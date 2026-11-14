@@ -1,0 +1,960 @@
+diff --git a/mario-odessy-harmony/entry/src/main/cpp/host/threads.c b/mario-odessy-harmony/entry/src/main/cpp/host/threads.c
+index 70a8f6d..1716706 100644
+--- a/mario-odessy-harmony/entry/src/main/cpp/host/threads.c
++++ b/mario-odessy-harmony/entry/src/main/cpp/host/threads.c
+@@ -29,7 +29,11 @@
+ #include <stdatomic.h>
+ #include <sys/ucontext.h>
+ #include <sys/mman.h>
++#include <string.h>
+ #include <time.h>
++#ifdef __MUSL__
++#include <sys/syscall.h>   // __NR_gettid（thread_main 记 htid）/ __NR_process_vm_readv（采样帧读）
++#endif
+ #include <mach/mach.h>
+ #include <pthread/qos.h>
+ #include <dlfcn.h>
+@@ -68,6 +72,8 @@ typedef struct thr {
+     uint64_t cseq, core_since; struct thr *cnext;
+     uint32_t wh[4]; int nwh;   // handles of the current WaitSynchronization (state dump)
+     int last_hle;              // 1 + wrapper index of the last host call made while "hletrace" was on (state dump)
++    int spin_pin;              // round3 自旋采样器选中且尚未放回：thr_free 跳过回收（防放锁后 use-after-free，泄露=取证可接受） | Pinned by the spin sampler between G sections: thr_free must not free it yet
++    int htid;                  // 宿主 tid（/proc/self/task 对应用；round3 采样失败诊断） | Host tid for /proc/self/task lookups
+     uint64_t yrun_ns, yrun_svc;   // the current run of yields: when it started, and nsvc at its last yield (yield_backoff_ns)
+ } thr_t;
+ static thr_t *g_all;
+@@ -288,6 +294,21 @@ void guest_thread_init(void);   // thread.c：每线程 TSD 槽（门、x18、TL
+ __attribute__((weak)) void runtime_hle_stack_set(uintptr_t top) { (void)top; }   // standalone thread probe: no host-stack switch
+ static void *thread_main(void *p) {
+     thr_t *t = p;
++#ifdef __MUSL__
++    t->htid = (int)syscall(__NR_gettid);
++#endif
++    {   /* emu3 定谳：采样器 pthread_kill(SIGUSR2) 全超时 + SigBlk 含 bit12 = 客体线程继承了创建者
++           （appspawn 主线程）的屏蔽掩码。SIGUSR2 同时是 CORE_PREEMPT_SIGNAL（核抢占），屏蔽它
++           也会让核抢占静默失效。客体线程出生即解除继承屏蔽（信号 handler 进程级已注册）。 */
++        sigset_t us; sigemptyset(&us); sigaddset(&us, SIGUSR2);
++        pthread_sigmask(SIG_UNBLOCK, &us, NULL);
++    }
++    {   /* round3：客体线程装独立信号栈——SIGUSR2 采样 handler 若落在客体栈上，SP 贴保护页的
++           深递归线程一压栈即 SEGV_ACCERR（emu_round3 第二次崩溃，0x6e03a47ffc 即栈保护区）。
++           16KiB 备用栈随线程泄漏（取证构建可接受），SA_ONSTACK 已在 spin_sampler_start 注册。 */
++        stack_t ss; ss.ss_sp = malloc(16384);
++        if (ss.ss_sp) { ss.ss_size = 16384; ss.ss_flags = 0; sigaltstack(&ss, NULL); }
++    }
+     pthread_setspecific(g_keythr, t);
+     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+     qos_class_t qc = QOS_CLASS_UNSPECIFIED; int rp = 0;
+@@ -302,6 +323,7 @@ static void *thread_main(void *p) {
+ }
+ static void thr_free(thr_t *t) {   // 持 G；从全部线程链摘下并释放 | Holding G; unlink from the all-threads chain and free
+     for (thr_t **p = &g_all; *p; p = &(*p)->all) if (*p == t) { *p = t->all; break; }
++    if (t->spin_pin) return;   // round3：采样器正引用（放锁 kill/等期间），只摘链不回收，泄露一次 | Sampler still references it outside G: unlink only, leak this one
+     pthread_cond_destroy(&t->cv); free(t);
+ }
+ 
+@@ -447,15 +469,168 @@ static uint64_t yield_backoff_ns(uint64_t run_ns) {
+ // ---------- Event SVC ring log (hang forensics: the identity of 0x1003/0x101f) ----------
+ enum { EVLOG_CREATE, EVLOG_SIGNAL, EVLOG_CLEAR, EVLOG_RESET, EVLOG_CLOSE };
+ static const char *const evlog_names[] = { "create", "signal", "clear", "reset", "close" };
+-typedef struct { uint32_t op, handle, extra; char who[24]; } evlog_t;
++typedef struct { uint32_t op, handle, extra; uint64_t lr; } evlog_t;   // round8: 存裸 LR（uint64 替代 char[24]）——0x1026 reset 洪 12-16k/s，热路径省掉每条 runtime_describe_address，dump 时再符号化
+ static evlog_t g_evlog[64];
+ static unsigned g_evlog_head, g_evlog_n;   // head=下一写位置；n=累计条数（回放窗口 min(n,16)）
+ void runtime_describe_address(uint64_t a, char *out, size_t n);   // 定义在诊断段（weak），此处前向声明
++void runtime_watch_add(uintptr_t addr, size_t len, int read);   // gfx_bridge.c：客体地址 READ/WRITE watch（fault 打印 pc/lr/帧链；round3 自旋期取证用）
++void spin_sampler_start(void);   // threads.c 诊断段：SIGUSR2 pc 链采样器（OHOS 上 mprotect watch 被 DFX 判死后的替代取证）
++
++/* ---------- round6 观测（只计数，dump 时输出；svc 热路径零 I/O——持 G 的 fprintf 即死，round3 四跑实证）----------
++   1) svc 0x34/0x35 裸计数：总数 + per-addr 前几名 + 0x35 调用者句柄。round47 dump 全程「0x35 零命中」
++      （活线程无一个以 0x35 收尾），下一轮 dump 直接给出调用总量 / 地址分布 / 释放者身份。
++      表与计数在两个 svc case 内、全程持 G 更新；dump 尾部放锁后无锁读（与 evlog/线程段同级取证风险）。
++   2) 事件账本 per-handle signal/reset 累计：evlog 环 64 槽被 0x1026（audio_device_handler 事件读端，
++      sdk+0xd3f084 每 5ms 一轮 reset，round3 三分钟 320 万条）淹没，尾部 16 条回放只见它——dump 时按
++      句柄打累计值表，环回放保留作最近时序。计数在 evlog() 内（该函数本就无锁写、竞态可接受）；
++      数组按句柄编号直接索引（与句柄表同为 MAX_H），游戏传入的坏句柄越界防护后不入账；
++      句柄编号会复用（CloseHandle 后同号可给别的事件），长时间运行后同号计数会合并——取证窗口（分钟级）内无碍。 */
++#define SIGADDR_TOP 16
++static struct { uint64_t addr, n34, n35; uint32_t caller; } g_sigaddr[SIGADDR_TOP];
++static unsigned g_sigaddr_n;
++static uint64_t g_ovf34, g_ovf35;
++static _Atomic uint64_t g_n34, g_n34_blk, g_n35, g_n35_woke, g_n35_bad;
++static _Atomic uint64_t g_evcnt[MAX_H][2];   /* [h-0x1000][0]=signal(svc 0x11 + 宿主服务侧) [1]=reset(svc 0x17) */
++static _Atomic uint64_t g_evfirst[MAX_H][2]; /* round8 归因：同上索引，signal/reset 各存首见裸 LR（照 sigaddr_note 的 caller 首见捕获范式）——0=空槽；dump 侧 who= 单列可见 */
++/* 3) h=0x1023（round3 dump 画像：prio 28 音频工作线程，wait=4 等 0x101f 事件读端，nsvc ~700k/min）
++      醒来计数——svc 0x18 返回路径打点：0x101f 是否持续把它唤醒。持 G 更新，plain 计数。 */
++static uint64_t g_w1023_calls, g_w1023_wake, g_w1023_wake_101f;
++static void sigaddr_note(int is35, uint64_t addr, uint32_t caller) {   // 调用方持 G
++    if (is35) atomic_fetch_add_explicit(&g_n35, 1, memory_order_relaxed);
++    else      atomic_fetch_add_explicit(&g_n34, 1, memory_order_relaxed);
++    for (unsigned i = 0; i < g_sigaddr_n; i++) if (g_sigaddr[i].addr == addr) {
++        if (is35) { g_sigaddr[i].n35++; if (!g_sigaddr[i].caller) g_sigaddr[i].caller = caller; }   // 首位 0x35 调用者=释放者画像
++        else g_sigaddr[i].n34++;
++        return;
++    }
++    if (g_sigaddr_n < SIGADDR_TOP) {   // 首见地址入表（16 槽后计入溢出桶：客体地址型对象本就寥寥）
++        g_sigaddr[g_sigaddr_n].addr = addr; g_sigaddr[g_sigaddr_n].n34 = !is35; g_sigaddr[g_sigaddr_n].n35 = !!is35;
++        g_sigaddr[g_sigaddr_n].caller = is35 ? caller : 0; g_sigaddr_n++;
++        return;
++    }
++    if (is35) g_ovf35++; else g_ovf34++;
++}
++/* ---------- round9 观测（条件变量 SVC）：svc 0x1C/0x1D per-key 计数表（照上方 sigaddr 范式：
++   {key,n1c,n1d} 前 16 槽 + 溢出桶，dump 时打）。0x1C 记等待次数、0x1D 记 signal 次数与首位调用者
++   句柄（释放者画像）；唤醒总数 g_n1d_woke 对照 total（total≫woke=发信号没人等）。dump 侧连同
++   该 key 当前等待者数一并打（现场数 g_wait 的 wkind==2）——等待有没有配对的 signal 一表可读。
++   两个 svc case 内全程持 G 更新，dump 尾部无锁读（与 sigaddr 同级取证风险）。 */
++#define PKEY_TOP 64   /* round9b：16 槽→49% 的 0x1D 落溢出桶；round8b：32 槽仍溢出 8.79M（≈2.05× 乒乓周期率=主线程每周期多打 2 发、活锁期才首见的第 33+ key）——64 槽把空打主力 key 的值/调用者钉死 */
++static struct { uint64_t key, n1c, n1d, n1dk; uint32_t caller; } g_pkey[PKEY_TOP];   /* n1dk=该 key 上实际转醒数（round8b：空打 key 的 woke 恒 0 一列可读） */
++static unsigned g_pkey_n;
++static uint64_t g_ovf1c, g_ovf1d;
++static _Atomic uint64_t g_n1c, g_n1d, g_n1d_woke;
++/* round8c 实测：boot 期一次性 key（sig=1 族）把 64 槽主表吃光，活锁期主力空打 key（7.3M 次）
++   首见时已无槽→落溢出桶无身份。次级表专收「主表满后首见」的 key——活锁期 key 全部落这里，身份可读。 */
++static struct { uint64_t key, n1c, n1d, n1dk; uint32_t caller; } g_pkey2[16];
++static unsigned g_pkey2_n;
++/* round9b 第三表（E4 族大小确认）：pkey2 也满后首见的 key——溢出桶只有总数没有身份，
++   64+16+32=112 个 key 以内族成员全可读，仍溢出才落回纯计数桶。 */
++#define PKEY3_TOP 32
++static struct { uint64_t key, n1c, n1d, n1dk; uint32_t caller; } g_pkey3[PKEY3_TOP];
++static unsigned g_pkey3_n;
++static void pkey_note(int is1d, uint64_t key, uint32_t caller) {   // 调用方持 G
++    if (is1d) atomic_fetch_add_explicit(&g_n1d, 1, memory_order_relaxed);
++    else      atomic_fetch_add_explicit(&g_n1c, 1, memory_order_relaxed);
++    for (unsigned i = 0; i < g_pkey_n; i++) if (g_pkey[i].key == key) {
++        if (is1d) { g_pkey[i].n1d++; if (!g_pkey[i].caller) g_pkey[i].caller = caller; }   // 首位 0x1D 调用者=发信号者画像
++        else g_pkey[i].n1c++;
++        return;
++    }
++    if (g_pkey_n < PKEY_TOP) {   // 首见 key 入主表（64 槽）
++        g_pkey[g_pkey_n].key = key; g_pkey[g_pkey_n].n1c = !is1d; g_pkey[g_pkey_n].n1d = !!is1d;
++        g_pkey[g_pkey_n].n1dk = 0; g_pkey[g_pkey_n].caller = is1d ? caller : 0; g_pkey_n++;
++        return;
++    }
++    for (unsigned i = 0; i < g_pkey2_n; i++) if (g_pkey2[i].key == key) {   // 主表满后首见的 key：次级表
++        if (is1d) { g_pkey2[i].n1d++; if (!g_pkey2[i].caller) g_pkey2[i].caller = caller; }
++        else g_pkey2[i].n1c++;
++        return;
++    }
++    if (g_pkey2_n < 16) {
++        g_pkey2[g_pkey2_n].key = key; g_pkey2[g_pkey2_n].n1c = !is1d; g_pkey2[g_pkey2_n].n1d = !!is1d;
++        g_pkey2[g_pkey2_n].n1dk = 0; g_pkey2[g_pkey2_n].caller = is1d ? caller : 0; g_pkey2_n++;
++        return;
++    }
++    for (unsigned i = 0; i < g_pkey3_n; i++) if (g_pkey3[i].key == key) {
++        if (is1d) { g_pkey3[i].n1d++; if (!g_pkey3[i].caller) g_pkey3[i].caller = caller; }
++        else g_pkey3[i].n1c++;
++        return;
++    }
++    if (g_pkey3_n < PKEY3_TOP) {
++        g_pkey3[g_pkey3_n].key = key; g_pkey3[g_pkey3_n].n1c = !is1d; g_pkey3[g_pkey3_n].n1d = !!is1d;
++        g_pkey3[g_pkey3_n].n1dk = 0; g_pkey3[g_pkey3_n].caller = is1d ? caller : 0; g_pkey3_n++;
++        return;
++    }
++    if (is1d) g_ovf1d++; else g_ovf1c++;
++}
++/* round16b 早 boot 键全录：boot 后前 10 秒的 0x1D 目标键全量专用表（256 槽+溢出计数），
++   与 pkey 三表完全独立（不挤槽、不改其行为——「全录不打扰」）。动机：round8c 实测 boot 期
++   一次性 key（sig=1 族）把 64 槽主表吃光，早窗到底有多少 distinct key、哪些是活锁期空打
++   key 的前身，主表结构里读不出；本表按窗口收录，dump 单独一段。窗口起点=libgame 装载
++   （dump_init 构造器），首个 0x1D 早于构造器打点时兜底以首见时刻为 t0。窗口过期后
++   early1d_closed 置位，热路径零额外开销（一次 flag 读）。持 G 更新，dump 无锁读（同 pkey）。 */
++#define EARLY1D_TOP 256
++static struct { uint64_t key; uint64_t n; uint32_t caller; } g_early1d[EARLY1D_TOP];
++static unsigned g_early1d_n; static uint64_t g_early1d_ovf;
++static uint64_t g_early1d_t0; static int g_early1d_t0_set, g_early1d_closed;
++static void early1d_note(uint64_t key, uint32_t caller) {   // 调用方持 G（svc 0x1D case 内）
++    if (g_early1d_closed) return;
++    uint64_t t = now_ns();
++    if (!g_early1d_t0_set) { g_early1d_t0 = t; g_early1d_t0_set = 1; }   // 兜底（构造器先到则不触发）
++    if (t - g_early1d_t0 >= 10000000000ull) { g_early1d_closed = 1; return; }   // 前 10s 窗口关闭
++    for (unsigned i = 0; i < g_early1d_n; i++) if (g_early1d[i].key == key) { g_early1d[i].n++; return; }
++    if (g_early1d_n < EARLY1D_TOP) {
++        g_early1d[g_early1d_n].key = key; g_early1d[g_early1d_n].n = 1;
++        g_early1d[g_early1d_n].caller = caller; g_early1d_n++;
++        return;
++    }
++    g_early1d_ovf++;   // 10s 内 distinct key 超 256：计数留痕（本身即发现）
++}
++/* ---------- round9b CreateThread/StartThread 全量账本（E2 宿主侧排查项）----------
++   修复方案定的宿主侧唯一排查项：核对 CreateThread/StartThread 门的全量账本（每个线程的
++   entry+arg+返回码），确认派发池消费者线程是「从未创建」而非「创建失败」。热路径零 I/O
++   （svc 0x08 成功路径本就持 G 登记；拒绝路径只加计数+末次样本），dump 时打全表与
++   线程名册（dump 逐线程行已带 entry/arg）对 diff。 */
++#define CT_LEDGER_CAP 64
++static struct { uint64_t entry, arg, stack_top; int prio, core; uint32_t handle; int started; uint32_t ret; } g_ct[CT_LEDGER_CAP];
++static unsigned g_ct_n;
++static uint64_t g_ct_calls, g_ct_rejects, g_ct_start_calls, g_ct_start_bad;
++static struct { uint64_t entry, arg; int prio, core; uint32_t ret; } g_ct_last_reject;
++static void ct_note_create(uint64_t entry, uint64_t arg, uint64_t sp, int prio, int core, uint32_t handle, uint32_t ret) {   // 调用方持 G（成功路径）
++    g_ct_calls++;
++    unsigned i = g_ct_n < CT_LEDGER_CAP ? g_ct_n++ : (unsigned)-1;
++    if (i == (unsigned)-1) return;   // 表满：只留总数（>64 个客体线程本就异常）
++    g_ct[i].entry = entry; g_ct[i].arg = arg; g_ct[i].stack_top = sp;
++    g_ct[i].prio = prio; g_ct[i].core = core; g_ct[i].handle = handle; g_ct[i].ret = ret; g_ct[i].started = 0;
++}
++static void ct_note_reject(uint64_t entry, uint64_t arg, int prio, int core, uint32_t ret) {   // 拒绝路径（无 G）：计数+末次样本，竞态可接受（取证类）
++    g_ct_calls++; g_ct_rejects++;
++    g_ct_last_reject.entry = entry; g_ct_last_reject.arg = arg; g_ct_last_reject.prio = prio; g_ct_last_reject.core = core; g_ct_last_reject.ret = ret;
++}
++static void ct_note_start(uint32_t handle, uint32_t ret) {   // 调用方持 G
++    g_ct_start_calls++;
++    if (ret) { g_ct_start_bad++; return; }
++    for (unsigned i = 0; i < g_ct_n; i++) if (g_ct[i].handle == handle) { g_ct[i].started = 1; return; }
++}
+ static void evlog(uint32_t op, uint32_t h, uint32_t h2, uint64_t lr) {
+-    char where[64]; runtime_describe_address(lr, where, sizeof where);
+-    evlog_t *e = &g_evlog[g_evlog_head]; e->op = op; e->handle = h; e->extra = h2;
+-    size_t k = strlen(where); if (k > sizeof e->who - 1) k = sizeof e->who - 1;
+-    memcpy(e->who, where, k); e->who[k] = 0;
++    /* round6 账本 + round8 归因：per-handle signal/reset 累计与首见裸 LR（0x1024 的 signal 源=宿主构造侧、
++       0x1026 的 reset 源=SDK svc 包装层 LR，分钟 dump 的 evc who= 单列给出）。计数/首见先于环写去重——
++       洪流条目照样入账，只是不再占环。首见捕获用 CAS(0→lr)，sigaddr_note caller 范式的原子版。 */
++    if (op == EVLOG_SIGNAL || op == EVLOG_RESET) {
++        unsigned hi = h - 0x1000;
++        if (hi > 0 && hi < MAX_H) {   // 无符号回绕的坏句柄自然被挡
++            atomic_fetch_add_explicit(&g_evcnt[hi][op == EVLOG_RESET], 1, memory_order_relaxed);
++            uint64_t first = 0;
++            atomic_compare_exchange_strong_explicit(&g_evfirst[hi][op == EVLOG_RESET], &first, lr, memory_order_relaxed, memory_order_relaxed);
++        }
++    }
++    /* round8 环写去重：连续同 (op,handle,lr) 只记账不占环——0x1026（sdk+0xd3f084 每 5ms 一轮 reset）
++       不再淹没 64 槽回放窗口，dump 环留给其它句柄/操作的最近时序；竞态可接受（本函数既往即无锁写）。 */
++    static uint32_t p_op, p_h; static uint64_t p_lr;
++    if (op == p_op && h == p_h && lr == p_lr) return;
++    p_op = op; p_h = h; p_lr = lr;
++    evlog_t *e = &g_evlog[g_evlog_head]; e->op = op; e->handle = h; e->extra = h2; e->lr = lr;
+     g_evlog_head = (g_evlog_head + 1) & 63; g_evlog_n++;
+ }
+ 
+@@ -478,16 +653,19 @@ int svc_thread(int num, uint64_t *regs) {
+                 fprintf(stderr,"[totk-stack] CreateThread rejected entry=%#llx sp=%#llx prio=%d core=%d why=%s\n",
+                     (unsigned long long)regs[1],(unsigned long long)regs[3],(int)regs[4],(int)regs[5],why);
+             }
++            ct_note_reject(regs[1], regs[2], (int)regs[4], (int)regs[5], R_BAD_STATE);   /* round9b CreateThread 账本：拒绝路径（无 G，竞态可接受） */
+             regs[0]=R_BAD_STATE;return 1;
+         }
+         thr_t *t = calloc(1, sizeof *t);
+         if(!t)die("thread allocation");
+         t->cur_core = -1;
+         pthread_cond_init(&t->cv, NULL);
+-        t->entry = regs[1]; t->arg = regs[2]; t->stack_top = regs[3] & ~0xFull;
++        t->entry = regs[1]; t->arg = regs[2]; t->stack_top = regs[3] & ~0x3Full;
+         t->prio = (int)regs[4]; t->core = (int)regs[5]; t->mask = t->core >= 0 ? 1ull << t->core : 7;
+         t->born_ns = now_ns(); t->born_tick = dm_thread_tick_fn ? dm_thread_tick_fn() : 0;
+-        pthread_mutex_lock(&G); t->handle = h_new(O_THREAD, t, regs[30]); t->id = g_next_id++; t->all = g_all; g_all = t; pthread_mutex_unlock(&G);
++        pthread_mutex_lock(&G); t->handle = h_new(O_THREAD, t, regs[30]); t->id = g_next_id++; t->all = g_all; g_all = t;
++        ct_note_create(regs[1], regs[2], t->stack_top, t->prio, t->core, t->handle, 0);   /* round9b CreateThread 账本：成功路径（持 G） */
++        pthread_mutex_unlock(&G);
+         pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 8 << 20);   // also the host-service stack of this guest thread
+         pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);   // 退出即回收宿主资源（客体经句柄等待，不 join） | Host resources are reclaimed on exit (the guest waits through the handle, no join)
+         if (pthread_create(&t->pt, &a, thread_main, t)) die("pthread_create");
+@@ -499,6 +677,7 @@ int svc_thread(int num, uint64_t *regs) {
+         pthread_mutex_lock(&G);
+         thr_t *t = h_get((uint32_t)regs[0], O_THREAD);
+         if (t) { t->started = 1; pthread_cond_signal(&t->cv); }
++        ct_note_start((uint32_t)regs[0], t ? 0 : R_BAD_HANDLE);   /* round9b StartThread 账本（持 G） */
+         pthread_mutex_unlock(&G);
+         regs[0] = t ? 0 : R_BAD_HANDLE; return 1;
+     }
+@@ -562,6 +741,7 @@ int svc_thread(int num, uint64_t *regs) {
+     case 0x1C: {  // WaitProcessWideKeyAtomic(x0 锁地址, x1 条件键, w2 标签, x3 超时) | WaitProcessWideKeyAtomic(x0 lock address, x1 condition key, w2 tag, x3 timeout)
+         thr_t *t = cur(); uint64_t addr = regs[0], key = regs[1];
+         pthread_mutex_lock(&G);
++        pkey_note(0, key, t->handle);   // round9 观测：条件等待 per-key 计数（持 G、零 I/O）
+         // 顺序要紧：先置条件键 = 1，再放互斥锁。SDK 的 InternalConditionVariable::Signal 在用户态先读条件键、为 0 就不发 svc 0x1D；
+         // 用户态抢互斥锁也不经过 G。原先先 lock_handoff 后置键：放锁后、置键前，别的线程可在用户态抢到锁、改完条件、读到键 0 就不唤醒，
+         // 本线程随后挂上去永远等不到（并行负载下资源表读写锁 main+0x320e5e0 卡死：读者计数 0、锁空闲、写者条件键 1、写者仍在等）。
+@@ -591,7 +771,13 @@ int svc_thread(int num, uint64_t *regs) {
+     case 0x1D: {  // SignalProcessWideKey(x0 条件键, w1 个数，<=0 全部) | SignalProcessWideKey(x0 condition key, w1 count, <=0 all)
+         uint64_t key = regs[0]; int cnt = (int)regs[1], n = 0;
+         pthread_mutex_lock(&G);
+-        for (thr_t *w; (cnt <= 0 || n < cnt) && (w = pick(2, key)); n++) lock_acquire_for(w, w->waddr, w->wtag);   // 按内核顺序；转为锁等待或被唤醒后不再是 kind 2 | In kernel order; once turned into a lock wait or woken it is no longer kind 2
++        { thr_t *me = me_or_null(); pkey_note(1, key, me ? me->handle : 0);   // round9 观测：signal per-key 计数+首位调用者（sigaddr 0x35 同范式）
++          early1d_note(key, me ? me->handle : 0); }   // round16b：boot 前 10s 的 0x1D 目标键全录（独立表；窗口外一次 flag 读即返回）
++        for (thr_t *w; (cnt <= 0 || n < cnt) && (w = pick(2, key)); n++) lock_acquire_for(w, w->waddr, w->wtag);   // 按内核顺序；转为锁等待或被唤醒后不再是 kind 2
++        for (unsigned i = 0; i < g_pkey_n; i++) if (g_pkey[i].key == key) { g_pkey[i].n1dk += (uint64_t)n; break; }   // round8b：per-key 实际转醒数（n1d≫n1dk 且 waiters=0 = 空打；与 g_n1d_woke 总账对照）
++        for (unsigned i = 0; i < g_pkey2_n; i++) if (g_pkey2[i].key == key) { g_pkey2[i].n1dk += (uint64_t)n; break; }   // 次级表同账
++        for (unsigned i = 0; i < g_pkey3_n; i++) if (g_pkey3[i].key == key) { g_pkey3[i].n1dk += (uint64_t)n; break; }   // round9b 第三表同账
++        atomic_fetch_add_explicit(&g_n1d_woke, (uint64_t)n, memory_order_relaxed);   // round9 观测：实际转醒的等待者数（signal 有没有人接） | In kernel order; once turned into a lock wait or woken it is no longer kind 2
+         int left = 0; for (thr_t *w = g_wait; w; w = w->next) if (w->wkind == 2 && w->wkey == key) { left = 1; break; }
+         if (!left) st32(key, 0);
+         pthread_mutex_unlock(&G);
+@@ -601,6 +787,7 @@ int svc_thread(int num, uint64_t *regs) {
+     case 0x34: {  // WaitForAddress(x0 地址, w1 类型, w2 值, x3 超时)：0 小于则等、1 小于则减一再等、2 相等则等 | WaitForAddress(x0 address, w1 type, w2 value, x3 timeout): 0 wait if less than, 1 decrement if less than then wait, 2 wait if equal
+         thr_t *t = cur(); uint64_t addr = regs[0]; int type = (int)regs[1]; int32_t val = (int32_t)regs[2];
+         pthread_mutex_lock(&G);
++        sigaddr_note(0, addr, t->handle);   // round6 观测：0x34 配对计数（总数+per-addr；持 G、零 I/O）
+         int64_t r; uint32_t v = ld32(addr);
+         int ok = type == 2 ? (int32_t)v == val : (int32_t)v < val;
+         if (ok && type == 1) { while (!cas32(addr, &v, v - 1)) if (!((int32_t)v < val)) { ok = 0; break; } }
+@@ -608,13 +795,29 @@ int svc_thread(int num, uint64_t *regs) {
+         /* round48 submit-chain 取证（F-I）：任务屏障等待侧。round47 dump 证 h=0x1007 卡在本 svc
+            （addr=0x6ecb5b9218，栈 main+0x95e188←main+0x6159bc 装载分发），屏障现值是定位
+            「哪些子任务没完成」的唯一缺失量——阻塞时打前 3 次：want/cur/tmo 全量。 */
+-        else { t->waddr = addr; {static unsigned fi34;if(fi34++<3)fprintf(stderr,"[F-I] WaitAddr block h=%#x addr=%#llx type=%d want=%d cur=%d tmo=%lld\n",t->handle,(unsigned long long)addr,type,val,(int32_t)v,(long long)(int64_t)regs[3]);} r = block(t, 3, (int64_t)regs[3]); }
++        else { t->waddr = addr;
++            /* round3 自旋期取证：首次阻塞在该屏障即挂 READ watch（地址随运行漂移，round1↔round2 实测
++               -0xa00000，硬编码必脱靶；env 注入 OHOS 上 appspawn 不继承 shell 环境亦不可行——只能在
++               打点处动态武装）。round3 实测 OHOS DFX 对页面 fault 判死整进程 → watch 在 __MUSL__ 下
++               仅登记地址；实际取证由 SIGUSR2 自旋采样器承担（每 200ms 抓 runnable 客体线程 pc 链）。
++               注意：此处运行在客体小栈上（:312 警告），只调 write(2) 级打点——再一个 fprintf 就会像
++               round3 第四跑那样被 vfprintf 撑爆栈（cppcrash-11638: fprintf←svc_thread）。 */
++            { static int fi_w; if (!fi_w) { fi_w = 1; runtime_watch_add((uintptr_t)addr, 4, 1); spin_sampler_start(); } }
++            /* round3：fi34/fi35 及 F-H 的 fprintf 全在客体小栈 SVC 路径上（guard 页上仅剩几十字节，
++               round3 多跑实证 SignalToAddr 一打即 SEGV_ACCERR@...7ffc）——OHOS 上禁打；屏障/loader
++               地址已由挂 watch 的 write(2) 级日志安全留痕，线程画像由 60s dump 承担。macOS 宿主照打。 */
++#ifndef __MUSL__
++            {static unsigned fi34;if(fi34++<3)fprintf(stderr,"[F-I] WaitAddr block h=%#x addr=%#llx type=%d want=%d cur=%d tmo=%lld\n",t->handle,(unsigned long long)addr,type,val,(int32_t)v,(long long)(int64_t)regs[3]);}
++#endif
++            atomic_fetch_add_explicit(&g_n34_blk, 1, memory_order_relaxed);   // round6：真挂上等待的 0x34（与总数差=立即 BAD_STATE 返回）
++            r = block(t, 3, (int64_t)regs[3]); }
+         pthread_mutex_unlock(&G);
+         regs[0] = (uint64_t)r; return 1;
+     }
+     case 0x35: {  // SignalToAddress(x0 地址, w1 类型, w2 值, w3 个数)：0 唤醒、1 相等则加一并唤醒、2 相等则按等待数改值并唤醒 | SignalToAddress(x0 address, w1 type, w2 value, w3 count): 0 wake, 1 increment if equal and wake, 2 if equal modify the value by waiter count and wake
+         uint64_t addr = regs[0]; int type = (int)regs[1]; int32_t val = (int32_t)regs[2]; int cnt = (int)regs[3];
+         pthread_mutex_lock(&G);
++        { thr_t *me = me_or_null(); sigaddr_note(1, addr, me ? me->handle : 0); }   // round6 观测：0x35 裸计数+调用者句柄（释放者画像）
+         int nw = 0; for (thr_t *w = g_wait; w; w = w->next) if (w->wkind == 3 && w->waddr == addr) nw++;
+         int64_t r = 0;
+         if (type != 0) {
+@@ -631,10 +834,14 @@ int svc_thread(int num, uint64_t *regs) {
+         int n = 0;
+         if (!r)
+             for (thr_t *w; (cnt <= 0 || n < cnt) && (w = pick(3, addr)); n++) wake(w, 0);
++        atomic_fetch_add_explicit(&g_n35_woke, (uint64_t)n, memory_order_relaxed);   // round6：累计实际唤醒的等待者数（waiters≠0 而 woke=0=没人等它）
++        if (r) atomic_fetch_add_explicit(&g_n35_bad, 1, memory_order_relaxed);   // round6：CAS 失败（R_BAD_STATE，值不符）
+         /* round48 submit-chain 取证（F-I）配套：屏障释放侧。0x35 全程 0 次出现在 round47 dump 的
+            last_svc 里（活线程无一个以 0x35 收尾）——若下一轮仍 0 命中即证明屏障从未被游戏释放，
+            堵点在「释放者没跑到」而非本宿主 svc 语义；命中则给出 waiters/woke 对照。 */
++#ifndef __MUSL__
+         {static unsigned fi35;if(fi35++<3)fprintf(stderr,"[F-I] SignalToAddr addr=%#llx type=%d val=%d cnt=%d waiters=%d woke=%d r=%lld\n",(unsigned long long)addr,type,val,cnt,nw,n,(long long)r);}
++#endif
+         pthread_mutex_unlock(&G);
+         regs[0] = (uint64_t)r; return 1;
+     }
+@@ -667,6 +874,7 @@ int svc_thread(int num, uint64_t *regs) {
+         if(n<0||n>64||(!hs&&n)){regs[0]=R_BAD_STATE;return 1;}
+         int64_t deadline = ns > 0 ? (dm_detclock_enabled() ? (int64_t)guest_ns() : now_mono_ns()) + ns : 0;
+         pthread_mutex_lock(&G);
++        if (t->handle == 0x1023u) g_w1023_calls++;   // round6 观测（任务3）：0x1023 的 svc 0x18 调用总数
+         t->nwh = n; for (int i = 0; i < n && i < 4; i++) t->wh[i] = hs[i];
+         /* F-H 取证（round48 补齐轮）：等待句柄含 0x1003（装载器 SystemEvent 读端；两轮日志已证恒为它）
+            → 用等待者传入的事件对象地址（=SDK WaitSystemEvent 的句柄数组 hs）反推装载器基址
+@@ -687,6 +895,12 @@ int svc_thread(int num, uint64_t *regs) {
+           }
+           if (fh_hit) {
+             g_loader_wait_x19 = regs[19]; g_loader_wait_hs = (uint64_t)(uintptr_t)hs;
++            /* round3 自旋期取证（配套 F-I）：loader 态字段 state@+0xa0/progress@+0xa4 登记 watch
++               （8 字节窗口盖两字段；OHOS 上 mprotect watch 禁用仅登记，macOS 宿主实挂）。 */
++            { static int fh_w; uint64_t hs_a2 = (uint64_t)(uintptr_t)hs;
++              uint64_t ld2 = (hs_a2 > 0x100000000ULL && hs_a2 < 0x800000000000ULL) ? hs_a2 - 0x1d8 : 0;
++              if (!fh_w && ld2) { fh_w = 1; runtime_watch_add((uintptr_t)(ld2 + 0xa0), 8, 1); } }   // 地址留痕走 write(2)，栈安全
++#ifndef __MUSL__
+             static unsigned said; if (said < 3) { said++;
+               uint64_t hs_a = (uint64_t)(uintptr_t)hs;
+               int ok_hs = hs_a > 0x100000000ULL && hs_a < 0x800000000000ULL;
+@@ -727,6 +941,7 @@ int svc_thread(int num, uint64_t *regs) {
+                 }
+               }
+             }
++#endif   /* !__MUSL__：F-H 打印簇（含 106 点循环）在客体小栈上一打即死，OHOS 禁打；loader 地址已由上方 watch 登记留痕 */
+           }
+         }
+         int64_t r; int idx = -1;
+@@ -740,6 +955,10 @@ int svc_thread(int num, uint64_t *regs) {
+             if (ns > 0 && left <= 0) { r = R_TIMEOUT; break; }
+             if (block(t, 4, left) == R_TIMEOUT) { r = R_TIMEOUT; break; }
+         }
++        if (t->handle == 0x1023u && idx >= 0) {   // round6 观测（任务3）：0x101f wait 返回路径——0x1023 醒来计数（谁把它唤醒）
++            g_w1023_wake++;
++            if (idx < n && hs && hs[idx] == 0x101fu) g_w1023_wake_101f++;   // 被目标事件 0x101f 唤醒（vs 其它句柄）
++        }
+         pthread_mutex_unlock(&G);
+         regs[0] = (uint64_t)r; regs[1] = idx >= 0 ? (uint64_t)idx : 0; return 1;
+     }
+@@ -814,6 +1033,11 @@ void hle_signal_system_event(void *ev) {
+         if (wh) {
+             event_t *e = h_get(wh, O_EVENT_W);
+             if (!e) die("SystemEvent 写端句柄失效 %#x", wh);
++            /* round13 fixPlan(3) 审计：宿主 HLE 侧对客体 SystemEvent 的 signal 此前只改
++               signaled、不入 evlog/evcnt——装载器事件 0x1002「signaled=1 但 evc signal=0」
++               无法区分『创建即置位』（hle_bind_system_event 的 CreateSystemEvent(ev,·,1)）
++               与『被 HLE 发过』。入环对齐 runtime_event_signal（round5 同款），纯观测。 */
++            evlog(EVLOG_SIGNAL, wh, 0, (uint64_t)(uintptr_t)__builtin_return_address(0));
+             e->signaled = 1; wake_sync_waiters();
+             pthread_mutex_unlock(&G);
+             return;
+@@ -851,8 +1075,29 @@ uint32_t runtime_event_readable(uint32_t hw) {
+ }
+ void runtime_event_signal(uint32_t hw) {
+     pthread_mutex_lock(&G); event_t *e = h_get(hw, O_EVENT_W); if (!e) die("service event handle %#x", hw);
++    /* evlog 可观测性（round5）：宿主服务侧的 signal 一直只在 SVC 0x11 路径入环，audio renderer 每帧
++       （5ms）经此处无条件触发（audio_renderer.c render_thread），环里却看不到——被误读成「evlog 无 signal
++       = 无信号源」。此处入环后 dump 环常驻 signal 条目（renderer 写端 0x1021 与游戏等的读端同一 event_t、
++       refs=2，可互证信号源活着）。evlog（round8 起）只存裸 LR+原子计数，无锁无 I/O，持 G 调用安全。 */
++    evlog(EVLOG_SIGNAL, hw, 0, (uint64_t)(uintptr_t)__builtin_return_address(0));
+     e->signaled = 1; wake_sync_waiters(); pthread_mutex_unlock(&G);
+ }
++/* round8：宿主服务侧写端释放（IAudioDevice 会话 free 钩子用）——镜像 SVC 0x16 事件分支：解绑、
++   减一引用（游戏侧每份读端拷贝各持一引用）、回收句柄槽。事件对象在读端也全关后才真正释放。 */
++void runtime_event_close(uint32_t hw) {
++    uint32_t evh = 0;
++    pthread_mutex_lock(&G);
++    unsigned i = hw - 0x1000;
++    if (i > 0 && i < MAX_H && g_h[i].type == O_EVENT_W) {
++        evh = hw;
++        se_unbind(hw);
++        event_t *e = g_h[i].obj;
++        if (--e->refs == 0) free(e);
++        g_h[i].type = O_FREE; g_h[i].obj = NULL;
++    }
++    pthread_mutex_unlock(&G);
++    if (evh) evlog(EVLOG_CLOSE, evh, 0, (uint64_t)(uintptr_t)__builtin_return_address(0));
++}
+ 
+ // ---------- Diagnostics: TOTK_DUMP_AFTER=<seconds> prints every guest thread's wait state and guest return chain ----------
+ #include "mach_vm_compat.h"
+@@ -871,6 +1116,7 @@ static void dump_chain(uint64_t lr, uint64_t fp) {
+     fputc('\n', stderr);
+ }
+ static void dump_threads(unsigned secs);
++static int spin_read16(uint64_t a, uint64_t out[2]);   /* round9b：dump 的 E1/E4 段用（定义在诊断段） */
+ static void *dump_after(void *arg) { unsigned secs = (unsigned)(uintptr_t)arg; sleep(secs); dump_threads(secs); return NULL; }
+ /* TOTK_LISTCHECK=<heap-relative object offset>: watch the two intrusive lists at +0x48/+0x60 of one game allocator
+    object (seen corrupted after the startup logo) and dump all threads the moment a node's next link is null. */
+@@ -906,6 +1152,18 @@ static void dump_threads(unsigned secs) {
+     int locked = 0; for (int i = 0; i < 100 && !(locked = pthread_mutex_trylock(&G) == 0); i++) usleep(10000);
+     fprintf(stderr, "[totk-dump] global thread lock %s\n", locked ? "acquired" : "HELD BY ANOTHER THREAD (dumping without it)");
+     fprintf(stderr, "[totk-dump] guest threads after %u s\n", secs);
++    {   /* round9 观测：模块基址头行（每次 dump 带头）。宿主 libgame.so（dladdr 自身函数取装载基址——
++           OHOS linker 完成 relocate 后 dladdr 即可查）+ 客体三模块（宿主 loader relocate 完成时另打
++           [loader-base] 一份）。evlog/evc 的 who=0x7f81… 裸 LR（宿主侧 __builtin_return_address，
++           runtime_describe_address 不落客体模块时打原值）用本行基址减去即得 offset，离线拿 obj 副本
++           （带 debug_info）符号化。 */
++        Dl_info di;
++        uint64_t host_base = dladdr((void *)(uintptr_t)&dump_threads, &di) ? (uint64_t)(uintptr_t)di.dli_fbase : 0;
++        uint8_t *bmain = runtime_module_base("main"), *bsdk = runtime_module_base("sdk"), *bsub = runtime_module_base("subsdk0");
++        fprintf(stderr, "[totk-dump] bases: host-libgame=%#llx main=%#llx sdk=%#llx subsdk0=%#llx\n",
++                (unsigned long long)host_base, (unsigned long long)(uintptr_t)bmain,
++                (unsigned long long)(uintptr_t)bsdk, (unsigned long long)(uintptr_t)bsub);
++    }
+     { fprintf(stderr, "[totk-dump] account lock owner host tid %llu\n", (unsigned long long)runtime_account_lock_owner()); }
+     for (int c = 0; c < NCORE; c++) fprintf(stderr, "[totk-dump] core %d owner %#x for %.1f ms\n", c, g_core_owner[c] ? g_core_owner[c]->handle : 0,
+                                             g_core_owner[c] ? (now_ns() - g_core_owner[c]->core_since) / 1e6 : 0.0);
+@@ -916,8 +1174,9 @@ static void dump_threads(unsigned secs) {
+         uint64_t htid = 0; if (t->pt) pthread_threadid_np(t->pt, &htid);
+         fprintf(stderr, "[totk-dump] tid=%llu ", (unsigned long long)htid);
+         fprintf(stderr, "core=%d mask=%#llx ", t->cur_core, (unsigned long long)t->mask);
+-        fprintf(stderr, "h=%#x prio=%d %s wait=%d addr=%#llx key=%#llx tag=%#x word=%#x last_svc=%#x nsvc=%llu\n", t->handle, t->prio,
+-                t->exited ? "exited" : t->started ? "run" : "new", t->wkind, (unsigned long long)t->waddr, (unsigned long long)t->wkey, t->wtag, word, t->last_svc, (unsigned long long)t->nsvc);
++        fprintf(stderr, "h=%#x prio=%d %s wait=%d addr=%#llx key=%#llx tag=%#x word=%#x last_svc=%#x nsvc=%llu entry=%#llx arg=%#llx\n", t->handle, t->prio,
++                t->exited ? "exited" : t->started ? "run" : "new", t->wkind, (unsigned long long)t->waddr, (unsigned long long)t->wkey, t->wtag, word, t->last_svc, (unsigned long long)t->nsvc,
++                (unsigned long long)t->entry, (unsigned long long)t->arg);   /* round9b：entry/arg 进名册行——与 CreateThread 账本 diff 找缺席线程 */
+         if (t->wkind == 4) { fprintf(stderr, "    waiting on %d handle(s):", t->nwh); for (int i = 0; i < t->nwh && i < 4; i++) fprintf(stderr, " %#x", t->wh[i]); fputc('\n', stderr); }
+         if (t->last_hle) { char nm[256]; runtime_hle_describe((unsigned)t->last_hle - 1, nm, sizeof nm); fprintf(stderr, "    last host call while tracing: %s\n", nm); }
+         dump_chain(t->last_lr, t->last_fp);
+@@ -980,11 +1239,366 @@ static void dump_threads(unsigned secs) {
+       for (unsigned k = from; k < g_evlog_n; k++) {
+         evlog_t *e = &g_evlog[k & 63];
+         const char *opn = e->op <= EVLOG_CLOSE ? evlog_names[e->op] : "?";
++        char who[64]; runtime_describe_address(e->lr, who, sizeof who);   // round8: 环里存裸 LR，dump 时符号化（热路径零 describe）
+         fprintf(stderr, "[totk-dump] ev#%u %s h=%#x", k, opn, e->handle);
+         if (e->extra) fprintf(stderr, " h2=%#x", e->extra);
+-        fprintf(stderr, " who=%s\n", e->who);
++        fprintf(stderr, " who=%s\n", who);
++      }
++    }
++    /* round6 观测（任务2）+ round8 归因：事件账本 per-handle signal/reset 累计表（自启动起全量）。
++       上方环回放被 0x1026 洪流淹没时这里给出全量分布；round8 起每句柄补 signal/reset 首见 LR 的符号
++       （who=）：0x1024 的 signal 源（宿主 IAudioDevice 构造侧）与 0x1026 的 reset 源（sdk+0xd3f084，
++       SDK svc 包装层 LR，其上真实调用循环=main+0x8b8xxx 音频线程）在每次分钟 dump 单列可见。
++       signal 列含宿主服务侧（runtime_event_signal）。选择在本地副本上做，全局计数不清零。 */
++    { struct { uint32_t h; uint64_t s, r, slr, rlr; } top[256]; unsigned nt = 0;
++      uint64_t tsig = 0, trst = 0;
++      for (unsigned i = 1; i < MAX_H && nt < 256; i++) {
++          uint64_t s = atomic_load(&g_evcnt[i][0]), rv = atomic_load(&g_evcnt[i][1]);
++          if (s || rv) { tsig += s; trst += rv; top[nt].h = 0x1000 + i; top[nt].s = s; top[nt].r = rv;
++                         top[nt].slr = atomic_load(&g_evfirst[i][0]); top[nt].rlr = atomic_load(&g_evfirst[i][1]); nt++; }
++      }
++      fprintf(stderr, "[totk-dump] event svc per-handle ledger (cumulative): %u handle(s) signal=%llu reset=%llu%s:\n",
++              nt, (unsigned long long)tsig, (unsigned long long)trst, nt == 256 ? " (capped at 256)" : "");
++      for (int k = 0; k < 8; k++) {
++          int best = -1; uint64_t bv = 0;
++          for (unsigned i = 0; i < nt; i++) { uint64_t v = top[i].s + top[i].r; if (v > bv) { bv = v; best = (int)i; } }
++          if (best < 0) break;
++          char ws[96], wr[96];
++          if (top[best].slr) runtime_describe_address(top[best].slr, ws, sizeof ws); else ws[0] = 0;
++          if (top[best].rlr) runtime_describe_address(top[best].rlr, wr, sizeof wr); else wr[0] = 0;
++          fprintf(stderr, "[totk-dump] evc h=%#x signal=%llu%s%s reset=%llu%s%s\n", top[best].h,
++                  (unsigned long long)top[best].s, top[best].slr ? " who=" : "", ws,
++                  (unsigned long long)top[best].r, top[best].rlr ? " who=" : "", wr);
++          top[best].s = top[best].r = 0;
++      }
++    }
++    /* round6 观测（任务1）：svc 0x34/0x35 裸计数——总数/真挂起/唤醒数/CAS 失败 + per-addr 前几名
++       （n35 降序、n34 并列）+ 0x35 调用者句柄。round47「0x35 零命中」之后，此表直接回答：
++       屏障有没有被释放过、谁在释放、0x34 的等待有没有配对的 0x35。表在 G 下更新、此处无锁读
++       （与上方线程段/环回放同级取证风险）。 */
++    { fprintf(stderr, "[totk-dump] svc 0x34 WaitForAddress: total=%llu blocked=%llu\n",
++              (unsigned long long)atomic_load(&g_n34), (unsigned long long)atomic_load(&g_n34_blk));
++      fprintf(stderr, "[totk-dump] svc 0x35 SignalToAddress: total=%llu woke=%llu bad-state=%llu\n",
++              (unsigned long long)atomic_load(&g_n35), (unsigned long long)atomic_load(&g_n35_woke),
++              (unsigned long long)atomic_load(&g_n35_bad));
++      unsigned done = 0;
++      for (int k = 0; k < 5; k++) {
++          int best = -1; uint64_t b35 = 0, b34 = 0;
++          for (unsigned i = 0; i < g_sigaddr_n && i < 32; i++) {
++              if ((done >> i) & 1u) continue;
++              uint64_t s35 = g_sigaddr[i].n35, s34 = g_sigaddr[i].n34;
++              if (s35 > b35 || (s35 == b35 && s34 > b34)) { b35 = s35; b34 = s34; best = (int)i; }
++          }
++          if (best < 0 || (!b35 && !b34)) break;
++          done |= 1u << best;
++          fprintf(stderr, "[totk-dump] sigaddr %#llx wait(0x34)=%llu sig(0x35)=%llu caller=h%#x\n",
++                  (unsigned long long)g_sigaddr[best].addr, (unsigned long long)g_sigaddr[best].n34,
++                  (unsigned long long)g_sigaddr[best].n35, g_sigaddr[best].caller);
++      }
++      if (g_ovf34 || g_ovf35)
++          fprintf(stderr, "[totk-dump] sigaddr overflow (beyond %d addrs): wait=%llu sig=%llu\n",
++                  SIGADDR_TOP, (unsigned long long)g_ovf34, (unsigned long long)g_ovf35);
++    }
++    /* round9 观测（条件变量 SVC）：svc 0x1C/0x1D per-key 表（sigaddr 范式）——总数/唤醒数 +
++       前 12 名 key 的 wait(0x1C)/sig(0x1D)/woke(per-key)/当前等待者数（现场数 g_wait 的 wkind==2）/
++       首位 signal 调用者句柄 + 溢出桶。等待无配对 signal（唤醒丢失嫌疑）/signal 无人接在此一表可读。
++       round8b 起 32 槽 + per-key woke（n1d≫n1dk=空打一列可读），覆盖 round9b 观测到的全部 ~24 个 distinct key。 */
++    { fprintf(stderr, "[totk-dump] svc 0x1C WaitProcessWideKey: total=%llu\n",
++              (unsigned long long)atomic_load(&g_n1c));
++      fprintf(stderr, "[totk-dump] svc 0x1D SignalProcessWideKey: total=%llu woken=%llu\n",
++              (unsigned long long)atomic_load(&g_n1d), (unsigned long long)atomic_load(&g_n1d_woke));
++      unsigned long long done = 0;
++      for (int k = 0; k < 16; k++) {
++          int best = -1; uint64_t bd = 0, bc = 0;
++          for (unsigned i = 0; i < g_pkey_n && i < PKEY_TOP; i++) {
++              if ((done >> i) & 1u) continue;
++              uint64_t sd = g_pkey[i].n1d, sc = g_pkey[i].n1c;
++              if (sd > bd || (sd == bd && sc > bc)) { bd = sd; bc = sc; best = (int)i; }
++          }
++          if (best < 0 || (!bd && !bc)) break;
++          done |= 1u << best;
++          int nw = 0; for (thr_t *w = g_wait; w; w = w->next) if (w->wkind == 2 && w->wkey == g_pkey[best].key) nw++;
++          fprintf(stderr, "[totk-dump] pkey %#llx wait(0x1C)=%llu sig(0x1D)=%llu woke=%llu waiters=%d sig-caller=h%#x\n",
++                  (unsigned long long)g_pkey[best].key, (unsigned long long)g_pkey[best].n1c,
++                  (unsigned long long)g_pkey[best].n1d, (unsigned long long)g_pkey[best].n1dk, nw, g_pkey[best].caller);
++      }
++      if (g_ovf1c || g_ovf1d)
++          fprintf(stderr, "[totk-dump] pkey overflow (beyond %d+16 keys): wait=%llu sig=%llu\n",
++                  PKEY_TOP, (unsigned long long)g_ovf1c, (unsigned long long)g_ovf1d);
++      /* round8d：次级表——主表满后（=活锁期）首见的 key。round8c 的 7.3M 空打主力在这里现出 key 值与调用者。 */
++      for (unsigned i = 0; i < g_pkey2_n; i++) {
++          int nw = 0; for (thr_t *w = g_wait; w; w = w->next) if (w->wkind == 2 && w->wkey == g_pkey2[i].key) nw++;
++          fprintf(stderr, "[totk-dump] pkey2 %#llx wait(0x1C)=%llu sig(0x1D)=%llu woke=%llu waiters=%d sig-caller=h%#x\n",
++                  (unsigned long long)g_pkey2[i].key, (unsigned long long)g_pkey2[i].n1c,
++                  (unsigned long long)g_pkey2[i].n1d, (unsigned long long)g_pkey2[i].n1dk, nw, g_pkey2[i].caller);
++      }
++      /* round9b 第三表：pkey2 也满后首见的 key（族大小确认）。 */
++      for (unsigned i = 0; i < g_pkey3_n; i++) {
++          int nw = 0; for (thr_t *w = g_wait; w; w = w->next) if (w->wkind == 2 && w->wkey == g_pkey3[i].key) nw++;
++          fprintf(stderr, "[totk-dump] pkey3 %#llx wait(0x1C)=%llu sig(0x1D)=%llu woke=%llu waiters=%d sig-caller=h%#x\n",
++                  (unsigned long long)g_pkey3[i].key, (unsigned long long)g_pkey3[i].n1c,
++                  (unsigned long long)g_pkey3[i].n1d, (unsigned long long)g_pkey3[i].n1dk, nw, g_pkey3[i].caller);
+       }
++      /* round16b 早 boot 键全录段：boot 后前 10 秒的 0x1D 目标键专用全量表（独立于 pkey 三表，
++         不受其槽位挤压）。n=窗口内该 key 的 signal 次数（boot 一次性 key 预期 n=1），
++         first-caller=窗口内首位发信号线程——与 pkey 主表同 key 行对照即知哪些活锁期 key
++         是 boot 期键的延续。 */
++      fprintf(stderr, "[totk-dump] early-boot 0x1D keys (first 10s, dedicated full table): %u key(s)%s\n",
++              g_early1d_n, g_early1d_ovf ? ", OVERFLOW beyond 256" : "");
++      for (unsigned i = 0; i < g_early1d_n; i++)
++          fprintf(stderr, "[totk-dump] early1d[%u] key=%#llx n=%llu first-caller=h%#x\n",
++                  i, (unsigned long long)g_early1d[i].key, (unsigned long long)g_early1d[i].n, g_early1d[i].caller);
++      if (g_early1d_ovf)
++          fprintf(stderr, "[totk-dump] early1d overflow: %llu signal(s) on keys beyond slot 256\n",
++                  (unsigned long long)g_early1d_ovf);
+     }
++    /* ---------- round9b CreateThread/StartThread 全量账本（E2 宿主侧排查项）----------
++       与上方线程名册（每行已带 entry=… arg=…）diff：账本里没有的 entry=从未创建；
++       有 entry 无 started=建了没 Start；rejects>0=创建失败（末次样本随行）。 */
++    fprintf(stderr, "[totk-dump] CreateThread ledger: calls=%llu entries=%u rejects=%llu (StartThread calls=%llu bad=%llu)\n",
++            (unsigned long long)g_ct_calls, g_ct_n, (unsigned long long)g_ct_rejects,
++            (unsigned long long)g_ct_start_calls, (unsigned long long)g_ct_start_bad);
++    for (unsigned i = 0; i < g_ct_n; i++)
++        fprintf(stderr, "[totk-dump] ct[%u] h=%#x entry=%#llx arg=%#llx sp=%#llx prio=%d core=%d started=%d ret=%#x\n",
++                i, g_ct[i].handle, (unsigned long long)g_ct[i].entry, (unsigned long long)g_ct[i].arg,
++                (unsigned long long)g_ct[i].stack_top, g_ct[i].prio, g_ct[i].core, g_ct[i].started, g_ct[i].ret);
++    if (g_ct_rejects)
++        fprintf(stderr, "[totk-dump] ct last reject entry=%#llx arg=%#llx prio=%d core=%d ret=%#x\n",
++                (unsigned long long)g_ct_last_reject.entry, (unsigned long long)g_ct_last_reject.arg,
++                g_ct_last_reject.prio, g_ct_last_reject.core, g_ct_last_reject.ret);
++    /* ---------- round9b E1/E2 观测门 + E4 两族合流检验（放锁后；spin_read16 是 EFAULT 安全读）----------
++       E1（main+0x57f950 元素数组门，game_patches.c）：末次快照 {el, this}，this+0x58 即发 key 表达式；
++       E4：等 key-0x78=worker 对象、发 key-0x58=池对象，两族交集=0 时唯一可能相等的绑定
++       [el+0x10]==worker+0x20（=wkey-0x58）在此直接判出。 */
++    {
++      extern uint64_t smo_obs_hits(int);
++      extern uint64_t smo_obs_last_x0(int);
++      extern unsigned smo_obs_e1_snapshot(uint64_t *, uint64_t *, unsigned, uint64_t *, uint64_t *, unsigned *);
++      fprintf(stderr, "[totk-dump] obs E1 0x57f950 hits=%llu last_x0=%#llx\n",
++              (unsigned long long)smo_obs_hits(0), (unsigned long long)smo_obs_last_x0(0));
++      fprintf(stderr, "[totk-dump] obs E2 drain 0x8aef34 hits=%llu last_x0=%#llx\n",
++              (unsigned long long)smo_obs_hits(1), (unsigned long long)smo_obs_last_x0(1));
++      fprintf(stderr, "[totk-dump] obs E2 drain 0x8af418 hits=%llu last_x0=%#llx\n",
++              (unsigned long long)smo_obs_hits(2), (unsigned long long)smo_obs_last_x0(2));
++      /* round13 fixPlan(2)：kick 断链指令级计数（donor 0x8ad1f0 族预期 ≈920+410+舞台数，与 wait#921/920/410 对账）。
++         kick1=派发函数全部入口（含 al 尾调）；al-kick=al 层调用（0x587ea8 单字门，仅过 NULL 检查的真实调用）；
++         kick3=三参变体合流点 0x8ad318（单字门）。kick1≈0 ⇒ kick 从未运行（断链在注册上游，走 fixPlan(4)）。 */
++      fprintf(stderr, "[totk-dump] obs kick1 0x8ad1f4 hits=%llu last_x0=%#llx\n",
++              (unsigned long long)smo_obs_hits(4), (unsigned long long)smo_obs_last_x0(4));
++      fprintf(stderr, "[totk-dump] obs al-kick 0x587ea8 hits=%llu last_x0=%#llx\n",
++              (unsigned long long)smo_obs_hits(5), (unsigned long long)smo_obs_last_x0(5));
++      fprintf(stderr, "[totk-dump] obs kick3 0x8ad318 hits=%llu last_x0=%#llx\n",
++              (unsigned long long)smo_obs_hits(6), (unsigned long long)smo_obs_last_x0(6));
++      /* round15 排空路径门：ENTER=0 → 排空函数从未被调（两调用源均未到达）；
++         ENTER>0 ∧ kick1=0 → 每次进排空都走空表捷径（完成包从未入队）；ENTER>0 ∧ kick1>0 → kick 已派发。 */
++      fprintf(stderr, "[totk-dump] obs drain-enter 0x8abf70 hits=%llu last_x0=%#llx\n",
++              (unsigned long long)smo_obs_hits(7), (unsigned long long)smo_obs_last_x0(7));
++      /* round16b 排空循环块门（循环头 0x8abf94，bl 0x8ad1f0 所在块入口）：LOOP>0 ⇒ 每次
++         命中必执行 bl（块内无分支）＝kick 直接调用路径实跑；KICK1−ALKICK−LOOP=其它直接调用源。
++         首见快照=kick 三条件值（w1 / [this+0xf9] / [this+0x20]，this=节点 x8-0x1c0——
++         kick 0x8ad200 cmp w1,#1 / 0x8ad208 ldrb [x19,#0xf9] / 0x8ad278 ldr x0,[x19,#0x20]）。 */
++      fprintf(stderr, "[totk-dump] obs drain-loop 0x8abf94 hits=%llu last_x0=%#llx\n",
++              (unsigned long long)smo_obs_hits(8), (unsigned long long)smo_obs_last_x0(8));
++      {
++      extern int smo_obs_dl_snapshot(uint64_t *, uint64_t *, uint64_t *, uint64_t *, uint64_t *, uint64_t *, int *);
++      uint64_t dn, dth, dw1, df9, do20, dts; int draw = 0;
++      if (smo_obs_dl_snapshot(&dn, &dth, &dw1, &df9, &do20, &dts, &draw))
++          fprintf(stderr, "[totk-dump] drain-loop first-hit: node(x8)=%#llx kick-this=%#llx w1=%llu [this+0xf9]=%#llx [this+0x20]=%#llx at %s%llu\n",
++                  (unsigned long long)dn, (unsigned long long)dth, (unsigned long long)dw1,
++                  (unsigned long long)df9, (unsigned long long)do20, draw ? "tick " : "+", (unsigned long long)dts);
++      else fprintf(stderr, "[totk-dump] drain-loop first-hit: none (gate never hit)\n");
++      }
++      /* round17 ①：KICK1 三条件快照（DRAIN-LOOP 门随排空函数 0 次进入而永不命中，改挂
++         kick 真入口 0x8ad1f4——this=x0、w1=原 x1）：三分支交叉分布直接回答「216 次真 kick
++         为何派不到 worker」（w1<1 与 w1>=1∧f9==2 走 0x8ad214 直虚调；w1>=1∧f9!=2 走
++         0x8ad22c 动画路径；o20==0 ⇒ 动画路径 0x8ad28c cbz 跳过 bl 0x8ac800）。 */
++      {
++      extern int smo_obs_k1_stats(uint64_t[5], uint64_t[3], uint64_t[4]);
++      uint64_t kf[5], kl[3], kd[4];
++      if (smo_obs_k1_stats(kf, kl, kd))
++          fprintf(stderr, "[totk-dump] kick1 cond: first this=%#llx w1=%llu [this+0xf9]=%#llx [this+0x20]=%#llx at +%lluns\n"
++                          "[totk-dump] kick1 cond: last w1=%llu f9=%#llx o20=%#llx | dist: w1<1=%llu w1>=1&f9==2=%llu w1>=1&f9!=2=%llu o20==0=%llu (hits=%llu)\n",
++                  (unsigned long long)kf[0], (unsigned long long)kf[1], (unsigned long long)kf[2],
++                  (unsigned long long)kf[3], (unsigned long long)kf[4],
++                  (unsigned long long)kl[0], (unsigned long long)kl[1], (unsigned long long)kl[2],
++                  (unsigned long long)kd[0], (unsigned long long)kd[1], (unsigned long long)kd[2],
++                  (unsigned long long)kd[3], (unsigned long long)smo_obs_hits(4));
++      else fprintf(stderr, "[totk-dump] kick1 cond: none (gate never hit)\n");
++      }
++      /* round17 ②：BC310 广播调用点（donor main+0x954310，CreateThread→StartThread→svc0x1d
++         广播序列现场 x3 恒=该入口值，且全镜像无直接分支落此＝只经指针调用）。emu hits>0 ⇒
++         emu main 执行了同一 boot 广播链；first/last x0=该函数收的对象（InitSystem 收件箱归属）。 */
++      {
++      extern int smo_obs_bc_snapshot(uint64_t *, uint64_t *);
++      uint64_t bfx0 = 0, bfts = 0;
++      int bchit = smo_obs_bc_snapshot(&bfx0, &bfts);
++      fprintf(stderr, "[totk-dump] obs bc310 0x954310 hits=%llu first_x0=%s%#llx (at +%lluns) last_x0=%#llx\n",
++              (unsigned long long)smo_obs_hits(9), bchit ? "" : "0/", bchit ? (unsigned long long)bfx0 : 0ULL,
++              (unsigned long long)bfts, (unsigned long long)smo_obs_last_x0(9));
++      }
++      /* round17 ③：KICKVT 虚调目标分布（0x8ad214 取数点：vt=[this]、tgt=[vt+0x20]＝
++         0x8ad228 br x1 的目标）。tgt 符号化（runtime_module_offset）：指向 main 内偏移或
++         HLE thunk 表即虚路径分叉点实锤，与 donor 的 kick 入数对账。 */
++      {
++      extern int smo_obs_kickvt_dist(uint64_t[8], uint64_t[8], uint64_t *, uint64_t *, uint64_t[2], uint64_t *);
++      uint64_t vv[8], vc[8], vover = 0, vzero = 0, vf[2], vlast = 0;
++      if (smo_obs_kickvt_dist(vv, vc, &vover, &vzero, vf, &vlast)) {
++          const char *nm; uint64_t off;
++          fprintf(stderr, "[totk-dump] obs kickvt 0x8ad214 hits=%llu zero=%llu over=%llu first vt=%#llx tgt=%#llx last_tgt=%#llx\n",
++                  (unsigned long long)smo_obs_hits(10), (unsigned long long)vzero, (unsigned long long)vover,
++                  (unsigned long long)vf[0], (unsigned long long)vf[1], (unsigned long long)vlast);
++          for (int i = 0; i < 8; i++) {
++              if (!vv[i]) continue;
++              fprintf(stderr, "[totk-dump] kickvt dist[%d]: tgt=%#llx cnt=%llu", i, (unsigned long long)vv[i], (unsigned long long)vc[i]);
++              if (runtime_module_offset(vv[i], &nm, &off)) fprintf(stderr, " -> %s+%#llx", nm, (unsigned long long)off);
++              fputc('\n', stderr);
++          }
++          if (vf[0] && runtime_module_offset(vf[0], &nm, &off))
++              fprintf(stderr, "[totk-dump] kickvt first-vt: %s+%#llx (this 的 vtable)\n", nm, (unsigned long long)off);
++      } else fprintf(stderr, "[totk-dump] obs kickvt 0x8ad214 hits=%llu (gate never hit)\n",
++                     (unsigned long long)smo_obs_hits(10));
++      }
++      /* round16b E2b 归属：上轮 E2a this=0x7f76fcdaf8 与 h1020/h1023 arg 同 0x7f76fc 邻域。
++         对 E2 this 做池反查（宿主 NVN 池账本 gfx_bridge nvn_pool_ledger，±0x4000 页距容差）
++         + CreateThread 账本同 64K 邻域 arg 对照，一行打归属推断依据（谁的对象）。
++         64K 而非 4K：实测两跑 this 与 arg 恒隔一页（0x7f76dc1af8 vs 0x7f76dc27a8 /
++         0x7f76fcdaf8 vs 0x7f76fc2xxx），4K 页匹配会漏掉全部证据。 */
++      {
++      extern int runtime_nvn_pool_hit(uint64_t, uint64_t *, uint64_t *, unsigned *);
++      uint64_t e2a = smo_obs_last_x0(1), e2b = smo_obs_last_x0(2), probe = e2a ? e2a : e2b;
++      if (probe > 0x100000000ULL) {
++          uint64_t lo = 0, hi = 0; unsigned pfl = 0;
++          int hit = runtime_nvn_pool_hit(probe, &lo, &hi, &pfl);
++          fprintf(stderr, "[totk-dump] E2 pool attribution: E2a this=%#llx E2b this=%#llx page=%#llx nvn-pool=%s",
++                  (unsigned long long)e2a, (unsigned long long)e2b, (unsigned long long)(probe & ~0xfffull),
++                  hit ? "HIT" : "miss");
++          if (hit) fprintf(stderr, " [mem=%#llx +%#llx flags=%#x]", (unsigned long long)lo,
++                           (unsigned long long)(hi - lo), pfl);
++          int near = 0;
++          for (unsigned i = 0; i < g_ct_n; i++)
++              if (g_ct[i].arg > 0x100000000ULL && (g_ct[i].arg & ~0xfffffull) == (probe & ~0xfffffull))
++                  fprintf(stderr, "%s h=%#x arg=%#llx Δ=%+lld", near++ ? "" : " | same-64K ct-arg:",
++                          g_ct[i].handle, (unsigned long long)g_ct[i].arg, (long long)(g_ct[i].arg - probe));
++          fprintf(stderr, " -> %s\n",
++                  hit ? "host NVN 池对象（nvn_pool_ledger 命中，flags 见上）"
++                  : near ? "非 NVN 池；同 64K 邻域存在 CreateThread arg → 游戏堆上交给线程的工作/队列对象邻域"
++                  : "非已知池且无同 64K 线程 arg：归属未定（可 TOTK_DUMP_AT 静态取证该页）");
++      } else fprintf(stderr, "[totk-dump] E2 pool attribution: E2a/E2b this 均 0（门未命中），无页可归属\n");
++      }
++      /* round15b 回执写入门（gfx_bridge 回执环）：writes=退休时真实落内存次数（emu14 遗留①验收位：
++         writes>0=回执落地）；recorded 分 kind 对照未退休 pending；unknown_handle=重录后旧句柄再提交。 */
++      {
++      extern uint64_t dm_nvn_receipt_stat(int);
++      fprintf(stderr, "[totk-dump] receipt ring: writes=%llu pending=%llu recorded(counter=%llu value=%llu signal=%llu) dropped=%llu unknown_handle=%llu submits=%llu\n",
++              (unsigned long long)dm_nvn_receipt_stat(0), (unsigned long long)dm_nvn_receipt_stat(1),
++              (unsigned long long)dm_nvn_receipt_stat(2), (unsigned long long)dm_nvn_receipt_stat(3),
++              (unsigned long long)dm_nvn_receipt_stat(4), (unsigned long long)dm_nvn_receipt_stat(5),
++              (unsigned long long)dm_nvn_receipt_stat(6), (unsigned long long)dm_nvn_receipt_stat(7));
++      }
++      /* round12e 定名：GetLoadProgress f() 的两条双间接 cell 链（0x1363dc8 已知=Map 作验证位，0x136deb8 待定名） */
++      {
++      extern int smo_obs_cell2_snapshot(uint64_t[6]);
++      uint64_t c2[6];
++      if (smo_obs_cell2_snapshot(c2)) {
++          const char *nm; uint64_t off;
++          /* round13b 实测：游戏 0x9b9bc4-0x9b9bd0 的双间接是 cell→[cell]=目标（blr 的就是它），
++             [cell] 落在宿主 HLE thunk 表（hle_stack.S runtime_hle_thunks，索引=包装注册序）——
++             上方打印的 fn= 是对 thunk 再解引用读到的头两条指令字（13b 实测 cell1 的 fn 低字
++             0xd2801b91 恰为『mov x17,#0xdc』的编码字，自证）。此处按 thunk 索引直接定名。 */
++          extern char runtime_hle_thunks[];
++          for (int k = 0; k < 2; k++) {
++              uint64_t t = c2[k * 3 + 1], base = (uint64_t)(uintptr_t)runtime_hle_thunks;
++              if (t >= base && t < base + 65536ULL * 16) {
++                  char hn[256]; runtime_hle_describe((unsigned)((t - base) / 16), hn, sizeof hn);
++                  fprintf(stderr, "[totk-dump] cell2 %s: call target %#llx = HLE thunk #%u -> %s\n",
++                          k ? "0x136deb8" : "0x1363dc8", (unsigned long long)t, (unsigned)((t - base) / 16), hn);
++              }
++          }
++          fprintf(stderr, "[totk-dump] cell2 0x1363dc8: cell=%#llx table=%#llx fn=%#llx",
++                  (unsigned long long)c2[0], (unsigned long long)c2[1], (unsigned long long)c2[2]);
++          if (runtime_module_offset(c2[2], &nm, &off)) fprintf(stderr, " -> %s+%#llx", nm, (unsigned long long)off);
++          fputc('\n', stderr);
++          fprintf(stderr, "[totk-dump] cell2 0x136deb8: cell=%#llx table=%#llx fn=%#llx",
++                  (unsigned long long)c2[3], (unsigned long long)c2[4], (unsigned long long)c2[5]);
++          if (runtime_module_offset(c2[5], &nm, &off)) fprintf(stderr, " -> %s+%#llx", nm, (unsigned long long)off);
++          fputc('\n', stderr);
++      } else fprintf(stderr, "[totk-dump] cell2 snapshot: not set (gate 0x9b9bc4 未命中或安装失败)\n");
++      }
++      static uint64_t e1el[128], e1th[128];
++      uint64_t obj = 0, arr = 0; unsigned trunc = 0;
++      unsigned n = smo_obs_e1_snapshot(e1el, e1th, 128, &obj, &arr, &trunc);
++      fprintf(stderr, "[totk-dump] E1 snapshot: obj=%#llx arr=%#llx count=%u%s\n",
++              (unsigned long long)obj, (unsigned long long)arr, n, trunc ? " (TRUNCATED, see trunc count)" : "");
++      if (trunc) fprintf(stderr, "[totk-dump] E1 truncated count=%u (cap 128)\n", trunc);
++      for (unsigned i = 0; i < n; i++) {
++          uint64_t th = e1th[i];
++          fprintf(stderr, "[totk-dump] E1 el[%u]=%#llx this=[el+0x10]=%#llx sig-key(this+0x58)=%#llx",
++                  i, (unsigned long long)e1el[i], (unsigned long long)th, (unsigned long long)(th + 0x58));
++          uint64_t mq2[2];
++          if (th > 0x100000000ULL && spin_read16(th + 0x10, mq2)) {   /* +0x10/+0x18 一并取；发 key=MQ+0x40 模型对账 */
++              uint64_t mq = mq2[1];
++              fprintf(stderr, " [this+0x18]=MQ=%#llx mq-key(MQ+0x40)=%#llx", (unsigned long long)mq, (unsigned long long)(mq + 0x40));
++          }
++          fputc('\n', stderr);
++      }
++      /* round15/16b：E1 count 变迁史（环 32 条 {at-hits,count,arr,ts}）——count 曾否>2 与
++         N→2 缩点时刻：环内逐条 + 单调汇总标量（max_cnt/shrink 不受环覆盖影响）。ts 为自
++         obs 门安装起的 ns（raw=1 时 timer 不可用，退化为裸 CNTVCT tick）。 */
++      {
++      extern unsigned smo_obs_e1_hist(uint64_t *, uint32_t *, uint64_t *, uint64_t *, unsigned, unsigned *, int *);
++      extern void smo_obs_e1_summary(uint32_t *, uint64_t *, uint32_t *, uint32_t *, uint64_t *, uint32_t *, int *);
++      uint64_t hh[32], ha[32], ht[32]; uint32_t hc[32]; unsigned total = 0; int raw = 0;
++      unsigned hn = smo_obs_e1_hist(hh, hc, ha, ht, 32, &total, &raw);
++      fprintf(stderr, "[totk-dump] E1 count history: %u transition(s) (total=%u%s, ts %s)\n",
++              hn, total, total > 32 ? ", ring wrapped" : "",
++              raw ? "raw ticks" : "ns, CLOCK_MONOTONIC_RAW 刻度（门安装时刻起可比，差值即耗时）");
++      for (unsigned i = 0; i < hn; i++)
++          fprintf(stderr, "[totk-dump] E1 hist[%u] at-E1-hits=%llu count=%u arr=%#llx ts=%llu\n",
++                  i, (unsigned long long)hh[i], hc[i], (unsigned long long)ha[i], (unsigned long long)ht[i]);
++      uint32_t mc = 0, sf = 0, st = 0, sh = 0; uint64_t mns = 0, sns = 0; int sraw = 0;
++      smo_obs_e1_summary(&mc, &mns, &sf, &st, &sns, &sh, &sraw);
++      fprintf(stderr, "[totk-dump] E1 summary: max-count-ever=%u (at %s%llu)%s",
++              mc, sraw ? "tick " : "+", (unsigned long long)mns,
++              mc > 2 ? "  ⇒ count 曾>2" : "  ⇒ count 从未>2");
++      if (sh) fprintf(stderr, "; shrink %u→%u at %s%llu (count 首次跌回≤2 的变迁=缩点时刻)",
++                      sf, st, sraw ? "tick " : "+", (unsigned long long)sns);
++      fputc('\n', stderr);
++      }
++      /* E4：两族推导表 + 交集判定（worker=key-0x78；池对象=key-0x58；绑定=[el+0x10]==wkey-0x58）。 */
++      int confluence = 0, binding = 0;
++      for (thr_t *w = g_wait; w; w = w->next) if (w->wkind == 2) {
++          uint64_t worker = w->wkey - 0x78;
++          uint64_t wv[2] = {0, 0};
++          int got = worker > 0x100000000ULL && spin_read16(worker + 0x20, wv);
++          fprintf(stderr, "[totk-dump] E4 waiter h=%#x wkey=%#llx worker=%#llx [worker+0x20]=%#llx\n",
++                  w->handle, (unsigned long long)w->wkey, (unsigned long long)worker,
++                  (unsigned long long)(got ? wv[0] : 0));
++      }
++      for (unsigned t = 0; t < 3; t++) {
++          unsigned cnt = t == 0 ? g_pkey_n : t == 1 ? g_pkey2_n : g_pkey3_n;
++          for (unsigned i = 0; i < cnt; i++) {
++              uint64_t key = t == 0 ? g_pkey[i].key : t == 1 ? g_pkey2[i].key : g_pkey3[i].key;
++              fprintf(stderr, "[totk-dump] E4 sig-key %#llx (pkey%s) pool-obj(key-0x58)=%#llx\n",
++                      (unsigned long long)key, t == 0 ? "" : t == 1 ? "2" : "3", (unsigned long long)(key - 0x58));
++              for (thr_t *w = g_wait; w; w = w->next) if (w->wkind == 2 && w->wkey == key) confluence = 1;
++          }
++      }
++      /* 绑定判定独立小循环（可读性优先）：[el+0x10] == 任一停泊 worker 的 wkey-0x58 */
++      for (unsigned j = 0; j < n; j++) {
++          if (!e1th[j]) continue;
++          for (thr_t *w = g_wait; w; w = w->next) if (w->wkind == 2 && e1th[j] == w->wkey - 0x58) {
++              binding++;
++              fprintf(stderr, "[totk-dump] E4 BINDING: E1 this %#llx == worker+0x20 of waiter h=%#x (wkey=%#llx)\n",
++                      (unsigned long long)e1th[j], w->handle, (unsigned long long)w->wkey);
++          }
++      }
++      fprintf(stderr, "[totk-dump] E4 verdict: key-confluence(sig-key==wait-key)=%d e1-binding(this==worker+0x20)=%d\n",
++              confluence, binding);
++    }
++    /* round6 观测（任务3）：h=0x1023 的 svc 0x18 醒来计数——calls=进入等待次数，woken=被唤醒返回次数，
++       woken-by-0x101f=其中被目标事件 0x101f 唤醒的（woken 与之恒等差=被别的句柄或超时喂醒）。 */
++    fprintf(stderr, "[totk-dump] svc 0x18 h=0x1023 wakeups: calls=%llu woken=%llu woken-by-0x101f=%llu\n",
++            (unsigned long long)g_w1023_calls, (unsigned long long)g_w1023_wake, (unsigned long long)g_w1023_wake_101f);
+     /* TOTK_DUMP_AT=rva1,rva2,...：静态地址取证通道（round33）——对每个 main 模块 RVA 转储
+        该处 4 个 u64，像指针的值经 describe 符号化。客体数据段有效映射，直读安全。 */
+     {const char *e=getenv("TOTK_DUMP_AT");uint8_t *mb=e?runtime_module_base("main"):NULL;
+@@ -997,7 +1611,134 @@ static void dump_threads(unsigned secs) {
+        for(int q=0;q<4;q++){char d[96];if(w[q]>=0x100000000ULL){runtime_describe_address(w[q],d,sizeof d);fprintf(stderr,"[totk-dump]   +%#llx[%d]=%s\n",(unsigned long long)rva,q,d);} } } } }
+ }
+ void runtime_dump_threads(void) { dump_threads(0); }   // TOTK_INPUT_FILE "threads"
++
++/* ---------- round3-B 自旋期取证：SIGUSR2 pc 链采样器 ----------
++   背景：mprotect 型 READ watch 在本 OHOS 镜像不可用——DFX sigchain 截获 SIGSEGV，首个页面 fault 即判死
++   整进程（emu_round3.log + cppcrash-9776，fault=0x6e459931b0 屏障同页越窗写）。改用信号采样：
++   对「已启动、未退出、不在任何宿主等待（wkind==0）」的客体线程 pthread_kill(SIGUSR2)，handler 只把
++   ucontext 的 pc/lr/fp 抓进全局槽（async-signal-safe：仅读寄存器+两次 store），采样线程在普通上下文
++   里走帧链——每帧先 mincore 验映射再读（OHOS 上 mach_vm_read_overwrite=裸 memcpy，ohos_compat.h:235，
++   野指针即 SEGV 即死，不能裸走）。样本即「自旋线程此刻的 pc 链」，洪流期/静默期都持续输出，
++   与 hang watchdog 的 60s 全景 dump 互补。 */
++static struct { _Atomic unsigned seq; volatile uint64_t pc, lr, fp, x19, x20, x21; } g_spin_cap;
++static void spin_cap_handler(int num, siginfo_t *si, void *ctx) {
++    (void)num; (void)si;
++    unsigned s = atomic_load_explicit(&g_spin_cap.seq, memory_order_relaxed);
++    if (!(s & 1)) return;   // 无采样请求
++    ucontext_t *u = ctx;
++#ifdef __MUSL__
++    g_spin_cap.pc = u->uc_mcontext.pc; g_spin_cap.lr = u->uc_mcontext.regs[30]; g_spin_cap.fp = u->uc_mcontext.regs[29];
++    g_spin_cap.x19 = u->uc_mcontext.regs[19]; g_spin_cap.x20 = u->uc_mcontext.regs[20]; g_spin_cap.x21 = u->uc_mcontext.regs[21];
++#else
++    g_spin_cap.pc = u->uc_mcontext->__ss.__pc; g_spin_cap.lr = u->uc_mcontext->__ss.__lr; g_spin_cap.fp = u->uc_mcontext->__ss.__fp;
++    g_spin_cap.x19 = u->uc_mcontext->__ss.__x[19]; g_spin_cap.x20 = u->uc_mcontext->__ss.__x[20]; g_spin_cap.x21 = u->uc_mcontext->__ss.__x[21];
++#endif
++    atomic_store_explicit(&g_spin_cap.seq, s + 1, memory_order_release);   // 奇→偶：完成
++}
++#ifdef __MUSL__
++#include <sys/syscall.h>
++#include <sys/uio.h>
++/* round3 第二次崩溃（SEGV_ACCERR@0x6e03a47ffc，采样器启动 100ms）：mincore 对 PROT_NONE 映射页返回 0
++   （只查映射不查权限），帧读 memcpy 裸读保护页即死。改 process_vm_readv 自进程读——对 PROT_NONE/未映射
++   一律返回 EFAULT 而不 fault，读自身 pid 永远合法（不受 yama 限制）。 */
++static int spin_read16(uint64_t a, uint64_t out[2]) {
++    if (a < 0x100000000ULL || a >= 0x800000000000ULL || (a & 15)) return 0;
++    struct iovec l = { out, 16 }, r = { (void *)(uintptr_t)a, 16 };
++    return syscall(__NR_process_vm_readv, getpid(), &l, 1ul, &r, 1ul, 0ul) == 16;
++}
++#else
++static int spin_read16(uint64_t a, uint64_t out[2]) {
++    if (a < 0x100000000ULL || a >= 0x800000000000ULL || (a & 15)) return 0;
++    unsigned char v; uintptr_t p = (uintptr_t)(a & ~0xfffull);
++    if (mincore((void *)p, 4096, &v) != 0) return 0;
++    if (((a + 15) & ~0xfffull) != p && mincore((void *)(uintptr_t)((a + 15) & ~0xfffull), 4096, &v) != 0) return 0;
++    memcpy(out, (const void *)(uintptr_t)a, 16); return 1;
++}
++#endif
++static void *spin_sampler(void *arg) {
++    (void)arg;
++    unsigned ticks = 0, tot_ok = 0, tot_fail = 0;
++    for (;;) {
++        usleep(200000);   // 5Hz：静默期每线程每秒 5 条 pc 链，洪流期也照采
++        ticks++;
++        /* round3 第五跑定谳：采样器 0.4s 后必停 = 持 G 做 I/O 的连锁死等——fprintf 要 stderr 的 FILE 锁、
++           OH_LOG_Print 要 hilog 客户端锁（与 stderr→hilog 转发线程共享），hilogd 对进程限流后转发线程
++           阻塞在 OH_LOG_Print 持客户端锁，采样器持 G 等它 → 全模拟器 SVC(G) 冻结（洪流不需 G 照跑，
++           dump 也不出——round3 第三跑 7 分钟活体+零 dump/零样本同证）。
++           第六跑定谳：等 handler 期间也不能持 G——目标线程被 G 闸住难以及时应答，kill 全超时
++           （124 心跳 cand=3..5 却只 4 样本）。改：持 G 只做「选人+pin」，放锁后 kill/等/取帧（20ms
++           预算），再回锁 unpin。pin 住 thr_free 不回收（泄露=取证可接受）。 */
++        char buf[4096]; int bn = 0;
++        int cand_n = 0, ok = 0, fail = 0;
++        pthread_mutex_lock(&G);
++        thr_t *cand[32]; int nc = 0;
++        for (thr_t *t = g_all; t && nc < 32; t = t->all)
++            if (t->started && !t->exited && !t->wkind && t->pt) { cand[nc++] = t; t->spin_pin = 1; }
++        pthread_mutex_unlock(&G);
++        cand_n = nc;
++        for (int i = 0; i < nc; i++) {
++            thr_t *t = cand[i];
++            atomic_store(&g_spin_cap.seq, atomic_load(&g_spin_cap.seq) + 1);   // 置奇=请求
++            if (pthread_kill(t->pt, SIGUSR2) != 0) { atomic_store(&g_spin_cap.seq, atomic_load(&g_spin_cap.seq) + 1); fail++; continue; }
++            int got = 0;
++            for (int w = 0; w < 40 && !got; w++) { if (!(atomic_load(&g_spin_cap.seq) & 1)) got = 1; else usleep(500); }
++            if (!got) { atomic_store(&g_spin_cap.seq, atomic_load(&g_spin_cap.seq) + 1); fail++;
++                /* 定谳用：读目标线程的信号位图（SigBlk=屏蔽中/SigIgn=忽略/SigCgt=已捕获），
++                   kill 超时 + SigBlk 含 bit12(SIGUSR2) = 目标把它屏蔽了（pthread_create 继承创建者掩码）。 */
++#ifdef __MUSL__
++                static int said_blk; if (!said_blk && t->htid) { said_blk = 1;
++                    char path[64]; snprintf(path, sizeof path, "/proc/self/task/%d/status", t->htid);
++                    FILE *f = fopen(path, "r");
++                    if (f) { char lbuf[128], out[384]; int on = 0;
++                        out[0] = 0;
++                        while (fgets(lbuf, sizeof lbuf, f) && on < (int)sizeof out - 128) {
++                            if (!strncmp(lbuf, "SigBlk:", 7) || !strncmp(lbuf, "SigIgn:", 7) || !strncmp(lbuf, "SigCgt:", 7)) {
++                                char *nl = strchr(lbuf, '\n'); if (nl) *nl = 0;
++                                on += snprintf(out + on, sizeof out - on, " %.20s=%.16s", lbuf, lbuf + 7);
++                            }
++                        }
++                        fclose(f);
++                        char db[512]; int dn = snprintf(db, sizeof db, "[spin] kill timeout h=%#x tid=%d%s\n", t->handle, t->htid, out);
++                        write(2, db, dn); } }
++#endif
++                continue; }   // 20ms 没应答：撤请求（不撤会错把旧样本当下次命中）
++            ok++;
++            char a[96], b[96];
++            runtime_describe_address(g_spin_cap.pc, a, sizeof a); runtime_describe_address(g_spin_cap.lr, b, sizeof b);
++            if (bn < (int)sizeof buf - 720)
++                bn += snprintf(buf + bn, sizeof buf - bn, "[spin] h=%#x pc=%s lr=%s x19=%#llx", t->handle, a, b, (unsigned long long)g_spin_cap.x19);
++            uint64_t fp = g_spin_cap.fp;
++            for (int d = 0; d < 8 && fp && bn < (int)sizeof buf - 128; d++) {
++                uint64_t fr[2];
++                if (!spin_read16(fp, fr)) break;   // 非故障读：PROT_NONE/未映射/野指针一律安全失败
++                char c[96]; runtime_describe_address(fr[1], c, sizeof c);
++                bn += snprintf(buf + bn, sizeof buf - bn, " <- %s", c);
++                if (fr[0] == fp) break; fp = fr[0];
++            }
++            if (bn < (int)sizeof buf - 2) { buf[bn++] = '\n'; }
++        }
++        pthread_mutex_lock(&G);
++        for (int i = 0; i < cand_n; i++) cand[i]->spin_pin = 0;
++        pthread_mutex_unlock(&G);
++        tot_ok += ok; tot_fail += fail;
++        if (ticks % 10 == 1) {   // 2s 心跳：采样器活着 + 候选/命中/未命中累计（诊断用）
++            char hb[112]; int hn = snprintf(hb, sizeof hb, "[spin] beat ticks=%u cand=%d ok=%u fail=%u\n", ticks, cand_n, tot_ok, tot_fail);
++            write(2, hb, hn);
++        }
++        if (bn > 0) write(2, buf, bn);
++    }
++    return NULL;
++}
++void spin_sampler_start(void) {
++    static int started; if (started) return; started = 1;
++    struct sigaction sa; memset(&sa, 0, sizeof sa);
++    sa.sa_sigaction = spin_cap_handler; sa.sa_flags = SA_SIGINFO | SA_ONSTACK; sigemptyset(&sa.sa_mask);
++    if (sigaction(SIGUSR2, &sa, NULL) != 0) return;   // 失败即静默放弃：调用点在客体小栈上，不能 fprintf
++    pthread_t th;
++    if (pthread_create(&th, NULL, spin_sampler, NULL) == 0) pthread_detach(th);
++}
+ __attribute__((constructor)) static void dump_init(void) {
++    if (!g_early1d_t0_set) { g_early1d_t0 = now_ns(); g_early1d_t0_set = 1; }   // round16b：早 boot 10s 窗口起点=libgame 装载时刻
+     const char *c = getenv("TOTK_LISTCHECK");
+     if (c) { pthread_t th; pthread_create(&th, NULL, list_check, (void *)(uintptr_t)strtoull(c, NULL, 0)); pthread_detach(th); }
+     const char *e = getenv("TOTK_DUMP_AFTER"); if (!e) return;

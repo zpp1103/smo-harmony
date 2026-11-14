@@ -1,0 +1,147 @@
+diff --git a/mario-odessy-harmony/entry/src/main/cpp/host/game_patches.c b/mario-odessy-harmony/entry/src/main/cpp/host/game_patches.c
+--- a/mario-odessy-harmony/entry/src/main/cpp/host/game_patches.c
++++ b/mario-odessy-harmony/entry/src/main/cpp/host/game_patches.c
+@@ -275,11 +275,29 @@
+  *   （w8）后观察器零解引用拿真目标，32 槽去重计数；stub 尾原义重放 br x1（prologue
+  *   已复原 x1，callee 入口caller-saved 全部死寄存器——与 ALKICK 尾跳另一函数入口同
+  *   性质）。0x8ad22c（b.ne 0x8ad210 落点）不动。与 KICKVT（0x8ad214 取数点，读
+- *   [vt+0x20] 推导）互证：KICKBR 记的是寄存器真值，KICKVT 记的是内存推导值。 */
++ *   [vt+0x20] 推导）互证：KICKBR 记的是寄存器真值，KICKVT 记的是内存推导值。
++ * round19 四门+一环（只观测零行为改动；round18 首跑 kickbr=0、thunk 层无计数）：
++ * ①② al thunk 双门×2（thunk1=0x587ea0 两参 kick 蹦床：ldr x0,[x0]; cbz x0,0x587eac;
++ *   b 0x8ad1f0；thunk2=0x587eb0 三参变体蹦床：ldr x0,[x0]; cbz x0,0x587ec4; mov w2,w1;
++ *   orr w1,wzr,#0; b 0x8ad310——字均实测自 main.patched.bin）。thunk 入口本体四字窗
++ *   含 cbz/b 出窗控制流不可门
++ *   （round15 已证），但全镜像扫描（round19 实跑复核）：跳 0x587ea0 的唯一分支=b@
++ *   0x587da4、跳 0x587eb0 的唯一分支=b@0x587db4，且两门址自身零落点——入口门装在
++ *   这条唯一进入分支上（单字尾门换 b→stub 记全部进入、stub 尾 b 回原目标），计数
++ *   语义=thunk 全部进入。NULL 出口门装在 cbz 早退落点 0x587eac/0x587ec4（出厂字
++ *   ret=0xd65f03c0，寄存器分支重放变体——stub 尾原义重放 ret，x30 由 prologue
++ *   保存/复原，跳回调用者；hits 即 [x0]==NULL 早退计数，cbz 只在 NULL 时走此）。
++ *   联读：THUNK1_IN−ALKICK(0x587ea8 真调用)≈THUNK1_NULL 自洽校验；THUNK2_IN 是
++ *   KICK3(0x8ad310 族) 路径的 thunk 层计数，THUNK2_NULL=三参路径 NULL 早退。
++ * ③ BC310（0x954310）加 first-16 唯一 x0 环：g_bc 16 槽 CAS 占位去重（g_br 范式）
++ *   枚举首 16 个唯一收件对象+各计数，x0==0/溢出各计数——45807 hits 的对象分布一屏可读。
++ * 门容量：尾部页 0x4000，16 门×104B+0x100 头部=1764B，余量充足。 */
+ enum { SMO_OBS_E1 = 0, SMO_OBS_DRAIN_A = 1, SMO_OBS_DRAIN_B = 2, SMO_OBS_CELL2 = 3,
+        SMO_OBS_KICK1 = 4, SMO_OBS_ALKICK = 5, SMO_OBS_KICK3 = 6,
+        SMO_OBS_DRAIN_ENTER = 7, SMO_OBS_DRAIN_LOOP = 8,
+-       SMO_OBS_BC310 = 9, SMO_OBS_KICKVT = 10, SMO_OBS_KICKBR = 11, SMO_OBS_N = 12 };
++       SMO_OBS_BC310 = 9, SMO_OBS_KICKVT = 10, SMO_OBS_KICKBR = 11,
++       SMO_OBS_THUNK1_IN = 12, SMO_OBS_THUNK1_NULL = 13,
++       SMO_OBS_THUNK2_IN = 14, SMO_OBS_THUNK2_NULL = 15, SMO_OBS_N = 16 };
+ typedef struct { uint32_t off, gate, tail; uint32_t word[4]; } smo_obs_site_t;
+ static const smo_obs_site_t smo_obs_site[] = {
+     {0x57f950, SMO_OBS_E1,      0, {0xa9be4ff4, 0xa9017bfd, 0x910043fd, 0xf9400408}},   /* stp x20,x19; stp x29,x30; add x29,sp,#0x10; ldr x8,[x0,#8] */
+@@ -306,6 +324,14 @@
+     /* round18 ③：br x1 本尊（单字尾门，寄存器分支变体）。word[1]=后继 0x8ad22c
+        ldrb w8,[x19,#0xe4]（b.ne 0x8ad210 的落点，装门不碰它）。 */
+     {0x8ad228, SMO_OBS_KICKBR,  1, {0xd61f0020, 0x39439268, 0, 0}},                     /* br x1（后继 0x8ad22c ldrb） */
++    /* round19 ①②：al thunk 双门×2。入口门=thunk 唯一进入分支（全镜像扫描：跳 0x587ea0
++       只有 b@0x587da4、跳 0x587eb0 只有 b@0x587db4，两门址自身零落点）；NULL 出口门=
++       cbz 早退落点（出厂字 ret，寄存器分支重放变体）。word[1]=后继原字（0x587da8/
++       0x587db8 零填充；0x587eb0=thunk2 入口 ldr x0,[x0] 不碰；0x587ec8 零填充）。 */
++    {0x587da4, SMO_OBS_THUNK1_IN,   1, {0x1400003f, 0x00000000, 0, 0}},                 /* b 0x587ea0（thunk1 全部进入） */
++    {0x587eac, SMO_OBS_THUNK1_NULL, 1, {0xd65f03c0, 0xf9400000, 0, 0}},                 /* ret（thunk1 [x0]==NULL 早退；后继=thunk2 入口） */
++    {0x587db4, SMO_OBS_THUNK2_IN,   1, {0x1400003f, 0x00000000, 0, 0}},                 /* b 0x587eb0（thunk2 全部进入） */
++    {0x587ec4, SMO_OBS_THUNK2_NULL, 1, {0xd65f03c0, 0x00000000, 0, 0}},                 /* ret（thunk2 [x0]==NULL 早退） */
+ };
+ #define SMO_OBS_E1_CAP 128
+ static struct {
+@@ -367,7 +393,11 @@
+    round18 ②：g_bc 首见补 x1（观察器参4=门点原 x1，prologue w8 抄走）；round18 ③：
+    KICKBR（0x8ad228 br x1 本尊）g_br 32 槽同款去重——tgt=寄存器真值零解引用，
+    first={this,tgt}（this=观察器 x0=kick 收件者），n_zero/over 同义。 */
+-static struct { _Atomic unsigned set; uint64_t x0, x1, tick; } g_bc;
++static struct { _Atomic unsigned set; uint64_t x0, x1, tick;
++    /* round19 ③：first-16 唯一 x0 环（CAS 占位去重，g_br 范式）——首 16 个唯一收件
++       对象+各计数；x0==0 计 xzero（空槽 sentinel 是 0，不入表）、16 槽满后 xover。 */
++    _Atomic uint64_t xv[16], xc[16], xover, xzero;
++} g_bc;
+ static struct {
+     _Atomic uint64_t val[8], cnt[8];
+     _Atomic uint64_t over, n_zero, first_vt, first_tgt, last_tgt;
+@@ -460,10 +490,28 @@
+             atomic_store_explicit(&g_k1.last_o20, o20, memory_order_relaxed);
+         }
+         /* round17 ②（round18 补 x1）：BC310 首见 {x0, x1, tick}（末见 x0 走 g_obs_x0[gate]；
+-           x1=观察器参4=门点原 x1，该函数第二实参）。 */
+-        if (gate == SMO_OBS_BC310 && !atomic_load_explicit(&g_bc.set, memory_order_relaxed)) {
+-            g_bc.x0 = x0; g_bc.x1 = x3; g_bc.tick = smo_obs_tick();
+-            atomic_store_explicit(&g_bc.set, 1, memory_order_relaxed);
++           x1=观察器参4=门点原 x1，该函数第二实参）。
++           round19 ③：first-16 唯一 x0 环——45807 hits 的收件对象分布（g_br 16 槽范式：
++           命中即计数，空槽 CAS 占位，满则 over；x0==0 只计 xzero 不入表）。 */
++        if (gate == SMO_OBS_BC310) {
++            if (!atomic_load_explicit(&g_bc.set, memory_order_relaxed)) {
++                g_bc.x0 = x0; g_bc.x1 = x3; g_bc.tick = smo_obs_tick();
++                atomic_store_explicit(&g_bc.set, 1, memory_order_relaxed);
++            }
++            if (x0 == 0) { atomic_fetch_add_explicit(&g_bc.xzero, 1, memory_order_relaxed); return; }
++            for (int i = 0; i < 16; i++) {
++                uint64_t v = atomic_load_explicit(&g_bc.xv[i], memory_order_relaxed);
++                if (v == x0) { atomic_fetch_add_explicit(&g_bc.xc[i], 1, memory_order_relaxed); return; }
++                if (v == 0) {
++                    uint64_t exp = 0;
++                    if (atomic_compare_exchange_strong_explicit(&g_bc.xv[i], &exp, x0, memory_order_relaxed, memory_order_relaxed)) {
++                        atomic_fetch_add_explicit(&g_bc.xc[i], 1, memory_order_relaxed); return;
++                    }
++                    if (exp == x0) { atomic_fetch_add_explicit(&g_bc.xc[i], 1, memory_order_relaxed); return; }
++                }
++            }
++            atomic_fetch_add_explicit(&g_bc.xover, 1, memory_order_relaxed);
++            return;
+         }
+         /* round17 ③：KICKVT 虚调目标分布——vt=[x0]（=kick this 的 vtable，游戏 0x8ad214
+            下一拍就读）、tgt=[vt+0x20]（0x8ad218 下一拍就读，br x1(0x8ad228) 的目标）。
+@@ -667,13 +715,15 @@
+         memcpy(w + 24, &fn, 8);                                             /* .quad 观察器地址 */
+         if (site->tail) {
+             /* 单字尾跳门：出厂 word[0] 是无条件 b（解出目标，stub 末尾原义重定向）或
+-               round18 ③ 的 br x1（寄存器分支，无静态目标可解码——stub 末尾原样重放
+-               br x1：prologue 已把 x1 复原成跳转目标，观察器经参4（w8 mov x3,x1 先抄）
+-               拿到目标真值）。veneer 只换这 1 个字（b→stub），相邻指令一个不动。 */
++               round18 ③ 的 br x1 / round19 ② 的 ret（寄存器分支，无静态目标可解码——
++               stub 末尾原样重放该字：prologue 已把 x1/x30 复原，重放 br x1 跳寄存器
++               目标、重放 ret 返回调用者；观察器经参4（w8 mov x3,x1 先抄）拿 x1 真值）。
++               veneer 只换这 1 个字（b→stub），相邻指令一个不动。 */
+             int brx1 = site->word[0] == 0xd61f0020u;
+-            uint64_t dst = 0;                                              /* brx1：目标在寄存器里 */
+-            if (brx1) {
+-                w[19] = 0xd61f0020u;                                       /* 原义重放 br x1 */
++            int reto = site->word[0] == 0xd65f03c0u;                       /* round19：ret（thunk NULL 出口门） */
++            uint64_t dst = 0;                                              /* 寄存器分支：目标在寄存器里 */
++            if (brx1 || reto) {
++                w[19] = site->word[0];                                     /* 原义重放 br x1 / ret */
+             } else {
+                 uint32_t imm26 = site->word[0] & 0x3ffffffu;
+                 int64_t disp = (imm26 & (1u << 25)) ? (int64_t)imm26 - (1 << 26) : (int64_t)imm26;
+@@ -703,6 +753,9 @@
+             installed++;
+             if (brx1)
+                 fprintf(stderr, "[odyssey] obs gate main+%#x (id %u, tail br x1 replayed) installed, stub at main+%#llx\n",
++                        site->off, site->gate, (unsigned long long)(uintptr_t)(stub - m->base));
++            else if (reto)
++                fprintf(stderr, "[odyssey] obs gate main+%#x (id %u, tail ret replayed) installed, stub at main+%#llx\n",
+                         site->off, site->gate, (unsigned long long)(uintptr_t)(stub - m->base));
+             else
+                 fprintf(stderr, "[odyssey] obs gate main+%#x (id %u, tail b->main+%#llx) installed, stub at main+%#llx\n",
+@@ -903,6 +956,18 @@
+     *last_tgt = atomic_load_explicit(&g_vt.last_tgt, memory_order_relaxed);
+     return 1;
+ }
++/* round19 ③（dump 侧）：BC310 first-16 唯一 x0 环。vals/cnts 各 16 槽（val==0 的槽
++   未用）、over=16 槽满后溢出、n_zero=x0==0 计数。返回 1=门命中过（环/计数有效）。 */
++int smo_obs_bc_x0ring(uint64_t vals[16], uint64_t cnts[16], uint64_t *over, uint64_t *n_zero) {
++    if (!atomic_load_explicit(&g_obs_hits[SMO_OBS_BC310], memory_order_relaxed)) return 0;
++    for (int i = 0; i < 16; i++) {
++        vals[i] = atomic_load_explicit(&g_bc.xv[i], memory_order_relaxed);
++        cnts[i] = atomic_load_explicit(&g_bc.xc[i], memory_order_relaxed);
++    }
++    *over = atomic_load_explicit(&g_bc.xover, memory_order_relaxed);
++    *n_zero = atomic_load_explicit(&g_bc.xzero, memory_order_relaxed);
++    return 1;
++}
+ /* round18 ①（dump 侧）：KICK1 首 16 次逐次快照环 + 六边际计数。
+    返回已记录条数 n（0=门未命中；>16 不会发生——ring_k 认领序号≥16 不写槽）；
+    this_/w1/f9/o20 各 cap=16 槽按命中序填充；marg={w1==0,w1!=0,f9==2,f9!=2,o20==0,o20!=0}。 */

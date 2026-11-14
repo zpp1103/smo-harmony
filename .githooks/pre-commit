@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# pre-commit：本地提交前拦掉「私有仓合法、公开仓违规」的内容。
+#
+# 为什么需要它（2026-11-14）：这个仓库有两个 remote（origin 私有 / github 公开镜像），
+# 共用同一工作树。pre-push 只能拦住"直推公开仓"这一条路，拦不住内容本身在索引里被提交、
+# 也拦不住有人新克隆后没启用钩子。所以在入口再钉一层：内容一旦进索引就不许。
+#
+# 拦截四类（命中即打印「文件 + 原因」并以 1 退出）：
+#   1) 暂存区的图片字节含厂商标记（Nintendo / AuthoringTool）
+#   2) build-profile.json5 含非空 keyPassword / storePassword（DevEco 回写的口令）
+#   3) 路径含 AGENTS.md（内部会话规约）
+#   4) *.pyc / __pycache__/（编译缓存）
+#
+# 只检查新增/修改/改名（A/C/M/R）；删除(D)一律放行——删除私有物只会减少泄漏面，
+# 否则 `git rm --cached AGENTS.md` 这种"去跟踪"动作反而提交不了。
+#
+# 必须兼容 macOS 自带 bash 3.2：不要用 mapfile / readarray / 关联数组。
+set -uo pipefail
+
+fail=0
+hit() { # $1=文件 $2=原因
+  printf '  ✗ %s\n    原因：%s\n' "$1" "$2" >&2
+  fail=1
+}
+
+# 注意：这里刻意先把暂存内容落到临时文件再 grep，而不是 `git show | grep -q`。
+# grep -q 命中即提前退出会让 git show 收到 SIGPIPE，配合 set -o pipefail
+# 会把「命中」误判成「失败」——钩子静默失效，比不写钩子更危险。
+tmpf=$(mktemp "${TMPDIR:-/tmp}/precommit.XXXXXX") || exit 1
+trap 'rm -f "$tmpf"' EXIT
+
+staged_to_tmp() { git show ":$1" >"$tmpf" 2>/dev/null || : >"$tmpf"; }
+
+while IFS= read -r -d '' f; do
+  [ -n "$f" ] || continue
+
+  # 4) 编译缓存
+  case "$f" in
+    *.pyc|*__pycache__/*)
+      hit "$f" "编译缓存（*.pyc / __pycache__/）不入库"
+      continue ;;
+  esac
+
+  # 3) 内部会话规约
+  case "$f" in
+    *AGENTS.md*)
+      hit "$f" "AGENTS.md 是内部规约，不入库（本地保留即可）"
+      continue ;;
+  esac
+
+  # 2) 签名口令
+  case "$f" in
+    *build-profile.json5)
+      staged_to_tmp "$f"
+      # 键在 JSON5 里是带引号的："keyPassword": "xxxx"（值非空才算命中；空串 "" 放行）
+      if grep -E -q "(keyPassword|storePassword)[\"']?[[:space:]]*:[[:space:]]*[\"'][^\"']+[\"']" "$tmpf"; then
+        hit "$f" "build-profile.json5 含非空 keyPassword/storePassword（签名口令），不入库"
+      fi
+      continue ;;
+  esac
+
+  # 1) 图片字节里的厂商标记
+  lf=$(printf '%s' "$f" | tr '[:upper:]' '[:lower:]')
+  case "$lf" in
+    *.jpg|*.jpeg|*.png|*.webp)
+      staged_to_tmp "$f"
+      if grep -a -E -q 'Nintendo|AuthoringTool' "$tmpf"; then
+        hit "$f" "图片字节含厂商标记（Nintendo/AuthoringTool），工作树里应是中性占位图"
+      fi
+      continue ;;
+  esac
+done < <(git diff --cached --name-only --diff-filter=ACMR -z)
+
+if [ "$fail" -ne 0 ]; then
+  cat >&2 <<'EOF'
+
+✗ 提交被拦截：以上内容是「私有合法、公开违规」，不能进库。
+
+  想只提交其它文件：git restore --staged <上面列出的文件>
+  想确认公开仓会推出去什么：bash tools/public/publish.sh --dry-run
+  确实要临时跳过本地钩子：git commit --no-verify（需说明理由；推公开仓不允许跳过）
+EOF
+  exit 1
+fi
+
+exit 0

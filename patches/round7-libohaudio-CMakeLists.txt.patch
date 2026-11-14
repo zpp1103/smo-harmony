@@ -1,0 +1,19 @@
+--- entry/src/main/cpp/CMakeLists.txt	2026-10-31 18:10:08
++++ /Users/zpp/VibeCoding/ns-mario-odessy-to-harmony/mario-odessy-harmony/entry/src/main/cpp/CMakeLists.txt	2026-11-01 00:42:19
+@@ -13,6 +13,8 @@
+ find_library(VULKAN_LIB vulkan)
+ find_library(HLOG_LIB hilog_ndk.z)
+ find_library(ACE_NAPI ace_napi.z)
++# round7：虚拟默认输出设备的真机出口（ohos_stub.c AudioUnit 段 → OH_AudioRenderer 写端）
++find_library(OHAUDIO_LIB ohaudio)
+ 
+ # 宿主源码：MacNativeGames games/odyssey/runtime（1.4.1 匹配）；opus_codec 需 libopus，电影音频周末接 oh_audio
+ # x86_64（模拟器）：游戏本体是 ARM64 重写镜像无法执行，壳层验证专用（game_napi 返回 2）
+@@ -63,6 +65,7 @@
+   ${VULKAN_LIB}
+   ${HLOG_LIB}
+   ${ACE_NAPI}
++  ${OHAUDIO_LIB}
+   ace_ndk.z
+   EGL
+   GLESv3

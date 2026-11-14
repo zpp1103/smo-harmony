@@ -1,0 +1,16 @@
+--- entry/src/main/cpp/host/audio_mixer.c	2026-10-31 18:10:08
++++ /Users/zpp/VibeCoding/ns-mario-odessy-to-harmony/mario-odessy-harmony/entry/src/main/cpp/host/audio_mixer.c	2026-11-01 00:42:14
+@@ -749,7 +749,12 @@
+     case 5: { int32_t n = 2; IPC_OUT(rs, n); return; }                                               /* GetActiveChannelCount */
+     case 13: { IpcBuffer b = out_buffer(rq, &pointer); put_name(&b, rs, pointer); return; }          /* GetActiveAudioOutputDeviceName [13.0.0+] */
+     case 14: { IpcBuffer b = out_buffer(rq, &pointer); int32_t n = b.size >= 0x100 ? 1 : 0; if (n) put_name(&b, rs, pointer); IPC_OUT(rs, n); return; }   /* ListAudioOutputDeviceName [13.0.0+] */
+-    case 4: case 11: case 12: { static uint32_t ev; if (!ev) ev = runtime_event_new(); rs->copy[rs->ncopy++] = runtime_event_readable(ev); return; }   /* device change events: never signalled, the device does not change */
++    /* device change events: 首次 Query 创建共享事件后立即 signal 一次 =「设备表枚举完成，默认输出设备
++       AudioTvOutput 可用」（List/GetActive 上方各 case 已返回它）——对齐 Ryujinx AudioDevice.cs 构造函数
++       _systemEvent.ReadableEvent.Signal()：三命令共用一事件、构造时 signal 一次，是行业模拟器行为而非盲
++       signal；signal 发生在句柄交给游戏之前，与 0x1026 复位自旋无竞态（自旋在 Query 返回后才启动）。
++       后续仅真变更再 signal（接 OHAudio 路由回调时），不做周期性 signal；不碰 0x1003（renderer 事件）。 */
++    case 4: case 11: case 12: { static uint32_t ev; if (!ev) { ev = runtime_event_new(); runtime_event_signal(ev); } rs->copy[rs->ncopy++] = runtime_event_readable(ev); return; }
+     default: ipc_unimplemented(s, rq);
+     }
+ }

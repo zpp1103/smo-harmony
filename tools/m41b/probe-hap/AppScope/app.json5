@@ -1,0 +1,10 @@
+{
+  "app": {
+    "bundleName": "com.vibecc.smo",
+    "vendor": "vibecc",
+    "versionCode": 1000000,
+    "versionName": "1.4.1-m41bprobe",
+    "icon": "$media:layered_image",
+    "label": "$string:app_name"
+  }
+}

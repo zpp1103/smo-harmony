@@ -1,0 +1,67 @@
+diff --git a/mario-odessy-harmony/entry/src/main/cpp/host/threads.c b/mario-odessy-harmony/entry/src/main/cpp/host/threads.c
+--- a/mario-odessy-harmony/entry/src/main/cpp/host/threads.c
++++ b/mario-odessy-harmony/entry/src/main/cpp/host/threads.c
+                   (unsigned long long)kd[3], (unsigned long long)smo_obs_hits(4));
+       else fprintf(stderr, "[totk-dump] kick1 cond: none (gate never hit)\n");
+       }
++      /* round18 ①：KICK1 首 16 次逐次快照环 + 六边际计数（与上方三分支交叉互补：
++         边际不受交叉条件限制，f9/o20 的分布在 w1==0 直虚调路径上也可见）。 */
++      {
++      extern unsigned smo_obs_k1_hist16(uint64_t[16], uint64_t[16], uint64_t[16], uint64_t[16], uint64_t[6], uint64_t *);
++      uint64_t rh[16], rw[16], rf[16], ro[16], rm[6], rtot = 0;
++      unsigned rn = smo_obs_k1_hist16(rh, rw, rf, ro, rm, &rtot);
++      fprintf(stderr, "[totk-dump] kick1 first16: recorded=%u/%llu | marg: w1==0=%llu w1!=0=%llu f9==2=%llu f9!=2=%llu o20==0=%llu o20!=0=%llu\n",
++              rn, (unsigned long long)rtot,
++              (unsigned long long)rm[0], (unsigned long long)rm[1], (unsigned long long)rm[2],
++              (unsigned long long)rm[3], (unsigned long long)rm[4], (unsigned long long)rm[5]);
++      for (unsigned i = 0; i < rn; i++)
++          fprintf(stderr, "[totk-dump] kick1 first16[%u]: this=%#llx w1=%llu [this+0xf9]=%#llx [this+0x20]=%#llx\n",
++                  i, (unsigned long long)rh[i], (unsigned long long)rw[i],
++                  (unsigned long long)rf[i], (unsigned long long)ro[i]);
++      }
+       /* round17 ②：BC310 广播调用点（donor main+0x954310，CreateThread→StartThread→svc0x1d
+          广播序列现场 x3 恒=该入口值，且全镜像无直接分支落此＝只经指针调用）。emu hits>0 ⇒
+          emu main 执行了同一 boot 广播链；first/last x0=该函数收的对象（InitSystem 收件箱归属）。 */
+       {
+-      extern int smo_obs_bc_snapshot(uint64_t *, uint64_t *);
+-      uint64_t bfx0 = 0, bfts = 0;
+-      int bchit = smo_obs_bc_snapshot(&bfx0, &bfts);
+-      fprintf(stderr, "[totk-dump] obs bc310 0x954310 hits=%llu first_x0=%s%#llx (at +%lluns) last_x0=%#llx\n",
++      extern int smo_obs_bc_snapshot(uint64_t *, uint64_t *, uint64_t *);
++      uint64_t bfx0 = 0, bfx1 = 0, bfts = 0;
++      int bchit = smo_obs_bc_snapshot(&bfx0, &bfx1, &bfts);
++      fprintf(stderr, "[totk-dump] obs bc310 0x954310 hits=%llu first_x0=%s%#llx x1=%s%#llx (at +%lluns) last_x0=%#llx\n",
+               (unsigned long long)smo_obs_hits(9), bchit ? "" : "0/", bchit ? (unsigned long long)bfx0 : 0ULL,
++              bchit ? "" : "0/", bchit ? (unsigned long long)bfx1 : 0ULL,
+               (unsigned long long)bfts, (unsigned long long)smo_obs_last_x0(9));
+       }
+       /* round17 ③：KICKVT 虚调目标分布（0x8ad214 取数点：vt=[this]、tgt=[vt+0x20]＝
+@@ -1458,6 +1474,28 @@
+       } else fprintf(stderr, "[totk-dump] obs kickvt 0x8ad214 hits=%llu (gate never hit)\n",
+                      (unsigned long long)smo_obs_hits(10));
+       }
++      /* round18 ③：KICKBR（0x8ad228 br x1 本尊，单字尾门）——x1 寄存器真值 32 槽分布，
++         每槽符号化（runtime_module_offset）出模块+偏移；与 kickvt 的内存推导值
++         （vt=[this]、[vt+0x20]）互证：两值不一致即取数链/寄存器被改道的直接证据，
++         emu tgt 指向 HLE thunk 表或错误槽=虚路径分叉实锤。 */
++      {
++      extern int smo_obs_kickbr_dist(uint64_t[32], uint64_t[32], uint64_t *, uint64_t *, uint64_t[2], uint64_t *);
++      uint64_t kbv[32], kbc[32], kbover = 0, kbzero = 0, kbf[2], kblast = 0;
++      if (smo_obs_kickbr_dist(kbv, kbc, &kbover, &kbzero, kbf, &kblast)) {
++          const char *nm; uint64_t off;
++          fprintf(stderr, "[totk-dump] obs kickbr 0x8ad228 hits=%llu zero=%llu over=%llu first this=%#llx tgt(x1)=%#llx last_tgt=%#llx\n",
++                  (unsigned long long)smo_obs_hits(11), (unsigned long long)kbzero, (unsigned long long)kbover,
++                  (unsigned long long)kbf[0], (unsigned long long)kbf[1], (unsigned long long)kblast);
++          for (int i = 0; i < 32; i++) {
++              if (!kbv[i]) continue;
++              fprintf(stderr, "[totk-dump] kickbr dist[%d]: x1=%#llx cnt=%llu", i,
++                      (unsigned long long)kbv[i], (unsigned long long)kbc[i]);
++              if (runtime_module_offset(kbv[i], &nm, &off)) fprintf(stderr, " -> %s+%#llx", nm, (unsigned long long)off);
++              fputc('\n', stderr);
++          }
++      } else fprintf(stderr, "[totk-dump] obs kickbr 0x8ad228 hits=%llu (gate never hit)\n",
++                     (unsigned long long)smo_obs_hits(11));
++      }
+       /* round16b E2b 归属：上轮 E2a this=0x7f76fcdaf8 与 h1020/h1023 arg 同 0x7f76fc 邻域。
+          对 E2 this 做池反查（宿主 NVN 池账本 gfx_bridge nvn_pool_ledger，±0x4000 页距容差）
+          + CreateThread 账本同 64K 邻域 arg 对照，一行打归属推断依据（谁的对象）。

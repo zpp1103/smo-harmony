@@ -1,0 +1,16 @@
+{
+  "app": {
+    // {{...}} 占位由 scripts/build_hap_from_profile.py 从 games/<titleID>/game.tsv 实例化：
+    //   HAP_BUNDLE  ← hap_bundle 键（bundleName）
+    //   HAP_LABEL   ← hap_label 键（经 AppScope/resources/.../string.json 的 app_name 落地）
+    //   HAP_VERSION ← package 行的 display 版本（versionName）
+    "bundleName": "{{HAP_BUNDLE}}",
+    "vendor": "vibecc",
+    "versionCode": 1000000,
+    "versionName": "{{HAP_VERSION}}",
+    // icon 占位：模板自带通用 icon.jpg（AppScope/resources/base/media/）；
+    // 档案要换图标时把 NSP control 的 icon.jpg 放进 host_override/ 对应 resources 路径即可（hap_icon 键）。
+    "icon": "$media:icon",
+    "label": "$string:app_name"
+  }
+}

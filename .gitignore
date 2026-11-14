@@ -1,0 +1,63 @@
+infra/
+.zcode/
+**/node_modules/
+**/build/
+**/.build/
+**/.hvigor/
+**/.cxx/
+**/.idea/
+**/oh_modules/
+*.hap
+*.so
+game-work/build-log.txt
+game-work/logs/*.log
+mario-odessy-harmony/local.properties
+# 本地工作件（不进库）
+signing-mario/
+swiftshader/
+swiftshader-dl/
+logs/
+shots/
+hap-archive/
+scripts_round*/
+emu_round*_run.sh
+emulator-nova16pro.log
+stage_material.js
+docs/local/
+
+# 外部参考克隆（自带 .git，不追踪）
+third/
+
+# 架构师：产物/日志不入库（2026-11-02）
+m0b-logs/
+m15-pack/
+shader-conv/
+emulator-*.log
+game-work/notes/
+
+# M3r：离线烘焙的 shader 语料（.spv/索引），只进 HAP 打包，绝不进 git
+mario-odessy-harmony/entry/src/main/resources/rawfile/shadercache/
+
+# 临时 boot 驱动脚本（一次性取证用，不入库）
+m3*_boot_run.sh
+m4*_boot_run.sh
+
+# 编译产物
+tools/m4b/pairbake
+tools/m3q/m3q_translate
+__pycache__/
+
+# 一次性里程碑脚本（每轮临时 boot/分析脚本；常驻模板见 scripts/boot/、scripts/build_tools/）
+/*_boot_run*.sh
+/*_an.py
+/*_timeline.sh
+/*_tex2png.py
+/*_pam2png.py
+/*_comp_extract.py
+/*_png*.py
+/e1e2_*.sh
+/emu_cycle.sh
+/scripts_round*_boot.sh
+
+# 会话规约：含内部纪律与发布红线，不入库（本地磁盘保留）
+/AGENTS.md

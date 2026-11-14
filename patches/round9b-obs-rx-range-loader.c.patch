@@ -1,0 +1,27 @@
+--- entry/src/main/cpp/host/loader.c
++++ /Users/zpp/VibeCoding/ns-mario-odessy-to-harmony/mario-odessy-harmony/entry/src/main/cpp/host/loader.c
+@@ -21,6 +21,7 @@
+ #include "runtime_tables.h"
+ #include "game_patches.h"
+ #include "game_version.h"
++void smo_obs_rx_range(uint64_t *lo, uint64_t *hi);   /* round9b：E-gate 尾部 stub 页的 RX 区间（game_patches.c；未安装时 hi=0） */
+ #define NM (sizeof(modules)/sizeof(modules[0]))
+ pthread_key_t runtime_keys[8];
+ static uint64_t timer_calls, svc_calls;
+@@ -268,6 +269,7 @@
+ }
+ static void check_permissions(Module *m) {
+  mach_vm_address_t a=(uintptr_t)m->base,end=a+m->size;
++ uint64_t obs_lo=0,obs_hi=0;smo_obs_rx_range(&obs_lo,&obs_hi);   /* round9b：E-gate 尾部 stub 页（game_patches.c mprotect 成 RX 的那页；未装=0） */
+  while(a<end) {
+   mach_vm_size_t size=0;vm_region_basic_info_data_64_t info;mach_msg_type_number_t count=VM_REGION_BASIC_INFO_COUNT_64;mach_port_t obj=0;
+   mach_vm_address_t requested=a;
+@@ -278,7 +280,7 @@
+   mach_vm_address_t lo=a>(uintptr_t)m->base?a:(uintptr_t)m->base,hi=a+size<end?a+size:end;
+   for(mach_vm_address_t p=lo;p<hi;p+=4096) {
+    uint64_t off=p-(uintptr_t)m->base;
+-   vm_prot_t expected=off>=page_up(m->file_size)?(VM_PROT_READ|VM_PROT_WRITE):
++   vm_prot_t expected=off>=page_up(m->file_size)?(p>=obs_lo&&p<obs_hi?(VM_PROT_READ|VM_PROT_EXECUTE):(VM_PROT_READ|VM_PROT_WRITE)):
+     (off<page_up(m->text_end)||off>=m->patch_off)?(VM_PROT_READ|VM_PROT_EXECUTE):
+     ((off>=page_up(m->text_end)&&off<(m->data_off&~0x3fffULL))||(off>=m->key_off&&off<m->key_off+0x4000ULL))?VM_PROT_READ:(VM_PROT_READ|VM_PROT_WRITE);
+    if(info.protection!=expected){char pmsg[176];snprintf(pmsg,sizeof pmsg,"module permission mismatch %s off=%#llx region=[%#llx,%#llx) prot=%u expected=%u",m->name,(unsigned long long)off,(unsigned long long)a,(unsigned long long)(a+size),info.protection,expected);runtime_fail(pmsg);}

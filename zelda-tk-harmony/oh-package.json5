@@ -1,0 +1,8 @@
+{
+  "name": "zelda-tk-harmony",
+  "version": "1.0.0",
+  "description": "Tears of the Kingdom 1.1.2 native port for HarmonyOS (translated ARM64 code + Horizon HLE host + NVN-on-Vulkan)",
+  "main": "",
+  "author": "vibecc",
+  "license": "MIT"
+}

@@ -1,0 +1,89 @@
+--- /Users/zpp/ZCodeProject/switch2mac/switch2hos/mario-odessy-harmony/entry/src/main/cpp/host/game_patches.c	2026-11-01 08:27:46
++++ /Users/zpp/VibeCoding/ns-mario-odessy-to-harmony/mario-odessy-harmony/entry/src/main/cpp/host/game_patches.c	2026-11-01 09:41:18
+@@ -222,9 +222,21 @@
+  *   到达），故走单字门（tail=1）：出厂 b→stub 计数→stub 尾 b 回原目标 0x8ad1f0，
+  *   无重放、不碰相邻 thunk（0x587eb0 起是另一个活 thunk）。KICK1−ALKICK=直接调用路径。
+  * KICK3 main+0x8ad318（kick 三参变体 0x8ad310 族的合流点：0x8ad310 and;0x8ad314 mov
+- *   顺流至此，0x8a671c cbz 也跳此——全镜像无其它落点，扫描实证）。同为单字门。 */
++ *   顺流至此，0x8a671c cbz 也跳此——全镜像无其它落点，扫描实证）。同为单字门。
++ * round15 定向 watch（末三注册分析建议①）：kick 三门 13c/14c 全程 hits=0 后，区分主线程
++ * 排空路径「循环没跑」vs「跑了但链表恒空（kick 分支不满足）」——
++ * DRAIN-ENTER main+0x8abf70（主线程排空函数入口，其循环体 0x8abf94 的 bl 0x8ad1f0 即 kick 直接
++ *   调用源之二；str/stp/stp/add 四寄存器字，全镜像扫描无窗内落点）。与 KICK1 联读三分支：
++ *   ENTER=0 → 排空函数从未被调（两个调用源均未到达，上游断链实锤）；
++ *   ENTER>0 ∧ KICK1=0 → 每次进排空都走 b.eq 空表捷径（0x8abf84 cmp x0,[x0+8]）＝链表恒空＝
++ *   E2b 完成包从未入队的指令级证据；ENTER>0 ∧ KICK1>0 → kick 已被派发（破局）。
++ *   非空前置块 0x8abf8c 不可门：循环回边 0x8abfac b.ne 落 0x8abf94＝窗内第 3 字（全镜像扫描
++ *   实证），veneer 必炸；bl 本身含 PC 相对字亦不可重放。al thunk 0x587ea0 入口同理不可门
++ *   （第 2/3 字=cbz/b 出窗控制流），ALKICK(0x587ea8) 继续承担该路径唯一计数——记录在案。
++ * 门容量：尾部页 0x4000，8 门×88B+0x100 头部=804B，余量充足。 */
+ enum { SMO_OBS_E1 = 0, SMO_OBS_DRAIN_A = 1, SMO_OBS_DRAIN_B = 2, SMO_OBS_CELL2 = 3,
+-       SMO_OBS_KICK1 = 4, SMO_OBS_ALKICK = 5, SMO_OBS_KICK3 = 6, SMO_OBS_N = 7 };
++       SMO_OBS_KICK1 = 4, SMO_OBS_ALKICK = 5, SMO_OBS_KICK3 = 6,
++       SMO_OBS_DRAIN_ENTER = 7, SMO_OBS_N = 8 };
+ typedef struct { uint32_t off, gate, tail; uint32_t word[4]; } smo_obs_site_t;
+ static const smo_obs_site_t smo_obs_site[] = {
+     {0x57f950, SMO_OBS_E1,      0, {0xa9be4ff4, 0xa9017bfd, 0x910043fd, 0xf9400408}},   /* stp x20,x19; stp x29,x30; add x29,sp,#0x10; ldr x8,[x0,#8] */
+@@ -240,6 +252,8 @@
+     {0x8ad1f4, SMO_OBS_KICK1,   0, {0xa9017bfd, 0x910043fd, 0xaa0003f3, 0x7100043f}},   /* stp x29,x30,[sp,#0x10]; add x29,sp,#0x10; mov x19,x0; cmp w1,#1 */
+     {0x587ea8, SMO_OBS_ALKICK,  1, {0x140c94d2, 0xd65f03c0, 0, 0}},                     /* b 0x8ad1f0（后继 0x587eac ret） */
+     {0x8ad318, SMO_OBS_KICK3,   1, {0x14000002, 0x00000000, 0, 0}},                     /* b 0x8ad320（后继 0x8ad31c udf 填充） */
++    /* round15 排空路径门（0x8abf70 反汇编实测字，main.patched.bin 校验一致）： */
++    {0x8abf70, SMO_OBS_DRAIN_ENTER, 0, {0xf81d0ff5, 0xa9014ff4, 0xa9027bfd, 0x910083fd}}, /* str x21,[sp,#-0x30]!; stp x20,x19; stp x29,x30; add x29,sp,#0x20 */
+ };
+ #define SMO_OBS_E1_CAP 128
+ static struct {
+@@ -248,6 +262,16 @@
+     unsigned n, truncated; uint64_t obj, arr;
+     uint64_t el[SMO_OBS_E1_CAP], thiz[SMO_OBS_E1_CAP];
+ } g_e1;
++/* round15 变迁史（末三注册分析建议②）：E1 快照只存末值（threads.c 旧 1385-1401），count 从 N
++   缩到 2 的时刻无从对账。观察器在 26k/s 洪流里只在 count/arr 变化时记一笔 {E1 hits, count, arr}
++   （hits 单调，两次 dump 的 hits 差≈耗时 → 缩点时刻可换算），64 槽环形覆盖保最旧 64 条之外
++   的最近 64 条；写入仍是纯定长拷贝+原子头指针（观察器无锁无 I/O 红线不变）。 */
++#define SMO_OBS_E1_HIST 64
++static struct {
++    _Atomic unsigned head;                      /* 已记录变迁总数（环覆盖） */
++    uint32_t lastc; uint64_t lastarr;           /* 上次记录值（去重；E1 单线程调用，无竞争） */
++    struct { uint64_t hits, arr; uint32_t cnt; } e[SMO_OBS_E1_HIST];
++} g_e1h;
+ static _Atomic uint64_t g_obs_hits[SMO_OBS_N], g_obs_x0[SMO_OBS_N];
+ /* round12e cell 链一次性快照（SMO_OBS_CELL2）：{cell1,table1,fn1, cell2,table2,fn2}
+    对应 cell 0x1363dc8（=Map，验证链条读法）与 cell 0x136deb8（待定名）。 */
+@@ -291,6 +315,15 @@
+     uint64_t h0 = hdr[0], arr = hdr[1];
+     if (arr < 0x100000000ULL) return;
+     unsigned n = (unsigned)(uint32_t)h0;
++    /* round15 变迁史：count/arr 变化才记（同一值洪流不刷环）。hits 用本门单调计数对账时刻。 */
++    if (n != g_e1h.lastc || arr != g_e1h.lastarr) {
++        g_e1h.lastc = n; g_e1h.lastarr = arr;
++        unsigned k = atomic_load_explicit(&g_e1h.head, memory_order_relaxed);
++        g_e1h.e[k % SMO_OBS_E1_HIST].hits = atomic_load_explicit(&g_obs_hits[SMO_OBS_E1], memory_order_relaxed);
++        g_e1h.e[k % SMO_OBS_E1_HIST].cnt = n;
++        g_e1h.e[k % SMO_OBS_E1_HIST].arr = arr;
++        atomic_store_explicit(&g_e1h.head, k + 1, memory_order_relaxed);
++    }
+     unsigned m = n > SMO_OBS_E1_CAP ? SMO_OBS_E1_CAP : n;
+     unsigned s = (unsigned)atomic_load_explicit(&g_e1.seq, memory_order_relaxed);
+     atomic_store_explicit(&g_e1.seq, s + 1, memory_order_relaxed);           /* 奇=写入中 */
+@@ -496,6 +529,20 @@
+     unsigned s1 = (unsigned)atomic_load_explicit(&g_e1.seq, memory_order_relaxed);
+     return s0 == s1 ? n : 0;                                                /* 读期间又写入：作废 */
+ }
++/* round15：E1 count 变迁史（dump 侧）。返回本次可读条数（≤cap），按时间序填
++   hits[]/cnt[]/arrp[]；*total_out=全部变迁数（>64 时环已覆盖最旧）。 */
++unsigned smo_obs_e1_hist(uint64_t *hits, uint32_t *cnt, uint64_t *arrp, unsigned cap, unsigned *total_out) {
++    unsigned total = atomic_load_explicit(&g_e1h.head, memory_order_relaxed);
++    if (total_out) *total_out = total;
++    unsigned n = total > SMO_OBS_E1_HIST ? SMO_OBS_E1_HIST : total;
++    if (n > cap) n = cap;
++    unsigned start = total > SMO_OBS_E1_HIST ? total - SMO_OBS_E1_HIST : 0;
++    for (unsigned i = 0; i < n; i++) {
++        unsigned k = (start + i) % SMO_OBS_E1_HIST;
++        hits[i] = g_e1h.e[k].hits; cnt[i] = g_e1h.e[k].cnt; arrp[i] = g_e1h.e[k].arr;
++    }
++    return n;
++}
+ 
+ void runtime_game_patches(Module *main_module) {
+     patch_render_res(main_module);

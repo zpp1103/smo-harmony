@@ -1,0 +1,18 @@
+--- entry/src/main/cpp/ohos_compat/include/AudioToolbox/AudioToolbox.h	2026-10-31 18:10:08
++++ /Users/zpp/VibeCoding/ns-mario-odessy-to-harmony/mario-odessy-harmony/entry/src/main/cpp/ohos_compat/include/AudioToolbox/AudioToolbox.h	2026-11-01 00:42:09
+@@ -70,7 +70,7 @@
+ OSStatus AudioQueueReset(AudioQueueRef aq);
+ OSStatus AudioQueueSetParameter(AudioQueueRef aq, AudioQueueParam param, double value);
+ 
+-// ---- AudioUnit / AudioComponent（audio_mixer 渲染链）：stub 失败返回，周末接 oh_audio ----
++// ---- AudioUnit / AudioComponent（audio_mixer 渲染链）：round7 实装为虚拟默认输出设备（ohos_stub.c） ----
+ typedef struct OpaqueAudioComponent *AudioComponent;
+ typedef struct OpaqueAudioComponentInstance *AudioComponentInstance;
+ typedef unsigned int AudioUnitRenderActionFlags;
+@@ -110,3 +110,6 @@
+                               unsigned int element, const void *data, unsigned int dataSize);
+ OSStatus AudioUnitGetProperty(AudioComponentInstance inst, unsigned int propID, AudioUnitScope scope,
+                               unsigned int element, void *data, unsigned int *dataSize);
++/* round7 前无原型（调用点隐式声明）；实装在 ohos_stub.c 虚拟输出设备段 */
++OSStatus AudioOutputUnitStart(AudioComponentInstance inst);
++OSStatus AudioOutputUnitStop(AudioComponentInstance inst);

@@ -1,0 +1,9 @@
+{
+  "name": "entry",
+  "version": "1.0.0",
+  "description": "m41b vk probe",
+  "main": "",
+  "author": "",
+  "license": "",
+  "dependencies": { "libvkprobe.so": "file:./src/main/cpp/types/libvkprobe" }
+}

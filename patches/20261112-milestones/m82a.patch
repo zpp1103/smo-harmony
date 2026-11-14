@@ -1,0 +1,998 @@
+--- mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c
++++ mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c
+@@ -50,6 +50,7 @@
+ #include <sys/syscall.h>
+ #endif
+ #include <sys/mman.h>   /* M4h P2：file-backed 映射，避免 412 MB 匿名常驻被 LMK 杀 */
++#include <sys/resource.h>   /* M68B：上屏泵的 setpriority（smo_m68b_pump_nice，缺省 0 = 不动） */
+ /* M4be P1：两个 arena 级全局的真定义在文件后部（常量区映射/纹理层），但初始化/回卷点更靠前，
+    这里先做 tentative 声明（C 允许：只有一个带初始化）。 */
+ static uint32_t g_min_ubo_align;   /* minUniformBufferOffsetAlignment（c1 槽粒度） */
+@@ -10617,7 +10618,145 @@
+ #else
+     (void)dst; (void)addr; (void)len; return 0;
+ #endif
++}
++/* ================= M82A（2026-11-12）：**真机专属根因族** —— 客体 UBO 超额读跨 VMA 边界 =================
++   一句话：`r_guest_copy(dst, src, 4096)` 对 `size < 4096` 的 UBO 绑定是**故意超额读**（M4au P2.b：让
++   shader 读越界尾巴时看到 0 而不是别人的常量）。真机上这些小 UBO 常落在 VMA 页尾，4096 B 一跨页就
++   EFAULT，内核**整段不拷**（返回 0）⇒ `if (cp < slot) memset(dst + cp, 0, slot - cp)` 把整个 4 KiB
++   常驻槽清零 ⇒ 描述符指的槽 = 全 0。模拟器堆连续映射多页，同样的读全部成功 ⇒ 这就是「只在真机出现」的来源。
++
++   现场证据（M80A 现存 HAP 的探针，零 build；手机 192.168.1.199:38201 vs 模拟器 m39e_b1）：
++     · 同一游戏进度（两端 `[u] ubo totals binds=5423` 完全相等）：模拟器 `trunc=0` / 手机 **`trunc=4223`**（78 %）；
++     · `[u] ubo bind st=0 bank=0 sz=128`：模拟器 `win=4096` / 手机 **`win=0`**；
++     · 大块读没坏（⇒ 不是 seccomp/权限）：`[z] idx0 meta read=65536`、`sz=65536 win=65536` 两端一致；
++     · comp pass 的 bank3 走 ABI 位移到 **bind idx 0**（`r_ubo_offset` 的 `bank-3`；off = `r_sticky_off(stage,0)`
++       = 7077888/7208960 **是公式常量**，不是"绑定一致"的证据）⇒ 该槽内容 = 最后一次 idx0 绑定的字节：
++       模拟器 `f0=4.2726 f5=7.5958`、手机全 0 ⇒ FS `out = texture(t0,uv)*c3[0] + c3[1]` 的 scale/bias 全 0
++       ⇒ 合成输出恒 0（黑），与采样源 `id=436 bmean=158` 有内容完全自洽。
++
++   开关 files/smo_m82a（缺省 0 = 逐字节旧行为；每 1024 次绑定重读一次，hdc 改位数秒生效）：
++     bit0(1)  **VMA 钳位 + 按页容错读**：先按 /proc/self/maps 把读窗钳进所在 VMA 的 [start,end)，
++              再按页边界切块逐块读；遇 EFAULT 停下并**保留已读前缀**，只把未读到的尾部清零
++              （绝不再整槽 memset）。钳位失败时退回「纯按页 readv」兜底。
++     bit1(2)  探针：前 16 条 `sz<=1024` 的小绑定各一行 —— 平读/按页读/原始 readv 三个字节数 + errno +
++              命中的 maps 行（start/end/perms），并记 stage/idx（回答"为什么 128 B 要跨 4096 读"）。
++   计数：`[u] ubo m82a`（clamped=被钳次数 / partial=前缀保住 / fail=一条都没读到 / rb=修前 <sz 修后 >=sz）。 */
++#define M82A_A "/data/storage/el2/base/files/smo_m82a"
++#define M82A_B "/data/app/el2/100/base/com.vibecc.smo/files/smo_m82a"
++static int g_m82a_v = -2;
++static unsigned g_m82a_calls;
++static unsigned long long g_m82a_clamped, g_m82a_partial, g_m82a_fail, g_m82a_bytes, g_m82a_rb;
++static unsigned g_m82a_probe_n;
++static uint8_t g_m82a_scratch[4096];
++typedef struct { uint64_t lo, hi; char perms[8]; } m82a_vma;
++static m82a_vma g_m82a_vc[8];
++static unsigned g_m82a_vcn;
++static void m82a_seed(void)
++{
++    const char *p[2] = { M82A_A, M82A_B };
++    for (int i = 0; i < 2; i++) { FILE *f = fopen(p[i], "r"); if (f) { fclose(f); return; } }
++    for (int i = 0; i < 2; i++) {
++        FILE *f = fopen(p[i], "w");
++        if (f) { fputs("0\n", f); fclose(f); vk_boot_logf("[m82a] seeded %s = 0", p[i]); return; }
++    }
+ }
++static int m82a_bits(void)
++{
++    if (g_m82a_v == -2) { m82a_seed(); g_m82a_v = p_file_int(M82A_A, M82A_B, 0); g_m82a_calls = 0; }
++    else if ((++g_m82a_calls & 1023u) == 0) g_m82a_v = p_file_int(M82A_A, M82A_B, g_m82a_v);
++    return (g_m82a_v < 0) ? 0 : (g_m82a_v & 3);
++}
++int nvn_vk_m82a_mode(void) { return m82a_bits(); }   /* M82A：只给 [u] ubo m82a 行报当前位（探针归因） */
++void nvn_vk_m82a_stats(unsigned long long *clamped, unsigned long long *partial,
++                       unsigned long long *fail, unsigned long long *bytes, unsigned long long *rb)
++{
++    if (clamped) *clamped = g_m82a_clamped;
++    if (partial) *partial = g_m82a_partial;
++    if (fail) *fail = g_m82a_fail;
++    if (bytes) *bytes = g_m82a_bytes;
++    if (rb) *rb = g_m82a_rb;
++}
++/* 找 a 所在的 VMA（/proc/self/maps；小 ring 缓存，避免每次绑定都解析）。0 = 找不到（未映射/权限外）。 */
++static int m82a_vma_find(uint64_t a, m82a_vma *out)
++{
++    for (unsigned i = 0; i < g_m82a_vcn && i < 8u; i++)
++        if (a >= g_m82a_vc[i].lo && a < g_m82a_vc[i].hi) { if (out) *out = g_m82a_vc[i]; return 1; }
++    FILE *f = fopen("/proc/self/maps", "r");
++    if (!f) return 0;
++    char line[400];
++    while (fgets(line, sizeof line, f)) {
++        unsigned long long lo = 0, hi = 0; char perms[8]; perms[0] = 0;
++        if (sscanf(line, "%llx-%llx %7s", &lo, &hi, perms) != 3) continue;
++        if (a < lo || a >= hi) continue;
++        m82a_vma v; v.lo = lo; v.hi = hi; memcpy(v.perms, perms, 5); v.perms[4] = 0;
++        g_m82a_vc[g_m82a_vcn & 7u] = v; g_m82a_vcn++;
++        fclose(f);
++        if (out) *out = v;
++        return 1;
++    }
++    fclose(f);
++    return 0;
++}
++/* VMA 钳位 + 按页容错读。返回真正读进 dst 的字节数（0..len）。got_flat 非 NULL 时回填"平读"结果，
++   clamped 非 NULL 时回填钳位后的长度。**不 memset dst**（尾部清零由调用方按 cp 做）。 */
++static uint32_t m82a_read(uint8_t *dst, uint64_t addr, uint32_t len, uint32_t *got_flat,
++                          uint32_t *clamped_to)
++{
++    if (!dst || !len) return 0;
++    uint32_t want = len;
++    m82a_vma v;
++    if (m82a_vma_find(addr, &v) && addr < v.hi && (uint64_t)addr + want > v.hi) {
++        want = (uint32_t)(v.hi - addr);
++        g_m82a_clamped++;
++    }
++    if (clamped_to) *clamped_to = want;
++    uint32_t total = r_guest_copy(dst, addr, want);      /* 平读（旧口径），命中即完事 */
++    if (got_flat) *got_flat = total;
++    if (total < want) {                                  /* 兜底：按页切块，保住已读前缀 */
++        while (total < want) {
++            uint64_t a = addr + total;
++            uint32_t chunk = 0x1000u - (uint32_t)(a & 0xFFFu);
++            if (chunk > want - total) chunk = want - total;
++            uint32_t n = r_guest_copy(dst + total, a, chunk);
++            if (!n) break;
++            total += n;
++            if (n < chunk) break;
++        }
++        if (total) g_m82a_partial++; else g_m82a_fail++;
++    }
++    g_m82a_bytes += total;
++    return total;
++}
++/* bit1 探针：一条小绑定一行（平读 / 按页读 / 原始 readv 的字节数 + errno + maps 行 + stage/idx）。 */
++static void m82a_probe(int si, int idx, uint64_t addr, uint32_t sz, uint32_t got_used, uint32_t got_flat)
++{
++    if (g_m82a_probe_n >= 16) return;
++    g_m82a_probe_n++;
++    m82a_vma v; int hv = m82a_vma_find(addr, &v);
++    uint32_t want = R_UBO_MIN_SLOT;
++    if (hv && addr < v.hi && (uint64_t)addr + want > v.hi) want = (uint32_t)(v.hi - addr);
++    errno = 0;
++    struct iovec l = { g_m82a_scratch, want }, r = { (void *)(uintptr_t)addr, want };
++    ssize_t nraw = syscall(__NR_process_vm_readv, getpid(), &l, 1ul, &r, 1ul, 0ul);
++    int eraw = errno;
++    uint32_t paged = 0; { uint32_t t = 0;
++        while (t < want) {
++            uint64_t a = addr + t;
++            uint32_t chunk = 0x1000u - (uint32_t)(a & 0xFFFu);
++            if (chunk > want - t) chunk = want - t;
++            uint32_t n = r_guest_copy(g_m82a_scratch + t, a, chunk);
++            if (!n) break;
++            t += n;
++            if (n < chunk) break;
++        }
++        paged = t; }
++    vk_boot_logf("[m82a] probe#%u st=%d idx=%d addr=%#llx sz=%u win=%u flat=%u paged=%u raw=%d "
++                 "errno=%d(%s) want=%u vma=%s[%#llx,%#llx) perms=%s",
++                 g_m82a_probe_n, si, idx, (unsigned long long)addr, sz, got_used, got_flat, paged,
++                 (int)nraw, eraw, strerror(eraw ? eraw : 0), want,
++                 hv ? "" : "none", (unsigned long long)(hv ? v.lo : 0), (unsigned long long)(hv ? v.hi : 0),
++                 hv ? v.perms : "-");
++}
+ /* M4ay P1（纯只读，行为零改动）：bank4 的 [96,160)（= shader 的 cb4[6..9]，gl_Position 矩阵）
+    在 **bind 时刻** 与 **draw 时刻** 各留一份，用来分辨「拷贝时机」与「块内基址」。
+    为什么必须留档：arena 里那份就是 bind 时 r_guest_copy 拷的 ⇒ bind 时刻 arena ≡ guest，
+@@ -10721,8 +10860,20 @@
+         uint64_t src = addr + ((si == 0 && idx == 6 && sz == M4AV_CB6_SZ) ? M4AV_CB6_OFF : 0);
+         uint32_t cp = sz;
+         if (sz < R_UBO_MIN_SLOT) {
+-            /* M4au P2.b：越界段按客体真实字节补（上限 = 描述符范围，shader 读不到更多）。 */
+-            cp = r_guest_copy(dst, src, R_UBO_MIN_SLOT);
++            /* M4au P2.b：越界段按客体真实字节补（上限 = 描述符范围，shader 读不到更多）。
++               M82A bit0（缺省 0 = 逐字节旧行为）：旧口径一次要 4096 B，真机上小 UBO 落在 VMA 页尾 ⇒
++               跨页即 EFAULT、内核整段不拷 ⇒ cp=0 ⇒ 整个 4 KiB 槽被清零（= 真机黑屏的直接机制）。
++               bit0 改成「VMA 钳位 + 按页容错读」，保住已读前缀，只清未读到的尾部。 */
++            int mb = m82a_bits();
++            uint32_t flat = 0;
++            if (mb & 1) {
++                cp = m82a_read(dst, src, R_UBO_MIN_SLOT, &flat, NULL);
++                if (cp >= sz && flat < sz) g_m82a_rb++;        /* 修前读不到声明区间、修后读到 */
++            } else {
++                cp = r_guest_copy(dst, src, R_UBO_MIN_SLOT);
++                flat = cp;
++            }
++            if ((mb & 2) && sz <= 1024u) m82a_probe(si, idx, src, sz, cp, flat);
+             if (cp < slot) memset(dst + cp, 0, slot - cp);   /* 读不到的尾部保持零 */
+             if (cp > sz) g_ubo_ext++;
+             if (cp < sz) g_ubo_trunc++;                      /* 连声明区间都读不到：如实记，不静默 */
+@@ -27752,8 +27903,255 @@
+     if (ph) *ph = s->h;
+     if (play) *play = p_slot_layout(s);
+     return 1;
++}
++
++/* ================= M80A（2026-11-12）：offscreen-first 取源（smo_m80a） =================
++   背景（M79A 定谳）：swapchain 建了、`vkQueuePresentKHR` 每帧成功、清色 100% 上屏（523 帧/55 s、#C85A28），
++   但**客体像素从未被搬进 swapchain image** —— 根因是 present_clear 每帧都成功 ⇒ `if(!vk_ok)` 之后的
++   nvn_vk_present_offscreen（取源→staging→写窗口）一次都不跑（A1/A2/B/C 四档零 `[p] present #`）。
++   本块只回答一个问题：**这一帧的上屏像素由谁生产**。开关 files/smo_m80a（缺省 0 = 逐字节旧行为）：
++     bit0(1)  offscreen-first：每次 present 先把**真实窗口纹理**当源 —— `win->tex[idx]`，idx 由
++              `nvnWindowAcquireTexture` 轮转给出、present 用同一个 idx（gfx_bridge 侧已解析成存储身份
++              `g_p_tex_key`，见 `[p] present tex=… stk=… idx=` 行）；映射回我们的 RT 槽后按现有
++              vkCmdCopyImageToBuffer → staging → nvn_win_present_rgba（win_fill.c 等比 letterbox 缩放）
++              上屏，成功即跳过 present_clear。**present_clear 只在无源时兜底。**
++     bit1(2)  泵按需（配合 smo_m67b bit4）：周期 >=33 ms、只推**新**帧、主线程已经写过的那一帧不再重写。
++     bit2(4)  真实源调试打印：[m80a] 每帧一行 + 一次槽表摘要（限流，只在排查时开）。
++   与 smo_m42f 的关系（选源策略）：m80a bit0=1 时 `m42f=0` = 真实窗口纹理上屏（本块）；`m42f=1` = 旧
++   M42F 链（comp 源 / 清色直上屏，逐字保留）。m80a=0 时 m42f 语义与改前**逐字相同**。
++   等价性（bit0=0）：nvn_vk_m80a_first() 只做一次文件整数读（每 16 次调用一次）+ 一次 m42f 缓存读
++   ⇒ 旧链一行不动。 */
++#define M80A_A "/data/storage/el2/base/files/smo_m80a"
++#define M80A_B "/data/app/el2/100/base/com.vibecc.smo/files/smo_m80a"
++static int      g_m80a_v = -2;              /* -2 = 还没读过/没种过 */
++static unsigned g_m80a_calls;
++static unsigned long long g_m80a_pick, g_m80a_miss, g_m80a_tbl;
++static unsigned g_m80a_pump_gen;                            /* 泵最近推过的 gen */
++static _Atomic unsigned g_m80a_main_gen;                    /* 主线程写成功的最大 gen */
++static unsigned long long g_m80a_pump_skip;
++
++static void m80a_seed(void)   /* 缺省种 0（**不是** p_file_seed 的 -1：-1 会被当成「全位开」） */
++{
++    const char *p[2] = { M80A_A, M80A_B };
++    for (int i = 0; i < 2; i++) { FILE *f = fopen(p[i], "r"); if (f) { fclose(f); return; } }
++    for (int i = 0; i < 2; i++) {
++        FILE *f = fopen(p[i], "w");
++        if (f) { fputs("0\n", f); fclose(f); vk_boot_logf("[m80a] seeded %s = 0", p[i]); return; }
++    }
++}
++static int m80a_bits(void)   /* 每 16 次调用重读一次：hdc 改位 ~1 s 内生效（A/B/C 可在同一 boot 内切） */
++{
++    if (g_m80a_v == -2) { m80a_seed(); g_m80a_v = p_file_int(M80A_A, M80A_B, 0); g_m80a_calls = 0; }
++    else if ((++g_m80a_calls & 15u) == 0) g_m80a_v = p_file_int(M80A_A, M80A_B, g_m80a_v);
++    return (g_m80a_v < 0) ? 0 : (g_m80a_v & 7);
++}
++/* gfx_bridge 侧入口（weak 调用）：本帧是否走 offscreen-first。=0 ⇒ 旧链逐字不变。 */
++int nvn_vk_m80a_first(void) { return (m80a_bits() & 1) && !m42f_on(); }
++/* 泵按需查询（m68b 泵线程/心跳侧）：bit1=1 ⇒ 周期 >=33 ms 且只推新帧。 */
++int nvn_vk_m80a_pump_gate(void) { return (m80a_bits() & 2) != 0; }
++/* bit2 调试：把「槽表里都有谁」打一次 —— 回答「窗口纹理身份到底映射不映射得到」的唯一直接证据。 */
++static void m80a_dump_slots(unsigned long long call)
++{
++    if (g_m80a_tbl) return;
++    g_m80a_tbl = 1;
++    const int ns = (int)(sizeof g_rt_tab / sizeof *g_rt_tab);
++    char b[512]; int o = 0;
++    for (int i = 0; i < ns && o < (int)sizeof b - 64; i++) {
++        if (!g_rt_tab[i].img) continue;
++        o += snprintf(b + o, sizeof b - (size_t)o, " [%d]id=%d ext=%ux%u key=%#llx dw=%u wall=%llu lay=%d",
++                      i, (int)g_rt_tab[i].tex_id, (unsigned)g_rt_tab[i].w, (unsigned)g_rt_tab[i].h,
++                      (unsigned long long)g_rt_tab[i].key, g_slot_dw[i],
++                      (i < (int)(sizeof g_slot_dw_all / sizeof *g_slot_dw_all)) ? g_slot_dw_all[i] : 0ull,
++                      (int)g_rt_tab[i].layout);
++    }
++    vk_boot_logf("[m80a] slots call=%llu win_key=%#llx/%#llx/%#llx/%#llx tex_key=%#llx idx=%d :%s",
++                 call, g_win_key[0], g_win_key[1], g_win_key[2], g_win_key[3],
++                 g_p_tex_key, (int)g_p_tex_idx, b);
++}
++
++/* ================= M68B（2026-11-12）：B2 独立上屏泵（smo_m67b bit4） =================
++   背景：M63A 的证据指向「客侧 QueuePresentTexture 自 11-11 包起从未被调用」（g_nvn_presents=0）。
++   若成立，M67B 的兜底（bit0）整体挂在 present 路径里 ⇒ 一行都执行不到。本块就是为此准备的
++   **可选** 上屏泵：它不依赖 present 是否被调用，按固定周期把「最近一帧已完成的离屏 RGBA」推上屏。
++
++   开关（沿用 M67B 的文件，不新开位域文件；**M67B 已有位语义一个字不改**）：
++     bit0(1)   M67B 软 blit 兜底（已验收；本块不动它）
++     bit4(16)  上屏泵：起一个独立线程，默认每 16 ms 尝试一次；**=0 时线程根本不创建**
++     bit5(32)  泵的诊断心跳：`[m68b-pump] st` 行追加排查字段（skip_main/skip_win/nosrc/torn/collide）
++
++   周期/优先级可配（可选文件；缺文件 = 16 ms / 不调 nice）：
++     files/smo_m68b_pump_ms    4..1000（缺省 16；越界夹紧）
++     files/smo_m68b_pump_nice  -20..19（缺省 0 = 不动调度 nice）
++
++   数据来源：**只读** staging —— `g_p_map` 是 vkMapMemory 的 host-visible 常驻映射，指针一次设定后
++   不再变；像素内容是 `present_offscreen` 里 vkCmdCopyImageToBuffer + fence 之后的那一帧。
++   主线程在 gain 之后、写屏之前用 `gen++` 发布「这一帧像素已就绪」；泵只认 gen。
++   泵**零 malloc、零 vk 调用、零 fence、零拷贝**（只读 g_p_map + 直接援引 nvn_win_present_rgba）。
++
++   三个原子（泵 ↔ 主线程，**双方都不等待**）：
++     g_m68b_main   主线程在「提交拷贝 → 写屏」整段里 =1；泵见到就跳过（不排队，下一周期再看）
++     g_m68b_gen    已完成帧序号（0 = 还没有可泵的帧）；泵读它两次以判「这一帧有没有被改写」
++     g_m68b_owner  窗口写者归属（CAS 抢占：1=泵 2=主线程）。抢到的人写屏；**抢不到的一方照旧执行**
++                   （主线程绝不为泵停下），撞上时计 collide / skip_win
++   为什么是 CAS 不是 pthread_mutex：主渲染线程阻塞在一个 16 ms 周期的诊断线程上，与「不许阻塞主
++   渲染线程」直接相违。代价是最坏情况两个线程各写一次窗口 —— 用计数器把这个残余竞争显式暴露，
++   真撞了日志里 main_collide>0 就是证据，不用猜。
++
++   **已知风险（同时写进 summary，必须让明早的判读人先看到）**：win_fill.c:89-91 记「nvn_win_present_rgba
++   必须在既有游戏/渲染线程调用；客体其它线程或新建 pthread 调原生 UI API 历史三次均崩」。
++   本泵按派活单要求就是新建 pthread ⇒ bit4=1 本身就是这条判别的实验：
++     · 泵成功（pump 增长）      ⇒ 跨线程调窗口 API 可行，明早 (c) 组直接有结论；
++     · bit4=1 立刻崩           ⇒ 结论「非 present 线程调原生 UI API 必崩」⇒ 泵要挂到游戏线程（B1 形态）；
++     · 泵只失败不崩（fail 增长、[p-red] 有 rc）⇒ 线程可调但窗口拒绝了这次写，转 B1。
++   三种结果都落在日志里（[m68b-pump] start/exit/st + win_fill.c 自己的 [p-red]/[p] win … tid=），不静默。
++
++   退出：g_m68b_run=0 → 循环退出 → 心跳线程 pthread_join（**不 detach**）；进程退出由内核回收，
++   但只要 bit4 被 hdc 关掉就走 join，所以不会留下游离线程、不会泄漏栈。
++
++   等价性（bit4=0，默认）：泵线程从不创建（g_m68b_live 恒 0）；主线程三处钩子全部由
++   `if (g_m68b_live)` 包住 ⇒ =0 时只多一个 volatile int 读，执行路径与 M67B 链逐字相同。 */
++#define M68B_KN_A   P_SLOT_DIR_A "/smo_m67b"   /* 与 M67B 同一开关文件：bit4=16 上屏泵，bit5=32 泵心跳 */
++#define M68B_KN_B   P_SLOT_DIR_B "/smo_m67b"
++#define M68B_MS_A   P_SLOT_DIR_A "/smo_m68b_pump_ms"
++#define M68B_MS_B   P_SLOT_DIR_B "/smo_m68b_pump_ms"
++#define M68B_NICE_A P_SLOT_DIR_A "/smo_m68b_pump_nice"
++#define M68B_NICE_B P_SLOT_DIR_B "/smo_m68b_pump_nice"
++
++static _Atomic int      g_m68b_run;    /* 1 = 泵线程继续跑（退出标志） */
++static _Atomic int      g_m68b_main;   /* 1 = 主线程在 present 的「拷贝→写屏」段里 */
++static _Atomic unsigned g_m68b_gen;    /* 已完成帧序号（0 = 还没有可泵的帧） */
++static _Atomic unsigned g_m68b_sw, g_m68b_sh;
++static _Atomic int      g_m68b_owner;  /* 0 空 / 1 泵 / 2 主线程（CAS，零等待） */
++static volatile int     g_m68b_live;   /* 线程活着：心跳线程写，present 线程只读 */
++static pthread_t        g_m68b_th;
++static unsigned         g_m68b_ms = 16;
++static int              g_m68b_nice;
++static unsigned long long g_m68b_pump_ok, g_m68b_pump_fail, g_m68b_skip_main, g_m68b_skip_win,
++                          g_m68b_nosrc, g_m68b_torn, g_m68b_collide, g_m68b_iters;
++
++static int m68b_tid(void)   /* 日志用真线程 id（musl 下 syscall(__NR_gettid)，非 musl 退 getpid） */
++{
++#ifdef __MUSL__
++    return (int)syscall(__NR_gettid);
++#else
++    return (int)getpid();
++#endif
++}
++
++/* ---- 主线程侧三个钩子：全部由 g_m68b_live 包住（bit4=0 ⇒ 只多一次 volatile 读）---- */
++static void m68b_main_enter(void) { if (g_m68b_live) atomic_store_explicit(&g_m68b_main, 1, memory_order_release); }
++static void m68b_main_leave(void) { if (g_m68b_live) atomic_store_explicit(&g_m68b_main, 0, memory_order_release); }
++static void m68b_publish(unsigned w, unsigned h)
++{
++    if (!g_m68b_live) return;
++    atomic_store_explicit(&g_m68b_sw, w, memory_order_relaxed);
++    atomic_store_explicit(&g_m68b_sh, h, memory_order_relaxed);
++    atomic_fetch_add_explicit(&g_m68b_gen, 1u, memory_order_release);   /* release：先像素、后序号 */
++}
++static int  m68b_win_claim(int who)
++{
++    int e = 0;
++    return (int)atomic_compare_exchange_strong_explicit(&g_m68b_owner, &e, who,
++                                                        memory_order_acq_rel, memory_order_relaxed);
+ }
++static void m68b_win_release(void) { atomic_store_explicit(&g_m68b_owner, 0, memory_order_release); }
+ 
++/* ---- 泵线程：每 g_m68b_ms 尝试一次；上一帧没完成/主线程在写屏 → 本周期跳过，不排队 ---- */
++static void *m68b_pump_main(void *arg)
++{
++    (void)arg;
++    __attribute__((weak)) int nvn_win_present_rgba(void *, const void *, int, int, int);
++    if (g_m68b_nice) setpriority(PRIO_PROCESS, 0, g_m68b_nice);
++    vk_boot_logf("[m68b-pump] start tid=%d ms=%u nice=%d map=%s win=%p blit=%s",
++                 m68b_tid(), g_m68b_ms, g_m68b_nice, g_p_map ? "mapped" : "lazy", g_win,
++                 nvn_win_present_rgba ? "yes" : "nosym");
++    while (atomic_load_explicit(&g_m68b_run, memory_order_relaxed)) {
++        g_m68b_iters++;
++        const unsigned gen = atomic_load_explicit(&g_m68b_gen, memory_order_acquire);
++        if (atomic_load_explicit(&g_m68b_main, memory_order_acquire)) {
++            g_m68b_skip_main++;                         /* 主线程正在拷贝/写屏：本周期什么都不做 */
++        } else if (!nvn_win_present_rgba || !g_p_map || !g_win || !gen) {
++            g_m68b_nosrc++;                             /* 还没有可泵的帧（或符号/窗口缺失） */
++        } else if ((m80a_bits() & 2) &&
++                   (gen == g_m80a_pump_gen ||
++                    gen <= atomic_load_explicit(&g_m80a_main_gen, memory_order_acquire))) {
++            g_m80a_pump_skip++;                         /* M80A 按需：这帧已推过 / 主线程自己写过了 */
++        } else if (!m68b_win_claim(1)) {
++            g_m68b_skip_win++;                          /* 主线程刚抢到窗口：让开 */
++        } else {
++            const int w = (int)atomic_load_explicit(&g_m68b_sw, memory_order_relaxed);
++            const int h = (int)atomic_load_explicit(&g_m68b_sh, memory_order_relaxed);
++            const int ok = (w > 0 && h > 0) ? nvn_win_present_rgba(g_win, g_p_map, w, h, w * 4) : 0;
++            m68b_win_release();
++            if (ok) { g_m68b_pump_ok++; g_m80a_pump_gen = gen; } else g_m68b_pump_fail++;
++            /* 这一帧在写屏过程中被新帧覆盖 / 主线程中途进场 ⇒ 计一次 torn（像素可能撕裂，只观测） */
++            if (atomic_load_explicit(&g_m68b_gen, memory_order_acquire) != gen ||
++                atomic_load_explicit(&g_m68b_main, memory_order_acquire)) g_m68b_torn++;
++        }
++        { struct timespec ts; const unsigned ms = g_m68b_ms;
++          ts.tv_sec = (time_t)(ms / 1000u); ts.tv_nsec = (long)(ms % 1000u) * 1000000L;
++          nanosleep(&ts, NULL); }
++    }
++    vk_boot_logf("[m68b-pump] exit tid=%d iters=%llu pump=%llu fail=%llu", m68b_tid(),
++                 g_m68b_iters, g_m68b_pump_ok, g_m68b_pump_fail);
++    return NULL;
++}
++
++/* ---- 心跳钩子（vk_boot.c 的 beat_thread 每 2 s 调一次）：
++   ① 直读 smo_m67b 看 bit4 ⇒ 起/停泵（2 s 内响应 hdc 改位）；② bit4 在跑时热更周期；③ 每 20 s 一行 st。
++   bit4=0 且从未起过泵 ⇒ 只有一次文件读 + 两个整数比较，零输出（与 M67B 关态空转同款）。 ---- */
++void nvn_vk_m68b_pump_tick(unsigned tsec, unsigned long frames)
++{
++    static unsigned last_stat;
++    const int v = p_file_int(M68B_KN_A, M68B_KN_B, 0);   /* 直读：hdc 覆盖 2 s 内生效（同 smo_m40c 节奏） */
++    const int want = (v & 16) != 0;
++    if (want && !g_m68b_live) {
++        g_m68b_ms = (unsigned)p_file_int(M68B_MS_A, M68B_MS_B, 16);
++        if ((int)g_m68b_ms < 4) g_m68b_ms = 4;
++        if (g_m68b_ms > 1000) g_m68b_ms = 1000;
++        if (m80a_bits() & 2) {                             /* M80A bit1：泵按需 —— 周期不短于 33 ms */
++            if (g_m68b_ms < 33u) g_m68b_ms = 33u;
++            vk_boot_logf("[m80a] pump on-demand: ms=%u (bit1=1, 只推新帧/不覆盖主线程)", g_m68b_ms);
++        }
++        g_m68b_nice = p_file_int(M68B_NICE_A, M68B_NICE_B, 0);
++        if (g_m68b_nice < -20) g_m68b_nice = -20;
++        if (g_m68b_nice > 19) g_m68b_nice = 19;
++        atomic_store_explicit(&g_m68b_run, 1, memory_order_relaxed);
++        g_m68b_live = 1;                                   /* 先置活：泵首轮就能看到 run=1 */
++        if (pthread_create(&g_m68b_th, NULL, m68b_pump_main, NULL) != 0) {
++            g_m68b_live = 0;
++            atomic_store_explicit(&g_m68b_run, 0, memory_order_relaxed);
++            vk_boot_logf("[m68b-pump] fail stage=create errno=%d knob=%d t=%us", errno, v, tsec);
++        } else {
++            vk_boot_logf("[m68b-pump] enabled knob=%d bit4=1 ms=%u nice=%d t=%us", v, g_m68b_ms, g_m68b_nice, tsec);
++        }
++    } else if (!want && g_m68b_live) {
++        atomic_store_explicit(&g_m68b_run, 0, memory_order_relaxed);
++        pthread_join(g_m68b_th, NULL);                     /* 不 detach：这里等着它退干净 */
++        g_m68b_live = 0;
++        vk_boot_logf("[m68b-pump] disabled knob=%d iters=%llu pump=%llu fail=%llu t=%us", v,
++                     g_m68b_iters, g_m68b_pump_ok, g_m68b_pump_fail, tsec);
++    }
++    if (!g_m68b_live) return;
++    {   /* 周期热更新（每 2 s 一次文件读）：ms 变更下一轮生效 */
++        const unsigned ms2 = (unsigned)p_file_int(M68B_MS_A, M68B_MS_B, (int)g_m68b_ms);
++        if (ms2 >= 4 && ms2 <= 1000) g_m68b_ms = ms2;
++        if ((m80a_bits() & 2) && g_m68b_ms < 33u) g_m68b_ms = 33u;   /* M80A：按需下限 33 ms */
++    }
++    if ((int)(tsec - last_stat) < 20) return;
++    last_stat = tsec;
++    if (v & 32)   /* bit5：追加排查字段 */
++        vk_boot_logf("[m68b-pump] st t=%us frames=%lu on=1 ms=%u gen=%u pump=%llu fail=%llu "
++                     "skip_main=%llu skip_win=%llu nosrc=%llu torn=%llu collide=%llu iters=%llu win=%p",
++                     tsec, frames, g_m68b_ms, atomic_load_explicit(&g_m68b_gen, memory_order_relaxed),
++                     g_m68b_pump_ok, g_m68b_pump_fail, g_m68b_skip_main, g_m68b_skip_win,
++                     g_m68b_nosrc, g_m68b_torn, g_m68b_collide, g_m68b_iters, g_win);
++    else
++        vk_boot_logf("[m68b-pump] st t=%us frames=%lu on=1 ms=%u gen=%u pump=%llu fail=%llu",
++                     tsec, frames, g_m68b_ms, atomic_load_explicit(&g_m68b_gen, memory_order_relaxed),
++                     g_m68b_pump_ok, g_m68b_pump_fail);
++}
++
+ /* 返 1 = 本帧屏幕内容归我们管（已上屏，或按降采样主动跳过——两种情况都不要再走纯色兜底）；
+    0 = 本帧没接（后端没起/还没画过/无窗口/拷贝失败），调用方自行回落。 */
+ int nvn_vk_present_offscreen(void)
+@@ -27770,6 +28168,7 @@
+     unsigned long long call = ++g_p_calls;
+     m40c_poll();   /* M40C：present 侧重读 smo_m40c；值变化 ⇒ 作废管线表（详见 m40c_poll 定义） */
+     unsigned every = present_every();
++    if (nvn_vk_m80a_first()) every = 1;   /* M80A：offscreen-first 每帧换屏（不吃 8 次降采样门） */
+     /* M40AT：smo_m40at=1 ⇒ 每帧上屏 + 上屏源改用 p_auto_select 当帧选中的活图（详见 gfx_bridge.c 注释）。 */
+     const int m40at = m40at_on();
+     /* M4ag P1 台账：每 300 次 present 一行（含降采样帧，反映「上一张真拷源」与 miss 累计）。
+@@ -28354,13 +28753,59 @@
+             m42f_tick_log();
+         } else {
+             g_m42f_skip_keep++;
++            g_p_skip++;   /* M80A：fail-closed 吞帧也要在 [p] present skip= 里可见 */
+             m42f_tick_log();
+             /* fail-closed（派活单口径）：本帧不写窗口 ⇒ XComponent 保留上一帧像素，绝不让清色/旧链
+                把它盖成纯色。M42F r1/r2 对照实证：走旧链 blit（rt282 灰图）的那两轮，游戏反而
+                **进不了 3D 关卡**（verts3=0，两次按键被吞）；不写窗口那一轮 verts3=76 ⇒ 保留本口径。 */
+             pthread_mutex_unlock(&lock);
+             return 1;
++        }
++    }
++    /* ===== M80A（2026-11-12）：offscreen-first —— 最终源 = **真实窗口纹理** =====
++       位置：M42F / M38H / M39A / M40AT 之后 ⇒ m80a bit0=1 时它们只当兜底；关态(m80a=0)整块不进，
++       旧链逐字不变。源身份 = gfx_bridge 每帧按 `nvnWindowAcquireTexture` 的 idx 解析出的存储身份
++       （`[p] present tex=… stk=… idx=…`），这里用**现有**映射 p_slot_by_key 换回我们的 RT 槽 ——
++       不新建图、不改 bind/draw 语义、不碰 swapchain。映射不到 ⇒ 逐张试 idx 钉住的 g_win_key[]
++       （M4bv P2 的窗口身份缓存），仍不行则**保持链上原选源**并记 miss（不硬指、不猜）。 */
++    int m80a_sel = -1;
++    if (nvn_vk_m80a_first()) {
++        const char *m80a_was = srcname; const unsigned m80a_wasw = sw, m80a_wash = sh;
++        h_rt_slot *ms = NULL; int mi = -1;
++        const unsigned long long mk = g_p_tex_key;
++        const char *m80a_why = "no-key";
++        if (mk) { mi = p_slot_by_key(mk, &ms); m80a_why = (mi >= 0) ? "key" : "key-miss"; }
++        if (mi < 0 || !ms || !p_src_copyable(ms)) {
++            for (int k = 0; k < 4; k++) {
++                if (!g_win_key[k] || g_win_key[k] == mk) continue;
++                h_rt_slot *s2 = NULL; const int i2 = p_slot_by_key(g_win_key[k], &s2);
++                if (i2 >= 0 && s2 && p_src_copyable(s2)) { ms = s2; mi = i2; m80a_why = "win-key"; break; }
++            }
+         }
++        if (ms && p_src_copyable(ms)) {
++            simg = ms->img; sw = ms->w; sh = ms->h;
++            slay = (ms == g_rt_cur) ? g_h_layout : p_slot_layout(ms);
++            srcname = "tex"; snap_used = 0; m80a_sel = mi; g_m80a_pick++;
++            { unsigned wr = 0, wra = 0;
++              if (mi >= 0 && mi < (int)(sizeof g_slot_dw_all / sizeof *g_slot_dw_all)) {
++                  wr = g_slot_dw[mi]; wra = g_slot_dw_all[mi]; }
++              if (g_m80a_pick <= 8 || (m80a_bits() & 4) || (g_m80a_pick % 120) == 0)
++                  vk_boot_logf("[m80a] src=tex #%llu call=%llu why=%s slot=%d key=%#llx id=%d ext=%ux%u idx=%d "
++                               "lay=%d writers=%u writers_all=%u win_key=%#llx/%#llx/%#llx/%#llx was=%s %ux%u",
++                               g_m80a_pick, call, m80a_why, mi, (unsigned long long)ms->key, (int)ms->tex_id,
++                               (unsigned)ms->w, (unsigned)ms->h, (int)g_p_tex_idx, (int)slay, wr, wra,
++                               g_win_key[0], g_win_key[1], g_win_key[2], g_win_key[3],
++                               m80a_was, m80a_wasw, m80a_wash); }
++        } else {
++            g_m80a_miss++;
++            if (g_m80a_miss <= 8 || (g_m80a_miss % 300) == 0)
++                vk_boot_logf("[m80a] miss #%llu call=%llu why=%s key=%#llx id=%d ext=%ux%u idx=%d "
++                             "win_key=%#llx/%#llx/%#llx/%#llx -> 保持链上选源 src=%s %ux%u (pick=%llu)",
++                             g_m80a_miss, call, m80a_why, mk, (int)g_p_tex_id, (unsigned)g_p_tex_w,
++                             (unsigned)g_p_tex_h, (int)g_p_tex_idx, g_win_key[0], g_win_key[1],
++                             g_win_key[2], g_win_key[3], m80a_was, m80a_wasw, m80a_wash, g_m80a_pick);
++        }
++        if ((m80a_bits() & 4) && call >= 20) m80a_dump_slots(call);
+     }
+     /* M4al P2：台账按**最终**选中的源记（快照会覆盖上面 pslot 已写下的 tex 选择）。 */
+     g_p_last_src = srcname; g_p_last_slot = snap_used ? -1 : pslot_i;
+@@ -28374,10 +28819,11 @@
+     if (!strcmp(srcname, "m39a")) g_p_last_slot = m39a_sel;   /* M39A：默认直送槽 ⇒ 同上（否则日志 slot/ext 对不上） */
+     if (!strcmp(srcname, "au-pick")) g_p_last_slot = g_au_pres_slot;   /* M40AU：台账记 post-draw 记账的那个槽 */
+     if (!strcmp(srcname, "comp")) g_p_last_slot = g_m42f_slot;   /* M42F：台账记真正供帧的那个槽 */
++    if (m80a_sel >= 0) g_p_last_slot = m80a_sel;   /* M80A：同上（否则 [p] 行 slot/ext 对不上） */
+     g_p_last_w = sw; g_p_last_h = sh;
+     /* M4ak P3：本帧选源身份（[p] sig 行会带出去配对）。快照不是槽 ⇒ sel_slot=-1（修掉 M4ak 记的标注 bug）。 */
+     g_p_sel_call = call;
+-    g_p_sel_slot = (m38h_sel >= 0) ? m38h_sel : (m39a_sel >= 0) ? m39a_sel
++    g_p_sel_slot = (m80a_sel >= 0) ? m80a_sel : (m38h_sel >= 0) ? m38h_sel : (m39a_sel >= 0) ? m39a_sel
+                  : (snap_used ? -1 : (!strcmp(srcname, "au-pick") ? g_au_pres_slot : pslot_i));
+     g_p_sel_why = srcname;
+     /* M39N（2026-11-09）：把「真正要拷去上屏的那张图」在指定 draws 门槛上 dump 一次。
+@@ -28648,6 +29094,9 @@
+     VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+     si.commandBufferCount = 1;
+     si.pCommandBuffers = &cb;
++    /* M68B：从「提交这次拷进 staging」到「写屏结束」整段标记为主线程占用（泵见到即跳过）。
++       bit4=0 时 m68b_main_enter() 只读一个 volatile int，立即返回 ⇒ 旧链逐字不变。 */
++    m68b_main_enter();
+     vkResetFences(g_dev, 1, &g_p_fence);
+     VkResult sr = vkQueueSubmit(g_q, 1, &si, g_p_fence);
+     VkResult wr = VK_NOT_READY;
+@@ -28662,6 +29111,7 @@
+         g_p_vkfail++;
+         if (m40at) atomic_fetch_add_explicit(&g_m40at_skip_vk, 1ull, memory_order_relaxed);
+         vk_boot_logf("[p-red] present copy submit rv=%d wait rv=%d (%s)", (int)sr, (int)wr, vr(sr));
++        m68b_main_leave();   /* M68B：失败路径也要放开（否则泵会被永久跳过） */
+         pthread_mutex_unlock(&lock);
+         return 0;
+     }
+@@ -28696,7 +29146,20 @@
+                          gain, srcname, call);
+     }
+     int ok = 0;
+-    if (nvn_win_present_rgba) ok = nvn_win_present_rgba(g_win, g_p_map, (int)cp_w, (int)cp_h, (int)cp_w * 4);
++    /* M68B：先发布「这一帧像素已就绪」（gen++），再写屏 —— 这样上屏泵拿到的永远是**完整帧**：
++       即便本帧写屏失败，泵下一个周期也能把这张已经躺在 staging 里的图推上去（bit4 的全部价值）。 */
++    m68b_publish(cp_w, cp_h);
++    const unsigned m80a_mygen = atomic_load_explicit(&g_m68b_gen, memory_order_acquire);   /* M80A：本帧序号 */
++    int m68b_own = 0;   /* M68B：本次写屏有没有抢到窗口（抢不到＝泵正在写同一块窗口，只观测不等待） */
++    if (nvn_win_present_rgba) {
++        if (g_m68b_live) m68b_own = m68b_win_claim(2);
++        ok = nvn_win_present_rgba(g_win, g_p_map, (int)cp_w, (int)cp_h, (int)cp_w * 4);
++    }
++    if (m68b_own) m68b_win_release();
++    else if (g_m68b_live) g_m68b_collide++;   /* 主线程与泵撞上：计数留证（不改变任何安排） */
++    /* M80A bit1：主线程写成功 ⇒ 记下「这一帧已经有人写过」，泵不再重写同一帧（不覆盖主线程）。 */
++    if (ok && (m80a_bits() & 2) && m80a_mygen) atomic_store_explicit(&g_m80a_main_gen, m80a_mygen, memory_order_release);
++    m68b_main_leave();
+     if (!ok) { g_p_winfail++; if (m40at) atomic_fetch_add_explicit(&g_m40at_skip_win, 1ull, memory_order_relaxed); }
+     else g_p_ok++;
+     if (g_p_ok + g_p_winfail <= 3 || (call % 60) == 0)
+@@ -30044,8 +30507,120 @@
+     }
+     g_m7d_win_t0 = t; g_m7d_win_n = 0; g_m7d_win_fail = 0; g_m7d_coln = 0;
+     for (int i = 0; i < 8; i++) { g_m7d_win_idx[i] = 0; g_m7d_colc[i] = 0; }
++}
++
++/* ================= M67B（2026-11-12）：native_buffer 缺失时的**兜底上屏** =================
++   背景（M63A 定案）：真机驱动无 VK_OHOS_native_buffer ⇒ 建设备时置 g_ohos_nb_stripped=1（:1629）
++   ⇒ nvn_vk_present_clear() 的交换链分支打一行 "swapchain/present skipped" 后**永久 return 0**
++   ⇒ vkQueuePresentKHR 一次都不执行。上屏只剩两件非 swapchain 的事：
++     · nvn_win_fill()（CPU 纯色；旧包橙红/黄带即此）；
++     · nvn_vk_present_offscreen()（vkCmdCopyImageToBuffer → 宿主 staging → win_fill.c 的
++       nvn_win_present_rgba 软件 blit 真图）。它**不碰 swapchain、不碰任何 VK_OHOS_* 扩展**，
++       所以 native_buffer 缺不缺与它无关 —— 这是兜底路径能成立的全部理由。
++   本块只改「那行 return 0」之后的事（smo_m67b，缺省 0 = 旧行为逐字不变）：
++     bit0(=1)  启用兜底：不再空手 return 0，而是主动驱动上面那条软件 blit 链；成功即把本帧屏幕
++               交出去（返 1，调用方不再回落纯色）；失败打 stage/rc 再回落纯色（信息不丢）。
++     bit1(=2)  对照：跳过 blit，只做纯色 CPU 填色（A/B「窗口通道还活着吗」）。
++     bit2(=4)  预留位（本单不用；将来需要「按毫秒节流」时在此扩展，见下面的节流取舍）。
++   节流取舍：**不做二次节流**。① present_offscreen 内部已有 present_every() 降采样门（缺省每 8 次
++   present 换一屏），再叠一层只会多一条「谎报已上屏」的分支；② 真机实测 present ≈1–4 fps
++   （M61A：[beat] 368 s / 1552 帧），全帧 blit 的 CPU 代价不是瓶颈。present 真跑到 60 fps 再加。
++   失败可判读性：所有失败走 [m67b-fail] stage=… rc=…，成功/归我管走计数器 + [m67b] st（心跳每 20 s）。
++   等价性（=0）：开关判断在旧早退分支**之前**，只多一次文件整数读（每 32 次 present 一次）；
++   =0 时执行路径仍是「打一行 → unlock → return 0」，与旧链逐字相同。 */
++#define M67B_A P_SLOT_DIR_A "/smo_m67b"
++#define M67B_B P_SLOT_DIR_B "/smo_m67b"
++static unsigned long long g_m67b_n, g_m67b_blit_ok, g_m67b_fill_ok, g_m67b_off_fail, g_m67b_keep;
++static unsigned long long g_m67b_nowin, g_m67b_nosym;
++static int g_m67b_val_cache = -2;
++static unsigned g_m67b_reads, g_m67b_init_done;
++
++static void m67b_seed(void)   /* 缺省种 0（**不是** p_file_seed 的 -1）：0=关，必须与「无文件」同义 */
++{
++    const char *p[2] = { M67B_A, M67B_B };
++    for (int i = 0; i < 2; i++) { FILE *f = fopen(p[i], "r"); if (f) { fclose(f); return; } }
++    for (int i = 0; i < 2; i++) {
++        FILE *f = fopen(p[i], "w");
++        if (f) { fputs("0\n", f); fclose(f); vk_boot_logf("[m67b] seeded %s = 0", p[i]); return; }
++    }
+ }
++static int m67b_val(void)   /* 0=关；bit0 启兜底；bit1 只纯色；bit2 预留。每 32 次调用重读一次 */
++{
++    if (g_m67b_val_cache == -2) { m67b_seed(); g_m67b_val_cache = p_file_int(M67B_A, M67B_B, 0); g_m67b_reads = 0; }
++    else if ((++g_m67b_reads & 31u) == 0) g_m67b_val_cache = p_file_int(M67B_A, M67B_B, 0);
++    return g_m67b_val_cache;
++}
++static int m67b_on(void) { return (m67b_val() & 1) != 0; }
+ 
++/* 心跳钩子（vk_boot.c 的 beat_thread 每 2 s 调一次）：**即使 present 根本不被调用**也能读出
++   兜底链的状态 —— 这是本单唯一能区分「present 没被调」与「上屏悄悄失败」的可观测点。
++   smo_m67b=0 且一次都没进过本块 ⇒ 零输出（旧版日志逐字不变）。 */
++void nvn_vk_m67b_poll(unsigned tsec, unsigned long frames)
++{
++    static unsigned last;
++    if ((int)(tsec - last) < 20) return;
++    last = tsec;
++    if (g_m67b_val_cache == -2) (void)m67b_val();   /* 首次：种文件 + 读一次 */
++    else g_m67b_val_cache = p_file_int(M67B_A, M67B_B, g_m67b_val_cache);   /* 每 20 s 直读：hdc 覆盖即时生效 */
++    const int v = g_m67b_val_cache;
++    if (v == 0 && g_m67b_n == 0) return;   /* 关且没跑过：完全不输出 */
++    vk_boot_logf("[m67b] st t=%us frames=%lu knob=%d nb_stripped=%d n=%llu blit_ok=%llu fill_ok=%llu "
++                 "keep=%llu off_fail=%llu nowin=%llu nosym=%llu",
++                 tsec, frames, v, g_ohos_nb_stripped, g_m67b_n, g_m67b_blit_ok, g_m67b_fill_ok,
++                 g_m67b_keep, g_m67b_off_fail, g_m67b_nowin, g_m67b_nosym);
++}
++
++/* 返 1 = 本帧屏幕归兜底链（已写屏，或按策略主动不写 —— 与 present_offscreen 的降采样门同义）；
++   0 = 兜底链不可用（无窗口 / 无 blit 符号 / 两级都失败）⇒ 调用方按旧链继续回落纯色。
++   失败一律带 stage/rc，不静默 return。 */
++static int m67b_nb_present(uint32_t r, uint32_t g, uint32_t b)
++{
++    __attribute__((weak)) int nvn_win_present_rgba(void *, const void *, int, int, int);
++    __attribute__((weak)) int nvn_win_fill(void *, unsigned, unsigned, unsigned);
++    __attribute__((weak)) int nvn_win_probe(void *, int *, int *, int *, int *, int *);
++    const int v = m67b_val();
++    void *w = g_win;
++    const unsigned long long n = ++g_m67b_n;
++    if (!g_m67b_init_done) {
++        g_m67b_init_done = 1;
++        /* 一次性能力探测：把「窗口 API 到底能不能用」的真返回码落进日志（不取 buffer、不写像素）。 */
++        int pw = 0, ph = 0, pf = -1, rc_geo = -3, rc_fmt = -3;
++        if (nvn_win_probe) nvn_win_probe(w, &pw, &ph, &pf, &rc_geo, &rc_fmt);
++        vk_boot_logf("[m67b-init] nb_stripped=1 ext=%s win=%p probe=%s rc_geo=%d rc_fmt=%d surf=%dx%d fmt=%d "
++                     "blit=%s fill=%s stage=%s/%ux%u every=%u knob=%d",
++                     PROX_EXT, w, nvn_win_probe ? "yes" : "nosym", rc_geo, rc_fmt, pw, ph, pf,
++                     nvn_win_present_rgba ? "yes" : "no", nvn_win_fill ? "yes" : "no",
++                     g_p_map ? "mapped" : "lazy", g_p_cp_w, g_p_cp_h, (unsigned)present_every(), v);
++    }
++    if (!w) { g_m67b_nowin++; vk_boot_logf("[m67b-fail] stage=win rc=nowin n=%llu", n); return 0; }
++    if (!(v & 2) && nvn_win_present_rgba) {
++        const unsigned long long ok0 = g_p_ok, sk0 = g_p_skip, wf0 = g_p_winfail, vk0 = g_p_vkfail, ck0 = g_p_calls;
++        const int pok = nvn_vk_present_offscreen();
++        if (pok && g_p_ok > ok0) { g_m67b_blit_ok++; return 1; }   /* 真图已写上屏（blit_ok 就是「真正上屏」口径） */
++        if (pok) {                                                 /* 归我管但本帧不换屏：降采样 / fail-closed 保上一帧 */
++            g_m67b_keep++;
++            if (n <= 3 || (n % 120) == 0)
++                vk_boot_logf("[m67b-keep] n=%llu why=%s call=%llu->%llu",
++                             n, g_p_skip > sk0 ? "downsample" : "fail-closed", ck0, g_p_calls);
++            return 1;
++        }
++        g_m67b_off_fail++;
++        vk_boot_logf("[m67b-fail] stage=blit rc=%s n=%llu call=%llu->%llu ok=%llu skip=%llu winfail=%llu vkfail=%llu",
++                     g_p_winfail > wf0 ? "winblit" : (g_p_vkfail > vk0 ? "vk_copy" : "nosrc"),
++                     n, ck0, g_p_calls, g_p_ok - ok0, g_p_skip - sk0, g_p_winfail - wf0, g_p_vkfail - vk0);
++    } else if (!nvn_win_present_rgba) {
++        g_m67b_nosym++;
++    }
++    /* 最后一档：纯色 CPU 填色（旧行为）—— 至少把「窗口通道还活着」这条信息留住 */
++    if (nvn_win_fill) {
++        if (nvn_win_fill(w, r, g, b)) { g_m67b_fill_ok++; return 1; }
++        vk_boot_logf("[m67b-fail] stage=fill rc=refused n=%llu", n);
++        return 0;
++    }
++    vk_boot_logf("[m67b-fail] stage=fill rc=nosym n=%llu", n);
++    return 0;
++}
++
+ int nvn_vk_present_clear(uint32_t r, uint32_t g, uint32_t b)
+ {
+     /* M3g 探针 #2：present 尝试计数。放在 g_on 判断之前——后端没起来时的「尝试」也要记，
+@@ -30057,6 +30632,9 @@
+        libvulkan_swapchain.so 后会调一个 NULL 函数指针（cppcrash: present_clear+244 → 层+0xf9b0 → pc=0）。
+        层不校验能力也不返回错误码，只能整段绕开：走已有的 device-only 模式，保住进程。 */
+     if (g_ohos_nb_stripped) {
++        /* M67B：兜底上屏。开关判断在旧早退**之前**（=0 时下面两行只是常量比较 ⇒ 旧链逐字不变）。
++           必须先 unlock 再进兜底：它自己要拿 present 锁 + g_vkq_lock，持 g_lock 调用会互锁。 */
++        if (m67b_on()) { pthread_mutex_unlock(&g_lock); return m67b_nb_present(r, g, b); }
+         static int reported;
+         if (!reported) { reported = 1; vk_boot_logf("swapchain/present skipped: driver lacks " PROX_EXT " (OHOS layer derefs NULL in acquire)"); }
+         pthread_mutex_unlock(&g_lock);
+@@ -30166,6 +30744,8 @@
+     g_on = 1;
+     { int i; for (i = 0; i < 4; i++) m7d_sw(i); }   /* M7d：起层即种 0（hdc shell 无创建权，只能覆盖既有文件） */
+     m42f_seed();   /* M42F：同上 —— 起层就把 smo_m42f 建出来（缺省 0），hdc 才能覆盖成 1 */
++    (void)m80a_bits();   /* M80A：同上 —— 起层就把 smo_m80a 种成 0（缺省 = 逐字节旧行为） */
++    m67b_seed();   /* M67B：同上 —— 起层种 smo_m67b=0（hdc shell 无创建权，只能覆盖既有文件） */
+     vk_boot_logf("RESULT: Vulkan backend up (device ready, not stub)");
+     NVK("[vk] NVN->Vulkan backend up (batch 1: device/surface/swapchain/texture upload), surface %{public}u x %{public}u",
+         g_win_w, g_win_h);
+@@ -30204,7 +30784,15 @@
+ void nvn_vk_set_native_window(void *native_window, uint32_t width, uint32_t height)
+ {
+     { __attribute__((weak)) int nvn_win_fill(void *, unsigned, unsigned, unsigned);
+-      if (nvn_win_fill) { int ok = nvn_win_fill(g_win, 0xE0, 0x60, 0x30); NVK("[vk] one-shot fill at surface create -> %{public}s", ok ? "ok" : "refused"); } }
++      if (nvn_win_fill) {
++        /* M67B：旧代码在这里用的是 g_win，而 g_win 要到下面 :g_win = native_window 才赋值
++           ⇒ 首次调用恒为 NULL ⇒ 恒 "refused"。m67b=1 时改用本次传进来的 native_window（真实句柄），
++           让「窗口通道最早能不能写」这条证据真的落地；=0 时逐字保留旧行为（含那个 NULL）。 */
++        void *fw = m67b_on() ? native_window : g_win;
++        int ok = nvn_win_fill(fw, 0xE0, 0x60, 0x30);
++        NVK("[vk] one-shot fill at surface create -> %{public}s", ok ? "ok" : "refused");
++        if (m67b_on()) vk_boot_logf("[m67b-init] surface-create fill win=%p rc=%s", fw, ok ? "ok" : "refused");
++      } }
+     int boot_now = 0;
+     pthread_mutex_lock(&g_lock);
+     g_win = native_window;
+--- mario-odessy-harmony/entry/src/main/cpp/platform/gfx_bridge.c
++++ mario-odessy-harmony/entry/src/main/cpp/platform/gfx_bridge.c
+@@ -109,6 +109,8 @@
+ static int g_rp_bind_color(uint64_t gp,const void *b,unsigned n,void *u);
+ extern void nvn_vk_ubo_stats(unsigned long long *binds,unsigned long long *up,unsigned long long *trunc);
+ extern unsigned long long nvn_vk_ubo_stage_count(int s);
++extern void nvn_vk_m82a_stats(unsigned long long *clamped,unsigned long long *partial,unsigned long long *fail,unsigned long long *bytes,unsigned long long *rb);   /* M82A */
++extern int nvn_vk_m82a_mode(void);   /* M82A */
+ extern uint64_t nvn_rec_cmdmem_readable(const void *p);   /* nvn_replay/glue_cmdbuf.c：池 chunk 表 + shadow 页块（task A/C） */
+ /* 第 2 步（2026-11-02）：记账/生命周期族也指向 cmdbuf，客体偏移 0 = 宿主 NvnCmdBuf* 成为唯一事实 */
+ extern void nvn_rec_command_buffer_finalize(void *cb);
+@@ -1954,6 +1956,59 @@
+ }
+ static uint64_t g_nvn_fence_gen,g_nvn_handle_gen,g_nvn_presents,g_nvn_cmd_total,g_nvn_ctl_total;   /* cmd/ctl_total：P0 队列级累计用量（donor 无 QueueGetTotal* 族；单队列游戏，全局累计，ResetMemoryUsageCounts 清零） */
+ uint64_t dm_nvn_frame_count(void){return g_nvn_presents;}   /* freeze_watchdog.c 弱符号的强定义：游戏自认渲染帧数=出图计数（donor :2469/2550 同位递增）；本宿主无显示链，QueuePresentTexture 处计数 */
++/* M67B（2026-11-12）：present **真的把画面交给了某条显示路径**的帧数（= 上面那条链里 vk_ok==1 的帧）。
++   与 g_nvn_presents 的区别是本单要判读的第一个问题：「present 被调了吗」vs「present 有东西上屏了吗」。
++   两者都要在 [beat] 每 2 s 可读（vk_boot.c 弱符号取本函数），否则只能翻几十 MB 的 vk_boot.log 猜。
++   纯观察量：只在既有 present 尾部自增，不参与任何分支判断。 */
++static uint64_t g_nvn_screens;
++uint64_t dm_nvn_screen_count(void){return g_nvn_screens;}
++/* ================= M68B（2026-11-12）：把「present 没被叫」与「present 被我们吞了」分开 =================
++   为什么必须是两个计数器而不是一个：
++     · g_nvn_presents（M67B 已打进 [beat]）的 ++ 就在 nvn_queue_present_texture 的第一行 —— 它只回答
++       「进到我们这层没有」；
++     · g_nvn_screens（M67B 的 onscreen）回答「进了之后有没有画面真交给某条显示路径」。
++   但 M63A 的疑问比这两者更靠外一层：**客侧到底调没调我们给的地址**？所以这里再补三个入口量：
++     g_nvn_present_enter = 进 nvn_queue_present_texture 的次数（入口第一行 ++；同上口径，独立计数）
++     dm_nvn_present_proc = nvnGetProcAddress 里被要过 "nvnQueuePresentTexture" 的次数（客侧有没有来取这枚地址）
++     dm_nvn_present_done = 复用 g_nvn_screens（**不新开计数器**：done 与 onscreen 必须同口径，否则两套数会漂移）
++   判别表（明早照抄 [beat] 三个数即可）：
++     proc=0 && enter=0      ⇒ 客侧连这枚地址都没取 ⇒ 引擎根本没用 NVN present 入口（泵是唯一出路）
++     proc>0 && enter=0      ⇒ 取了地址但一次没调（引擎自己走了别的出图路径）⇒ 仍靠泵
++     enter>0 && done=0      ⇒ 进了我们这层但没上屏 ⇒ **被我们吞了**（nb 分支/降采样/fail-closed/窗口 blit 失败
++                              全发生在 done 之前）⇒ 查 M67B 兜底为何没走到
++     enter>0 && done>0      ⇒ 上屏有发生 ⇒ 问题在「上屏内容/尺寸/时序」，不在通道存活性
++   全部是纯观察量：只自增、只被日志读，不参与任何分支判断。 */
++static uint64_t g_nvn_present_enter, g_nvn_present_proc;
++uint64_t dm_nvn_present_enter(void){return g_nvn_present_enter;}
++uint64_t dm_nvn_present_proc(void){return g_nvn_present_proc;}
++uint64_t dm_nvn_present_done(void){return g_nvn_screens;}   /* done ≡ onscreen（同一计数器，避免两套口径漂移） */
++static void m68b_addr_str(uint64_t a, char *out, size_t n)
++{
++    __attribute__((weak)) void runtime_describe_address(uint64_t, char *, size_t);   /* loader.c */
++    if (!a) { snprintf(out, n, "n/a"); return; }
++    if (runtime_describe_address) { runtime_describe_address(a, out, n); return; }
++    snprintf(out, n, "0x%llx", (unsigned long long)a);
++}
++/* 入口首次进入时的调用者栈（最多 3 层；本函数不内联，所以 c0 就是 present 入口自己，
++   c1 通常是我们自己生成的 hle thunk（runtime_hle_switch），c2 才是客体调用点 —— runtime_describe_address
++   对客体地址按装载模块给出 `模块名+0x偏移`，所以三层都能读成人话）。 */
++static void __attribute__((noinline)) m68b_present_note(void)
++{
++    const unsigned long long n = (unsigned long long)g_nvn_present_enter;
++    if (n == 1ull) {
++        char c[3][96];
++        void *ra0 = __builtin_return_address(0), *ra1 = __builtin_return_address(1), *ra2 = __builtin_return_address(2);
++        m68b_addr_str((uint64_t)(uintptr_t)ra0, c[0], sizeof c[0]);
++        m68b_addr_str((uint64_t)(uintptr_t)ra1, c[1], sizeof c[1]);
++        m68b_addr_str((uint64_t)(uintptr_t)ra2, c[2], sizeof c[2]);
++        vk_boot_logf("[m68b-present] enter=%llu presents=%llu done=%llu first-caller=c0=%s c1=%s c2=%s",
++                     n, (unsigned long long)g_nvn_presents, (unsigned long long)g_nvn_screens, c[0], c[1], c[2]);
++    } else if ((n % 300ull) == 0ull) {
++        vk_boot_logf("[m68b-present] enter=%llu presents=%llu done=%llu proc=%llu",
++                     n, (unsigned long long)g_nvn_presents, (unsigned long long)g_nvn_screens,
++                     (unsigned long long)g_nvn_present_proc);
++    }
++}
+ typedef struct{uint32_t magic,fenced;uint64_t fence;} sync_h;   /* =donor sync_t（hle_nvn.c:611 注释族），'SYNC'=0x434e5953 */
+ static uint64_t nvn_sync_initialize(void *s,void *d){(void)d;*(sync_h *)s=(sync_h){0x434e5953,0,0};fn_note_life((uint64_t)(uintptr_t)s,FN_SYNC,1);{static unsigned n;if(n++<1)fprintf(stderr,"[nvn] SyncInitialize %p (retire-immediate host)\n",s);}return 1;}   /* donor :609 盖 magic 返 1；此前空桩返 0=Initialize 失败 */
+ static void nvn_sync_finalize(void *s){((sync_h *)s)->magic=0;fn_note_life((uint64_t)(uintptr_t)s,FN_SYNC,0);}   /* donor :610 */
+@@ -4968,6 +5023,11 @@
+  {unsigned long long ub=0,uu=0,ut=0;nvn_vk_ubo_stats(&ub,&uu,&ut);
+   vk_boot_logf("[u] ubo totals binds=%llu up=%llu trunc=%llu s0=%llu s1=%llu",ub,uu,ut,
+    nvn_vk_ubo_stage_count(0),nvn_vk_ubo_stage_count(1));}
++ /* M82A：真机专属根因族（客体 UBO 超额读跨 VMA 边界 ⇒ readv 整段 EFAULT ⇒ 4 KiB 槽被清零）。
++    rb = 「修前读不到声明区间、修后读到」的绑定数；clamped/partial/fail = 钳位/前缀保住/一条没读到。 */
++ {unsigned long long cl=0,pa=0,fa=0,by=0,rb=0;nvn_vk_m82a_stats(&cl,&pa,&fa,&by,&rb);
++  vk_boot_logf("[u] ubo m82a clamped=%llu partial=%llu fail=%llu bytes=%llu rb=%llu mode=%d",
++   cl,pa,fa,by,rb,nvn_vk_m82a_mode());}
+  /* M3u P1：UpdateUniformBuffer 真落地口径（ok = 真写进客体内存的次数/字节） */
+  vk_boot_logf("[u] upd totals n=%llu ok=%llu bad=%llu bytes=%llu",g_ub_n,g_ub_ok,g_ub_bad,g_ub_bytes);
+  /* M3y P2：真实纹理上送口径。up=首次上送成功张数 skip=跳过张数(建图/上送失败、超限) cache=已上送再次绑定
+@@ -5262,7 +5322,7 @@
+ volatile unsigned long long g_av_cur_img, g_av_cur_tex, g_av_cur_stamp;
+ volatile unsigned g_av_cur_w, g_av_cur_h, g_av_cur_lookup;
+ volatile int g_av_cur_texid, g_av_cur_idx;
+-static void nvn_queue_present_texture(void *q,void *w,int idx){unsigned long long m7w_t0=0;int m7w_off=0,m7w_cpu=0;(void)q;g_nvn_presents++;runtime_thread_note_op2(8,(uint64_t)idx); {extern _Atomic int g_m7w_on; extern uint64_t runtime_now_ns(void); if(atomic_load_explicit(&g_m7w_on,memory_order_relaxed)) m7w_t0=runtime_now_ns();}   /* M5c：进上屏路径（stage/合成/回读都在这一段里） */ runtime_watch_tick(g_nvn_presents);/* 内容 watch 的 present 打点（OHOS 上 watch_n 恒 0，runtime_watch_add 提前 return 仅留痕，tick 只走 env 初始化，log-only） */
++static void nvn_queue_present_texture(void *q,void *w,int idx){unsigned long long m7w_t0=0;int m7w_off=0,m7w_cpu=0;(void)q;g_nvn_present_enter++;g_nvn_presents++;m68b_present_note();   /* M68B：入口第一行计数（enter=客侧真的调进来了）*/runtime_thread_note_op2(8,(uint64_t)idx); {extern _Atomic int g_m7w_on; extern uint64_t runtime_now_ns(void); if(atomic_load_explicit(&g_m7w_on,memory_order_relaxed)) m7w_t0=runtime_now_ns();}   /* M5c：进上屏路径（stage/合成/回读都在这一段里） */ runtime_watch_tick(g_nvn_presents);/* 内容 watch 的 present 打点（OHOS 上 watch_n 恒 0，runtime_watch_add 提前 return 仅留痕，tick 只走 env 初始化，log-only） */
+  /* M4ag P1（2026-11-04）：**游戏自己指定的上屏纹理**。nvnWindowBuilderSetTextures 把 n 张 NVNtexture
+     交给窗口（:849 存进 win_builder_h.tex[]、nvn_window_initialize:858 拷进 win_h.tex[]），
+     nvnWindowAcquireTexture 每帧轮转给出 idx，present 用同一个 idx ⇒ win->tex[idx] 就是
+@@ -5312,7 +5372,16 @@
+  if(m7d&4){ __attribute__((weak)) int nvn_vk_present_offscreen(void);
+    int m7d_pok=nvn_vk_present_offscreen?nvn_vk_present_offscreen():0;
+    if(m7d_pok){vk_ok=1;m7w_off=1;vk_boot_logf("[m7d] same: offscreen path presented (真图上屏)");}}
+- if(!vk_ok) vk_ok=nvn_vk_present_clear(m7d_r,m7d_g,m7d_b);
++  /* M80A（2026-11-12）：offscreen-first —— 每次 present 先把**真实窗口纹理**当源
++     （win->tex[idx]，身份已由上面的 nvn_vk_present_src 按 WindowAcquireTexture 的 idx 解析）：
++     取源 → staging → win_fill 等比 blit，成功即跳过清色；失败才落回 present_clear（清色兜底）。
++     m80a=0 或 m42f=1 时本块只多两次 weak 符号查询，旧链一行不动。 */
++  if(!vk_ok){ __attribute__((weak)) int nvn_vk_m80a_first(void);
++    __attribute__((weak)) int nvn_vk_present_offscreen(void);
++    if(nvn_vk_m80a_first && nvn_vk_m80a_first() && nvn_vk_present_offscreen){
++      int m80a_pok=nvn_vk_present_offscreen();
++      if(m80a_pok){vk_ok=1;m7w_off=1;} } }
++  if(!vk_ok) vk_ok=nvn_vk_present_clear(m7d_r,m7d_g,m7d_b);
+  { /* 模拟器无 Vulkan ICD（vkCreateInstance=-9）→ 显示链回落到 CPU 填色：直接把清屏色写进 XComponent 窗口。
+       判据是「屏幕上有真实像素」，不要求像素由 Vulkan 产生；这里只换出图通道，不动 NVN 语义。 */
+    if(!vk_ok){ __attribute__((weak)) void *nvn_vk_native_window(void); __attribute__((weak)) int nvn_win_fill(void*,unsigned,unsigned,unsigned);
+@@ -5321,6 +5390,7 @@
+      if(pok) vk_ok=1,m7w_off=1;
+      else if(nvn_vk_native_window&&nvn_win_fill){ static int filled; int ok=nvn_win_fill(nvn_vk_native_window(),m7d_r,m7d_g,m7d_b); m7w_cpu=1;
+        if(!filled&&ok){filled=1;fprintf(stderr,"[nvn] present -> CPU fill OK (Vulkan unavailable, window path works)\n");} vk_ok=ok; } } }   /* round23批1落点3：NVN present → vk acquire+经典通道清色+present（donor third/d2r-mobile dm/android/vulkan_present.cpp present() 同位；带源图 blit 属批2）。SMO_VK=0/未起层时内部返 0，宿主行为同此前纯记账版 */
++ if(vk_ok)g_nvn_screens++;   /* M67B：本帧确实有画面交给了某条显示路径（present_clear/present_offscreen/win_fill 任一成功）。纯观察量。 */
+  {static unsigned n;if(n<4){n++;fprintf(stderr,"[nvn] QueuePresentTexture idx=%d present #%llu vk=%d\n",idx,(unsigned long long)g_nvn_presents,vk_ok);}} {extern void runtime_m7w_pres_capture(unsigned long long,int,int,int); if(m7w_t0) runtime_m7w_pres_capture(m7w_t0,vk_ok,m7w_off,m7w_cpu);}}   /* donor :2909 出图计帧（g_frame++）；批1 接通显示链后计数语义不变 */
+ /* round48 方向=submit-chain 审计结论：四提交入口首用 0 次 + 全程 stub 普查（round47 dump 35 项）无任何
+    fence/sync/queue 状态查询被调 ⇒ 提交链从未被进入，:439-458 现有桩没有一个是堵点（没人问它们）；
+@@ -6371,6 +6441,10 @@
+ }
+ static void *nvn_get_proc_address(void *device,const char *name){
+  (void)device;const char *n=name?name:"";void *fn=nvn_lookup(n);
++ /* M68B：客侧有没有来取 present 这枚地址（取过 ≠ 调过，见 M68B 判别表）。只多一次首字母判 + 一次 strcmp。 */
++ if(n[0]=='n'&&!strcmp(n,"nvnQueuePresentTexture")){g_nvn_present_proc++;
++   if(g_nvn_present_proc<=3)vk_boot_logf("[m68b-present] proc-request=%llu name=%s fn=%s",
++                                        (unsigned long long)g_nvn_present_proc,n,fn?"host":"stub");}
+  if(!strncmp(n,"nvnVertexAttribState",20)||!strncmp(n,"nvnVertexStreamState",20))
+   vk_boot_logf("[v] proc %s -> %s",n,fn?"host":"stub");   /* M3s：确认状态 helper 走的是哪条解析通道 */
+  m3y_proc_note(n,fn);   /* M3y P1：本轮补表的纹理/采样器名字（首请求一次） */
+--- mario-odessy-harmony/entry/src/main/cpp/platform/vk_boot.c
++++ mario-odessy-harmony/entry/src/main/cpp/platform/vk_boot.c
+@@ -300,6 +300,24 @@
+ __attribute__((weak)) void nvn_vk_m40aw_poll(unsigned tsec, unsigned long frames); /* M40AW：每 20 s 一行 submit 边界签名 + 内容门探针（n_sig/n_nonflat/best_spread/gate_ok/skip_*）（nvn_vk.c） */
+ __attribute__((weak)) void nvn_vk_m40ax_poll(unsigned tsec, unsigned long frames); /* M40AX：每 20 s 一行 flush+fence 之后的签名 + 内容门探针（n_sig/n_nonflat/best_spread/gate_ok/skip_*）（nvn_vk.c） */
+ __attribute__((weak)) void nvn_vk_m40av_poll(unsigned tsec, unsigned long frames); /* M40AV：每 20 s 一行「游戏 present 的 image」上屏源探针（cur/ok/ext/lay/pres/skip_empty/skip_why）（nvn_vk.c） */
++/* M67B（2026-11-12）：上屏三真值 + 兜底链状态。
++   · dm_nvn_frame_count()   = gfx_bridge.c 的 g_nvn_presents（**游戏真调 present 的次数**）
++   · dm_nvn_screen_count()  = 同一个 present 里「确实有画面交给了某条显示路径」的帧数
++   · nvn_vk_m67b_poll()     = smo_m67b 兜底链的逐级计数（=0 且没跑过时必须零输出）
++   三者都走弱符号：缺任何一条（x86_64 壳层）时按 0 打，不改变旧行为。 */
++__attribute__((weak)) uint64_t dm_nvn_frame_count(void);
++__attribute__((weak)) uint64_t dm_nvn_screen_count(void);
++__attribute__((weak)) void nvn_vk_m67b_poll(unsigned tsec, unsigned long frames); /* M67B：每 20 s 一行 [m67b] st（nvn_vk.c） */
++/* M68B（2026-11-12）：把「present 没被叫」与「present 被我们吞了」分开的三个入口量 + 上屏泵心跳。
++   · dm_nvn_present_enter() = 进 nvn_queue_present_texture 的次数（入口第一行 ++）
++   · dm_nvn_present_done()  = 该入口里「画面真交给某条显示路径」的次数（≡ M67B 的 onscreen，同一计数器）
++   · dm_nvn_present_proc()  = nvnGetProcAddress 里被要过 "nvnQueuePresentTexture" 的次数
++   · nvn_vk_m68b_pump_tick() = smo_m67b bit4 的上屏泵起停/心跳（=0 时零输出，泵线程不创建）
++   全部走弱符号：缺失时按 0 打 / 不调，不改变旧行为。 */
++__attribute__((weak)) uint64_t dm_nvn_present_enter(void);
++__attribute__((weak)) uint64_t dm_nvn_present_done(void);
++__attribute__((weak)) uint64_t dm_nvn_present_proc(void);
++__attribute__((weak)) void nvn_vk_m68b_pump_tick(unsigned tsec, unsigned long frames);
+ __attribute__((weak)) int  runtime_tid_info(int tid, unsigned *handle, int *op, int *wk, unsigned long long *waddr,
+                                             int *core, int *prio, unsigned long long *nsvc);   /* M6f: host tid -> KThread (threads.c) */
+ __attribute__((weak)) const char *runtime_op_name(int op);   /* threads.c: op enum -> short name */
+@@ -717,8 +735,19 @@
+         unsigned long frames = atomic_load_explicit(&g_beat_frames, memory_order_relaxed);
+         double now = vb_now_s(), cpu = vb_cpu_s();
+         if (frames != last_frames) { last_frames = frames; moved = now; }
+-        vk_boot_logf("[beat] t=%lus n=%lu frames=%lu present_try=%lu nvn_submit=%lu img=%lu buf=%lu cmd=%lu cpu=%.1f pct=%.0f stall=%.0f rss=%ld",
+-                     n * 2UL, n, frames,
++        /* M67B：present 的两个真值直接进 [beat]（M63A 的建议）。presents=「游戏真调 present 几次」，
++           onscreen=「其中有几次确实把画面交给了显示路径」。二者都为 0 ⇒ 全黑不在上屏实现里，
++           得往 submit→present 之间找（见 logs/m67b/summary.md）。弱符号缺失时打 0。 */
++        unsigned long long presents = dm_nvn_frame_count ? (unsigned long long)dm_nvn_frame_count() : 0ull;
++        unsigned long long onscreen = dm_nvn_screen_count ? (unsigned long long)dm_nvn_screen_count() : 0ull;
++        /* M68B：入口三个量并列进 [beat]（判别表见 logs/m68b/summary.md）。
++           enter = 客侧真调进 present 入口的次数；done ≡ onscreen（同一计数器，只为让判别表三项一眼可读）；
++           proc = 客侧有没有来 nvnGetProcAddress 取过 present 这枚地址。 */
++        unsigned long long enter = dm_nvn_present_enter ? (unsigned long long)dm_nvn_present_enter() : 0ull;
++        unsigned long long done  = dm_nvn_present_done ? (unsigned long long)dm_nvn_present_done() : 0ull;
++        unsigned long long proc  = dm_nvn_present_proc ? (unsigned long long)dm_nvn_present_proc() : 0ull;
++        vk_boot_logf("[beat] t=%lus n=%lu frames=%lu presents=%llu onscreen=%llu enter=%llu done=%llu proc=%llu present_try=%lu nvn_submit=%lu img=%lu buf=%lu cmd=%lu cpu=%.1f pct=%.0f stall=%.0f rss=%ld",
++                     n * 2UL, n, frames, presents, onscreen, enter, done, proc,
+                      atomic_load_explicit(&g_beat_present_try, memory_order_relaxed),
+                      atomic_load_explicit(&g_beat_nvn_submit, memory_order_relaxed),
+                      atomic_load_explicit(&g_beat_img, memory_order_relaxed),
+@@ -767,6 +796,12 @@
+         if (nvn_vk_m40av_poll) nvn_vk_m40av_poll((unsigned)(n * 2UL), frames);   /* M40AV：上屏源=游戏 present 的 image（关态空转零输出） */
+         if (nvn_vk_m40aw_poll) nvn_vk_m40aw_poll((unsigned)(n * 2UL), frames);   /* M40AW：submit 边界签名 + 内容门（关态空转零输出） */
+         if (nvn_vk_m40ax_poll) nvn_vk_m40ax_poll((unsigned)(n * 2UL), frames);   /* M40AX：flush+fence 之后的签名 + 内容门（关态空转零输出） */
++        /* M67B：兜底上屏链的逐级计数。/ 挂心跳 ⇒ present 根本没被调用时也能读出「兜底一次都没进」
++           ⇒ 直接区分「present 没被调」（n=0）与「present 调了但上屏失败」（n>0 且 blit_ok/fill_ok=0）。 */
++        if (nvn_vk_m67b_poll) nvn_vk_m67b_poll((unsigned)(n * 2UL), frames);
++        /* M68B：上屏泵起停（bit4=16）+ 泵心跳（bit5=32）。挂心跳 = present 从不被调也能起停，
++           2 s 内响应 hdc 改位；bit4=0 时该函数只做一次 smo_m67b 文件读 + 两个比较，零输出、不建线程。 */
++        if (nvn_vk_m68b_pump_tick) nvn_vk_m68b_pump_tick((unsigned)(n * 2UL), frames);
+         cpu_prev = cpu;
+         if ((n % 30u) == 0u) nvn_vk_m40p_stat();   /* M40P：每 60 s 一行建图分桶（smo_m40p 关态空转） */
+         if ((n % 30u) == 0u && runtime_m40x_poll) runtime_m40x_poll((unsigned)(n * 2UL));   /* M40X：每 60 s 一行命令分类（挂心跳，smo_m40x 关态空转） */
+--- mario-odessy-harmony/entry/src/main/cpp/platform/win_fill.c
++++ mario-odessy-harmony/entry/src/main/cpp/platform/win_fill.c
+@@ -63,6 +63,36 @@
+     Region region = {0};   /* rects=nullptr + rectNumber 0 = whole buffer dirty */
+     if (OH_NativeWindow_NativeWindowFlushBuffer(w, buf, -1, region) != 0) return 0;
+     return 1;
++}
++
++/* ---- M67B (2026-11-12): 只读能力探测 —— 窗口 API 到底能不能用 ----
++ *
++ * 为什么需要：native_buffer 缺失时，「上屏失败」有两种完全不同的原因 ——
++ *   ①窗口拿不到 buffer（RequestBuffer / FlushBuffer 挂）；
++ *   ②Vulkan 侧没有可拷的源（离屏 RT 还没画过 / 取源判据不命中）。
++ * 不分开就只能靠猜。本函数**不取 buffer、不写一个像素**：只问窗口当前的几何与格式，
++ * 把 OH_NativeWindow 的真返回码交给调用方落日志。
++ *
++ * 返回 1 = 两个查询都成功；0 = 至少一个失败（*prc_geo / *prc_fmt 带真返回码，-3 = 未调用）。
++ * GET_BUFFER_GEOMETRY 的出参顺序按 SDK 头文件 external_window.h:111 的注释是 (height, width)。 */
++int nvn_win_probe(void *win, int *pw, int *ph, int *pfmt, int *prc_geo, int *prc_fmt)
++{
++    if (pw) *pw = 0;
++    if (ph) *ph = 0;
++    if (pfmt) *pfmt = -1;
++    if (prc_geo) *prc_geo = -3;
++    if (prc_fmt) *prc_fmt = -3;
++    OHNativeWindow *w = (OHNativeWindow *)win;
++    if (!w) return 0;
++    int32_t h = 0, wd = 0, fmt = -1;
++    int32_t rg = OH_NativeWindow_NativeWindowHandleOpt(w, GET_BUFFER_GEOMETRY, &h, &wd);
++    int32_t rf = OH_NativeWindow_NativeWindowHandleOpt(w, GET_FORMAT, &fmt);
++    if (prc_geo) *prc_geo = (int)rg;
++    if (prc_fmt) *prc_fmt = (int)rf;
++    if (ph) *ph = (int)h;
++    if (pw) *pw = (int)wd;
++    if (pfmt) *pfmt = (int)fmt;
++    return (rg == 0 && rf == 0) ? 1 : 0;
+ }
+ 
+ /* ---- M3o (2026-11-03): real frame onto the window — 离屏 RT 的像素走这里上屏 ----
+--- mario-odessy-harmony/entry/src/main/cpp/platform/services.c
++++ mario-odessy-harmony/entry/src/main/cpp/platform/services.c
+@@ -286,19 +286,48 @@
+ static const char *diag_str64(const char *s){static char buf[2][65];static int slot;char *b;
+  if(!s)return "(null)";b=buf[slot&1];slot++;
+  size_t i=0;while(i<64&&s[i])b[i]=s[i],i++;b[i]=0;return b;}
++/* M80A：`smo_m80a` bit3(=8) = 6 参 abort 转发开关（缺省 0 = 只打印、不转发 = 旧行为）。
++   为什么默认不转发：转发到 sdk 真身会让进程按 SDK 的口径**终止**，而 M79A 已证这条 abort 不是渲染
++   必经点（A1 跑满 523 帧不崩）——长跑验证时把它换成「进程退出」是本末倒置；真正的 abort 原因
++   上面那行 [totk] 已经打全（module/file/func/line + Result）。开关位只在文件存在时读一次。 */
++static int m80a_fwd_abort(void) {
++ static int cached=-1; const char *p[2]={"/data/storage/el2/base/files/smo_m80a",
++  "/data/app/el2/100/base/com.vibecc.smo/files/smo_m80a"}; int v=0;
++ if(cached>=0)return cached;
++ cached=0;
++ for(int i=0;i<2;i++){FILE *f=fopen(p[i],"r"); if(!f)continue; if(fscanf(f,"%d",&v)!=1)v=0; fclose(f);
++  cached=((v>0)&&((v&8)!=0))?1:0; break;}
++ return cached;
++}
+ static void host_diag_abort2_6(const char *module,const char *file,const char *func,int line,const void *result,const char *fmt,...) {
+  fprintf(stderr,"[totk] diag AbortImpl2 6arg/Result module=%s file=%s func=%s line=%d result=%s%#llx fmt=%s (thread=%u)\n",
+   diag_str64(module),diag_str64(file),diag_str64(func),line,result?"":"null:",result?(unsigned long long)*(const uint32_t*)result:(unsigned long long)0,diag_str64(fmt),runtime_thread_current_handle());
++ /* M80A：默认到达这里就结束（不转发 ⇒ 进程存活）；bit3=1 才按签名转发。转发时 fmt 换成空串：
++    变参个数与被调方不一致会读栈垃圾，而 abort 的正文已经在上面的 [totk] 行里。Result 为空则不转发
++    （否则又把 sdk 送回同一个空指针坑）。 */
++ if(result && m80a_fwd_abort()){
++  uint8_t *fn=runtime_symbol("_ZN2nn4diag6detail9AbortImplEPKcS3_S3_iPKNS_6ResultES3_z");
++  if(fn){fprintf(stderr,"[totk] diag AbortImpl2 forwarding to sdk (fmt forced empty)\n");
++   ((void(*)(const char *,const char *,const char *,int,const void *,const char *))fn)(module,file,func,line,result,"");}
++  else fprintf(stderr,"[totk] diag AbortImpl2 forward target missing (kept alive)\n");
++ }
+ }
+ static void host_diag_abort2_mlc(const void *ctx,const void *result,const char *fmt,...) {
+  fprintf(stderr,"[totk] diag AbortImpl2 MetaLogContext ctx=%p result=%s%#llx fmt=%s (thread=%u)\n",
+   ctx,result?"":"null:",result?(unsigned long long)*(const uint32_t*)result:(unsigned long long)0,diag_str64(fmt),runtime_thread_current_handle());
+ }
+-static void host_diag_abort_impl(const char *module,const char *file,const char *func,int line) {
+- fprintf(stderr,"[totk] diag AbortImpl module=%p file=%p func=%p line=%d (thread=%u); forwarding to sdk\n",(void *)module,(void *)file,(void *)func,line,runtime_thread_current_handle());
++/* M80A（2026-11-12）：**崩溃根因修复**。M79A 在 sdk+0x17ed1c（= VAbortImpl+0xAC 的 `ldr w8,[x19]`）
++   指令级定谳：x19 = x4 = 第 5 参 `const nn::Result*` = **空** ⇒ VAbortImpl 解引用空指针（SIGSEGV），
++   把真正的 abort 信息整段盖掉。来源就是我们这枚桩「只带 4 参转调」：AAPCS64 下被调方看到的 x4 是
++   宿主残值 0。sdk 自己的 4 参包装（sdk+0x17EE90）在转调前会 `str wzr,[sp,#8]` 造一份合法 Result ——
++   这里做同一件事：**自建 nn::Result{0}（4 字节 POD，值 0 = 成功）显式放进第 5 参**。
++   对目标是 4 参包装（会自己重填 x4）还是 5 参真身（读 x4）两种情形都安全。 */
++static void host_diag_abort_impl(const char *module,const char *file,const char *func,int line) {
++ fprintf(stderr,"[totk] diag AbortImpl module=%p file=%p func=%p line=%d (thread=%u); forwarding to sdk (host-built Result{0})\n",(void *)module,(void *)file,(void *)func,line,runtime_thread_current_handle());
+  uint8_t *fn=runtime_symbol("_ZN2nn4diag6detail9AbortImplEPKcS3_S3_i");
+- if(fn)((void(*)(const char *,const char *,const char *,int))fn)(module,file,func,line);
+- else runtime_fail("AbortImpl forward target missing");
++ if(!fn)runtime_fail("AbortImpl forward target missing");
++ volatile uint32_t result0=0;   /* 栈上合法 nn::Result；调用期间一直活着 */
++ ((void(*)(const char *,const char *,const char *,int,const void *))fn)(module,file,func,line,(const void *)&result0);
+ }
+ /* nn::vi 显示服务（SMO 导入 6 个，符号来自 sdk 反解）：宿主无 vi:m IPC，按 HLE 盖掉整条显示链。
+    Display/Layer 用静态占位句柄；GetNativeWindow 返回非空占位（nvn_vk 未接线前无人消费）；

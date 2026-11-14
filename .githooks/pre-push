@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# pre-push：禁止直接把私有工作树推到公开镜像。
+#
+# 背景（2026-11-14）：这个仓库有两个 remote，origin 是私有 NAS Gitea，
+# github 是公开镜像。工作树里为了能构建，必须保留任天堂原版应用图标和
+# DevEco 回写的签名口令；直接 push github 曾两次把这些内容发上公网。
+#
+# 放行条件：只要不是推 github 就放行；推 github 必须走过滤脚本
+# （脚本自己会设 PUBLISH_PUBLIC=1）。
+set -uo pipefail
+
+is_github() { case "$1" in *github.com/zpp1103/smo-harmony*) return 0;; *) return 1;; esac; }
+
+remote_name="${1:-}"
+remote_url="${2:-}"
+
+if [ "$remote_name" != "github" ] && ! is_github "$remote_url"; then
+  exit 0
+fi
+
+# 允许纯删除：所有 ref 的远端 sha 都是 0（删除）时不拦，删只会减少泄漏
+all_delete=1
+while read -r lref lsha _rref _rsha; do
+  [ -n "${lsha:-}" ] || continue
+  case "$lref $lsha" in
+    "(delete)"*) ;;
+    0000000000000000000000000000000000000000*) ;;
+    *) all_delete=0 ;;
+  esac
+done
+if [ "$all_delete" = "1" ]; then
+  exit 0
+fi
+
+if [ "${PUBLISH_PUBLIC:-0}" = "1" ]; then
+  exit 0
+fi
+
+cat >&2 <<'EOF'
+✗ 拦截：不允许直接把工作树推送到公开仓库 github。
+
+  工作树里的这些内容是「私有仓合法、公开仓违规」的，push 一次就上一次公网：
+    · 7 个任天堂原版 icon.jpg（EXIF 含 Nintendo AuthoringTool）
+    · build-profile.json5 里 DevEco 回写的 keyPassword / storePassword
+    · AGENTS.md（内部会话规约与绝对路径）
+
+  正确做法（导出过滤后再推）：
+    bash tools/public/publish.sh            # 推当前 HEAD
+    bash tools/public/publish.sh <ref>      # 推指定分支
+
+  只想看看会推出去什么：
+    bash tools/public/publish.sh --dry-run
+EOF
+exit 1

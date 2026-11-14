@@ -1,0 +1,125 @@
+--- a/entry/src/main/cpp/host/threads.c
++++ b/entry/src/main/cpp/host/threads.c
+@@ -469,7 +469,7 @@
+ // ---------- Event SVC ring log (hang forensics: the identity of 0x1003/0x101f) ----------
+ enum { EVLOG_CREATE, EVLOG_SIGNAL, EVLOG_CLEAR, EVLOG_RESET, EVLOG_CLOSE };
+ static const char *const evlog_names[] = { "create", "signal", "clear", "reset", "close" };
+-typedef struct { uint32_t op, handle, extra; char who[24]; } evlog_t;
++typedef struct { uint32_t op, handle, extra; uint64_t lr; } evlog_t;   // round8: 存裸 LR（uint64 替代 char[24]）——0x1026 reset 洪 12-16k/s，热路径省掉每条 runtime_describe_address，dump 时再符号化
+ static evlog_t g_evlog[64];
+ static unsigned g_evlog_head, g_evlog_n;   // head=下一写位置；n=累计条数（回放窗口 min(n,16)）
+ void runtime_describe_address(uint64_t a, char *out, size_t n);   // 定义在诊断段（weak），此处前向声明
+@@ -491,6 +491,7 @@
+ static uint64_t g_ovf34, g_ovf35;
+ static _Atomic uint64_t g_n34, g_n34_blk, g_n35, g_n35_woke, g_n35_bad;
+ static _Atomic uint64_t g_evcnt[MAX_H][2];   /* [h-0x1000][0]=signal(svc 0x11 + 宿主服务侧) [1]=reset(svc 0x17) */
++static _Atomic uint64_t g_evfirst[MAX_H][2]; /* round8 归因：同上索引，signal/reset 各存首见裸 LR（照 sigaddr_note 的 caller 首见捕获范式）——0=空槽；dump 侧 who= 单列可见 */
+ /* 3) h=0x1023（round3 dump 画像：prio 28 音频工作线程，wait=4 等 0x101f 事件读端，nsvc ~700k/min）
+       醒来计数——svc 0x18 返回路径打点：0x101f 是否持续把它唤醒。持 G 更新，plain 计数。 */
+ static uint64_t g_w1023_calls, g_w1023_wake, g_w1023_wake_101f;
+@@ -510,15 +511,24 @@
+     if (is35) g_ovf35++; else g_ovf34++;
+ }
+ static void evlog(uint32_t op, uint32_t h, uint32_t h2, uint64_t lr) {
+-    char where[64]; runtime_describe_address(lr, where, sizeof where);
+-    evlog_t *e = &g_evlog[g_evlog_head]; e->op = op; e->handle = h; e->extra = h2;
+-    size_t k = strlen(where); if (k > sizeof e->who - 1) k = sizeof e->who - 1;
+-    memcpy(e->who, where, k); e->who[k] = 0;
+-    g_evlog_head = (g_evlog_head + 1) & 63; g_evlog_n++;
+-    if (op == EVLOG_SIGNAL || op == EVLOG_RESET) {   // round6 账本：per-handle signal/reset 累计（环回放被 0x1026 洪流淹没后由此给全量分布）
++    /* round6 账本 + round8 归因：per-handle signal/reset 累计与首见裸 LR（0x1024 的 signal 源=宿主构造侧、
++       0x1026 的 reset 源=SDK svc 包装层 LR，分钟 dump 的 evc who= 单列给出）。计数/首见先于环写去重——
++       洪流条目照样入账，只是不再占环。首见捕获用 CAS(0→lr)，sigaddr_note caller 范式的原子版。 */
++    if (op == EVLOG_SIGNAL || op == EVLOG_RESET) {
+         unsigned hi = h - 0x1000;
+-        if (hi > 0 && hi < MAX_H) atomic_fetch_add_explicit(&g_evcnt[hi][op == EVLOG_RESET], 1, memory_order_relaxed);   // 无符号回绕的坏句柄自然被挡
++        if (hi > 0 && hi < MAX_H) {   // 无符号回绕的坏句柄自然被挡
++            atomic_fetch_add_explicit(&g_evcnt[hi][op == EVLOG_RESET], 1, memory_order_relaxed);
++            uint64_t first = 0;
++            atomic_compare_exchange_strong_explicit(&g_evfirst[hi][op == EVLOG_RESET], &first, lr, memory_order_relaxed, memory_order_relaxed);
++        }
+     }
++    /* round8 环写去重：连续同 (op,handle,lr) 只记账不占环——0x1026（sdk+0xd3f084 每 5ms 一轮 reset）
++       不再淹没 64 槽回放窗口，dump 环留给其它句柄/操作的最近时序；竞态可接受（本函数既往即无锁写）。 */
++    static uint32_t p_op, p_h; static uint64_t p_lr;
++    if (op == p_op && h == p_h && lr == p_lr) return;
++    p_op = op; p_h = h; p_lr = lr;
++    evlog_t *e = &g_evlog[g_evlog_head]; e->op = op; e->handle = h; e->extra = h2; e->lr = lr;
++    g_evlog_head = (g_evlog_head + 1) & 63; g_evlog_n++;
+ }
+ 
+ int svc_thread(int num, uint64_t *regs) {
+@@ -949,10 +959,26 @@
+     /* evlog 可观测性（round5）：宿主服务侧的 signal 一直只在 SVC 0x11 路径入环，audio renderer 每帧
+        （5ms）经此处无条件触发（audio_renderer.c render_thread），环里却看不到——被误读成「evlog 无 signal
+        = 无信号源」。此处入环后 dump 环常驻 signal 条目（renderer 写端 0x1021 与游戏等的读端同一 event_t、
+-       refs=2，可互证信号源活着）。runtime_describe_address（loader.c）不取 G，持 G 调用安全。 */
++       refs=2，可互证信号源活着）。evlog（round8 起）只存裸 LR+原子计数，无锁无 I/O，持 G 调用安全。 */
+     evlog(EVLOG_SIGNAL, hw, 0, (uint64_t)(uintptr_t)__builtin_return_address(0));
+     e->signaled = 1; wake_sync_waiters(); pthread_mutex_unlock(&G);
+ }
++/* round8：宿主服务侧写端释放（IAudioDevice 会话 free 钩子用）——镜像 SVC 0x16 事件分支：解绑、
++   减一引用（游戏侧每份读端拷贝各持一引用）、回收句柄槽。事件对象在读端也全关后才真正释放。 */
++void runtime_event_close(uint32_t hw) {
++    uint32_t evh = 0;
++    pthread_mutex_lock(&G);
++    unsigned i = hw - 0x1000;
++    if (i > 0 && i < MAX_H && g_h[i].type == O_EVENT_W) {
++        evh = hw;
++        se_unbind(hw);
++        event_t *e = g_h[i].obj;
++        if (--e->refs == 0) free(e);
++        g_h[i].type = O_FREE; g_h[i].obj = NULL;
++    }
++    pthread_mutex_unlock(&G);
++    if (evh) evlog(EVLOG_CLOSE, evh, 0, (uint64_t)(uintptr_t)__builtin_return_address(0));
++}
+ 
+ // ---------- Diagnostics: TOTK_DUMP_AFTER=<seconds> prints every guest thread's wait state and guest return chain ----------
+ #include "mach_vm_compat.h"
+@@ -1080,20 +1106,23 @@
+       for (unsigned k = from; k < g_evlog_n; k++) {
+         evlog_t *e = &g_evlog[k & 63];
+         const char *opn = e->op <= EVLOG_CLOSE ? evlog_names[e->op] : "?";
++        char who[64]; runtime_describe_address(e->lr, who, sizeof who);   // round8: 环里存裸 LR，dump 时符号化（热路径零 describe）
+         fprintf(stderr, "[totk-dump] ev#%u %s h=%#x", k, opn, e->handle);
+         if (e->extra) fprintf(stderr, " h2=%#x", e->extra);
+-        fprintf(stderr, " who=%s\n", e->who);
++        fprintf(stderr, " who=%s\n", who);
+       }
+     }
+-    /* round6 观测（任务2）：事件账本 per-handle signal/reset 累计表（自启动起全量，每次 dump 都报全量）。
+-       上方环回放被 0x1026 洪流淹没（round3：320 万条/3 分钟，尾部 16 条只见它）时，这里给出全量分布：
+-       谁在被反复 signal/reset、各多少次。signal 列含宿主服务侧（runtime_event_signal，audio renderer）。
+-       选择在本地副本上做，全局计数不清零。 */
+-    { struct { uint32_t h; uint64_t s, r; } top[256]; unsigned nt = 0;
++    /* round6 观测（任务2）+ round8 归因：事件账本 per-handle signal/reset 累计表（自启动起全量）。
++       上方环回放被 0x1026 洪流淹没时这里给出全量分布；round8 起每句柄补 signal/reset 首见 LR 的符号
++       （who=）：0x1024 的 signal 源（宿主 IAudioDevice 构造侧）与 0x1026 的 reset 源（sdk+0xd3f084，
++       SDK svc 包装层 LR，其上真实调用循环=main+0x8b8xxx 音频线程）在每次分钟 dump 单列可见。
++       signal 列含宿主服务侧（runtime_event_signal）。选择在本地副本上做，全局计数不清零。 */
++    { struct { uint32_t h; uint64_t s, r, slr, rlr; } top[256]; unsigned nt = 0;
+       uint64_t tsig = 0, trst = 0;
+       for (unsigned i = 1; i < MAX_H && nt < 256; i++) {
+           uint64_t s = atomic_load(&g_evcnt[i][0]), rv = atomic_load(&g_evcnt[i][1]);
+-          if (s || rv) { tsig += s; trst += rv; top[nt].h = 0x1000 + i; top[nt].s = s; top[nt].r = rv; nt++; }
++          if (s || rv) { tsig += s; trst += rv; top[nt].h = 0x1000 + i; top[nt].s = s; top[nt].r = rv;
++                         top[nt].slr = atomic_load(&g_evfirst[i][0]); top[nt].rlr = atomic_load(&g_evfirst[i][1]); nt++; }
+       }
+       fprintf(stderr, "[totk-dump] event svc per-handle ledger (cumulative): %u handle(s) signal=%llu reset=%llu%s:\n",
+               nt, (unsigned long long)tsig, (unsigned long long)trst, nt == 256 ? " (capped at 256)" : "");
+@@ -1101,8 +1130,12 @@
+           int best = -1; uint64_t bv = 0;
+           for (unsigned i = 0; i < nt; i++) { uint64_t v = top[i].s + top[i].r; if (v > bv) { bv = v; best = (int)i; } }
+           if (best < 0) break;
+-          fprintf(stderr, "[totk-dump] evc h=%#x signal=%llu reset=%llu\n", top[best].h,
+-                  (unsigned long long)top[best].s, (unsigned long long)top[best].r);
++          char ws[96], wr[96];
++          if (top[best].slr) runtime_describe_address(top[best].slr, ws, sizeof ws); else ws[0] = 0;
++          if (top[best].rlr) runtime_describe_address(top[best].rlr, wr, sizeof wr); else wr[0] = 0;
++          fprintf(stderr, "[totk-dump] evc h=%#x signal=%llu%s%s reset=%llu%s%s\n", top[best].h,
++                  (unsigned long long)top[best].s, top[best].slr ? " who=" : "", ws,
++                  (unsigned long long)top[best].r, top[best].rlr ? " who=" : "", wr);
+           top[best].s = top[best].r = 0;
+       }
+     }

@@ -1,0 +1,19 @@
+--- a/entry/src/main/cpp/host/audio_renderer.c
++++ b/entry/src/main/cpp/host/audio_renderer.c
+@@ -338,7 +338,15 @@
+         return;
+     }
+     case 1: { uint64_t v = WORK_BUFFER_BYTES; IPC_OUT(rs, v); return; }
+-    case 2: case 4: rs->move[rs->nmove++] = runtime_ipc_new_session("IAudioDevice", audio_device_handler, NULL, NULL); return;
++    case 2: case 4: {   /* OpenAudioDevice(Auto): per-session event, signaled once right here — the host twin of
++       Ryujinx new AudioDevice() ctor Signal ("device enumeration done, default output available"). Signal happens
++       in the same statement that creates the session, i.e. before the game can hold any handle: race-free, and a
++       reopened session gets a fresh signaled event instead of the process's first (possibly long-reset) one. */
++        AudioDeviceState *d = calloc(1, sizeof *d);
++        need(d != NULL, "IAudioDevice session state");
++        d->ev = runtime_event_new(); runtime_event_signal(d->ev);
++        rs->move[rs->nmove++] = runtime_ipc_new_session("IAudioDevice", audio_device_handler, d, audio_device_close);
++        return; }
+     default: ipc_unimplemented(s, rq);
+     }
+ }

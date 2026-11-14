@@ -1,0 +1,143 @@
+diff --git a/mario-odessy-harmony/entry/src/main/cpp/host/threads.c b/mario-odessy-harmony/entry/src/main/cpp/host/threads.c
+index 06ff543..f0ed91e 100644
+--- a/mario-odessy-harmony/entry/src/main/cpp/host/threads.c
++++ b/mario-odessy-harmony/entry/src/main/cpp/host/threads.c
+@@ -23,6 +23,7 @@
+ // All waits hang on one global lock G, with one condition variable per thread; correctness first, performance to be measured later.
+ #include "thread_compat.h"
+ #include "ipc.h"
++#include "game_patches.h"   /* round20：SMO_OBS_HEAVY 最小扰动开关（early1d 等重探针编译开关） */
+ #include <errno.h>
+ #include <sched.h>
+ #include <signal.h>
+@@ -569,7 +570,11 @@ static void pkey_note(int is1d, uint64_t key, uint32_t caller) {   // 调用方
+    一次性 key（sig=1 族）把 64 槽主表吃光，早窗到底有多少 distinct key、哪些是活锁期空打
+    key 的前身，主表结构里读不出；本表按窗口收录，dump 单独一段。窗口起点=libgame 装载
+    （dump_init 构造器），首个 0x1D 早于构造器打点时兜底以首见时刻为 t0。窗口过期后
+-   early1d_closed 置位，热路径零额外开销（一次 flag 读）。持 G 更新，dump 无锁读（同 pkey）。 */
++   early1d_closed 置位，热路径零额外开销（一次 flag 读）。持 G 更新，dump 无锁读（同 pkey）。
++   round20 最小扰动构建：整段随 SMO_OBS_HEAVY=0 编译关闭——该账本在 svc 0x1D 持全局锁 G
++   的临界区内做 256 槽线性扫+now_ns()，boot 10s 窗口内每次 0x1D 都付此代价且阻塞其它
++   svc 线程，是宿主侧 boot 扰动最大源；注册时序假说要求先剥掉它。恢复观测改回 1 即可。 */
++#if SMO_OBS_HEAVY
+ #define EARLY1D_TOP 256
+ static struct { uint64_t key; uint64_t n; uint32_t caller; } g_early1d[EARLY1D_TOP];
+ static unsigned g_early1d_n; static uint64_t g_early1d_ovf;
+@@ -587,6 +592,7 @@ static void early1d_note(uint64_t key, uint32_t caller) {   // 调用方持 G（
+     }
+     g_early1d_ovf++;   // 10s 内 distinct key 超 256：计数留痕（本身即发现）
+ }
++#endif
+ /* ---------- round9b CreateThread/StartThread 全量账本（E2 宿主侧排查项）----------
+    修复方案定的宿主侧唯一排查项：核对 CreateThread/StartThread 门的全量账本（每个线程的
+    entry+arg+返回码），确认派发池消费者线程是「从未创建」而非「创建失败」。热路径零 I/O
+@@ -772,7 +778,11 @@ int svc_thread(int num, uint64_t *regs) {
+         uint64_t key = regs[0]; int cnt = (int)regs[1], n = 0;
+         pthread_mutex_lock(&G);
+         { thr_t *me = me_or_null(); pkey_note(1, key, me ? me->handle : 0);   // round9 观测：signal per-key 计数+首位调用者（sigaddr 0x35 同范式）
++#if SMO_OBS_HEAVY
+           early1d_note(key, me ? me->handle : 0); }   // round16b：boot 前 10s 的 0x1D 目标键全录（独立表；窗口外一次 flag 读即返回）
++#else
++          (void)me; }   // round20 最小扰动：early1d 账本编译关闭（pkey 轻量计数保留）
++#endif
+         for (thr_t *w; (cnt <= 0 || n < cnt) && (w = pick(2, key)); n++) lock_acquire_for(w, w->waddr, w->wtag);   // 按内核顺序；转为锁等待或被唤醒后不再是 kind 2
+         for (unsigned i = 0; i < g_pkey_n; i++) if (g_pkey[i].key == key) { g_pkey[i].n1dk += (uint64_t)n; break; }   // round8b：per-key 实际转醒数（n1d≫n1dk 且 waiters=0 = 空打；与 g_n1d_woke 总账对照）
+         for (unsigned i = 0; i < g_pkey2_n; i++) if (g_pkey2[i].key == key) { g_pkey2[i].n1dk += (uint64_t)n; break; }   // 次级表同账
+@@ -1342,7 +1352,9 @@ static void dump_threads(unsigned secs) {
+       /* round16b 早 boot 键全录段：boot 后前 10 秒的 0x1D 目标键专用全量表（独立于 pkey 三表，
+          不受其槽位挤压）。n=窗口内该 key 的 signal 次数（boot 一次性 key 预期 n=1），
+          first-caller=窗口内首位发信号线程——与 pkey 主表同 key 行对照即知哪些活锁期 key
+-         是 boot 期键的延续。 */
++         是 boot 期键的延续。
++         round20 最小扰动构建：探针编译关闭，dump 只打 off 标记（日志可证本轮确实没跑它）。 */
++#if SMO_OBS_HEAVY
+       fprintf(stderr, "[totk-dump] early-boot 0x1D keys (first 10s, dedicated full table): %u key(s)%s\n",
+               g_early1d_n, g_early1d_ovf ? ", OVERFLOW beyond 256" : "");
+       for (unsigned i = 0; i < g_early1d_n; i++)
+@@ -1351,6 +1363,9 @@ static void dump_threads(unsigned secs) {
+       if (g_early1d_ovf)
+           fprintf(stderr, "[totk-dump] early1d overflow: %llu signal(s) on keys beyond slot 256\n",
+                   (unsigned long long)g_early1d_ovf);
++#else
++      fprintf(stderr, "[totk-dump] early1d: probe OFF this build (round20 minimal-perturbation; SMO_OBS_HEAVY=0)\n");
++#endif
+     }
+     /* ---------- round9b CreateThread/StartThread 全量账本（E2 宿主侧排查项）----------
+        与上方线程名册（每行已带 entry=… arg=…）diff：账本里没有的 entry=从未创建；
+@@ -1411,7 +1426,10 @@ static void dump_threads(unsigned secs) {
+       /* round17 ①：KICK1 三条件快照（DRAIN-LOOP 门随排空函数 0 次进入而永不命中，改挂
+          kick 真入口 0x8ad1f4——this=x0、w1=原 x1）：三分支交叉分布直接回答「216 次真 kick
+          为何派不到 worker」（w1<1 与 w1>=1∧f9==2 走 0x8ad214 直虚调；w1>=1∧f9!=2 走
+-         0x8ad22c 动画路径；o20==0 ⇒ 动画路径 0x8ad28c cbz 跳过 bl 0x8ac800）。 */
++         0x8ad22c 动画路径；o20==0 ⇒ 动画路径 0x8ad28c cbz 跳过 bl 0x8ac800）。
++         round20 最小扰动构建：三条件快照编译关闭（观察器侧 #if），本段只打 off 标记+
++         门本体计数（kick1 纯计数门保留）。 */
++#if SMO_OBS_HEAVY
+       {
+       extern int smo_obs_k1_stats(uint64_t[5], uint64_t[3], uint64_t[4]);
+       uint64_t kf[5], kl[3], kd[4];
+@@ -1440,6 +1458,10 @@ static void dump_threads(unsigned secs) {
+                   i, (unsigned long long)rh[i], (unsigned long long)rw[i],
+                   (unsigned long long)rf[i], (unsigned long long)ro[i]);
+       }
++#else
++      fprintf(stderr, "[totk-dump] kick1 cond/first16: probes OFF this build (round20 minimal-perturbation; SMO_OBS_HEAVY=0) | kick1 counting gate hits=%llu last_x0=%#llx\n",
++              (unsigned long long)smo_obs_hits(4), (unsigned long long)smo_obs_last_x0(4));
++#endif
+       /* round17 ②：BC310 广播调用点（donor main+0x954310，CreateThread→StartThread→svc0x1d
+          广播序列现场 x3 恒=该入口值，且全镜像无直接分支落此＝只经指针调用）。emu hits>0 ⇒
+          emu main 执行了同一 boot 广播链；first/last x0=该函数收的对象（InitSystem 收件箱归属）。 */
+@@ -1506,8 +1528,32 @@ static void dump_threads(unsigned secs) {
+       fprintf(stderr, "[totk-dump] thunk gates: thunk1 in(0x587da4)=%llu null(0x587eac)=%llu | thunk2 in(0x587db4)=%llu null(0x587ec4)=%llu\n",
+               (unsigned long long)smo_obs_hits(12), (unsigned long long)smo_obs_hits(13),
+               (unsigned long long)smo_obs_hits(14), (unsigned long long)smo_obs_hits(15));
++      /* round20 注册三门 + mq walker 双尾门（game_patches.c 门 id 16-19）：
++         entry(0x8ae230)=注册函数（str x1,[x0] 写句柄入槽）全部进入；done(0x8ae258)=注册体
++         跑到尾声（str 与回指针写都在其上游线性路径上；全镜像扫描 23c/240/244 零落点 ⇒
++         str 执行 ⇔ entry 命中）；entry==done ⇔ 每次进入都完整注册，entry>done=中途异常。
++         mq680 ret+adv=版本比较 walker 全部进入（终结+前进四路径穷尽，合成环头计数）。
++         首见 {x0,x1,ts}：x1=被注册句柄(entry)/版本比较字(mq)；REG230 与 MQ 门首见 ts
++         相减=注册 vs 消费侧首跑时序（注册时序假说的主读数）。 */
++      fprintf(stderr, "[totk-dump] reg gates: entry(0x8ae230)=%llu done(0x8ae258)=%llu | mq680 walker: ret(0x9646a4)=%llu adv(0x9646ac)=%llu\n",
++              (unsigned long long)smo_obs_hits(16), (unsigned long long)smo_obs_hits(17),
++              (unsigned long long)smo_obs_hits(18), (unsigned long long)smo_obs_hits(19));
++      {
++      extern int smo_obs_fs_snapshot(int, uint64_t *, uint64_t *, uint64_t *);
++      static const char *fsn[3] = { "reg-entry 0x8ae230 (x0=slot x1=handler)", "mq680-ret 0x9646a4 (x0=node x1=ver)", "mq680-adv 0x9646ac (x0=next x1=ver)" };
++      for (int k = 0; k < 3; k++) {
++          uint64_t fx0 = 0, fx1 = 0, fts = 0;
++          if (smo_obs_fs_snapshot(k, &fx0, &fx1, &fts))
++              fprintf(stderr, "[totk-dump] fs[%d] %s: first x0=%#llx x1=%#llx at +%lluns\n",
++                      k, fsn[k], (unsigned long long)fx0, (unsigned long long)fx1, (unsigned long long)fts);
++          else fprintf(stderr, "[totk-dump] fs[%d] %s: none (gate never hit)\n", k, fsn[k]);
++      }
++      }
+       /* round19 ③：BC310 first-16 唯一 x0 环——45807 hits 的收件对象分布（首 16 个唯一
+-         x0 枚举+各计数；x0 是对象指针，非代码地址，不做模块符号化）。 */
++         x0 枚举+各计数；x0 是对象指针，非代码地址，不做模块符号化）。
++         round20 最小扰动构建：x0 环编译关闭（观察器侧 #if），本段只打 off 标记；BC310
++         门本身保留首见 {x0,x1}+hits 计数（上方 bc310 行继续输出）。 */
++#if SMO_OBS_HEAVY
+       {
+       extern int smo_obs_bc_x0ring(uint64_t[16], uint64_t[16], uint64_t *, uint64_t *);
+       uint64_t xv[16], xc[16], xover = 0, xzero = 0;
+@@ -1519,6 +1565,9 @@ static void dump_threads(unsigned secs) {
+                                  i, (unsigned long long)xv[i], (unsigned long long)xc[i]);
+       } else fprintf(stderr, "[totk-dump] bc310 first16 x0: none (gate never hit)\n");
+       }
++#else
++      fprintf(stderr, "[totk-dump] bc310 first16 x0: probe OFF this build (round20 minimal-perturbation; SMO_OBS_HEAVY=0)\n");
++#endif
+       /* round16b E2b 归属：上轮 E2a this=0x7f76fcdaf8 与 h1020/h1023 arg 同 0x7f76fc 邻域。
+          对 E2 this 做池反查（宿主 NVN 池账本 gfx_bridge nvn_pool_ledger，±0x4000 页距容差）
+          + CreateThread 账本同 64K 邻域 arg 对照，一行打归属推断依据（谁的对象）。
+@@ -1799,7 +1848,9 @@ void spin_sampler_start(void) {
+     if (pthread_create(&th, NULL, spin_sampler, NULL) == 0) pthread_detach(th);
+ }
+ __attribute__((constructor)) static void dump_init(void) {
++#if SMO_OBS_HEAVY
+     if (!g_early1d_t0_set) { g_early1d_t0 = now_ns(); g_early1d_t0_set = 1; }   // round16b：早 boot 10s 窗口起点=libgame 装载时刻
++#endif
+     const char *c = getenv("TOTK_LISTCHECK");
+     if (c) { pthread_t th; pthread_create(&th, NULL, list_check, (void *)(uintptr_t)strtoull(c, NULL, 0)); pthread_detach(th); }
+     const char *e = getenv("TOTK_DUMP_AFTER"); if (!e) return;

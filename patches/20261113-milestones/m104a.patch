@@ -1,0 +1,551 @@
+--- mario-odessy-harmony/entry/src/main/cpp/platform/win_fill.c	2026-11-13 20:56:33
++++ mario-odessy-harmony/entry/src/main/cpp/platform/win_fill.c	2026-11-13 20:58:05
+@@ -23,6 +23,98 @@
+ 
+ /* 文件日志（nvn_vk.c 提供）。几何行必须进 boot 日志：stderr/hilog 首波会被流控丢。 */
+ extern void vk_boot_logf(const char *fmt, ...);
++
++/* ================= M104A（2026-11-13）：可见面写者台账 ==================================
++   问题（M103A 留下的最锐事实）：present 前段 `[p] sig src=tex staging mean=0/0/0`，屏幕却有
++   16% 纯黄 ⇒ 「可见帧不是我们这条拷贝路径产出的」这句话必须被证或证伪。
++   事实链：**本文件是唯一直接写 XComponent 窗口缓冲区的模块**（两条通道：
++     ① nvn_win_present_rgba —— 真图 blit（staging→窗口），
++     ② nvn_win_fill —— 纯色 CPU 填色兜底。
++   所以「谁写可见面」的计数器必须落在这里。通道号：
++     0=未知 1=主 present 线程（nvn_vk_present_offscreen）2=上屏泵（m68b）3=m67b 兜底 4=init 一次性
++   统计口径（与截图判据同口径）：目标面 = 窗口 buffer 全幅；黄 = R>=200 && G>=150 && B<=60
++   （M103A 交付图的量化口径）；nz = 非零像素占比。采样 64x36 网格（2304 点，几十 us，只读）。
++   =0 关态不存在：本块是纯观测设施，不读开关、不改一个像素，热路径只多一次网格采样。 */
++#include <stdatomic.h>
++#define M104A_NCH 6
++static _Atomic int g_m104a_tag;                            /* 当前写者（调用方在 blit 前置） */
++void nvn_win_m104a_tag(int t) { atomic_store_explicit(&g_m104a_tag, t, memory_order_relaxed); }
++static double m104a_now(void)
++{
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
++}
++/* 一次采样：均值/最大值/非零占比/黄色占比（‰，整数避免浮点误差与格式串风险）。 */
++typedef struct { unsigned mr, mg, mb, mxr, mxg, mxb, nz, yel, ns; } m104a_sig_t;
++static void m104a_sig(m104a_sig_t *s, const uint8_t *base, int stride, int w, int h)
++{
++    memset(s, 0, sizeof *s);
++    if (!base || stride <= 0 || w <= 0 || h <= 0) return;
++    const int sx = (w > 64) ? (w / 64) : 1;
++    const int sy = (h > 36) ? (h / 36) : 1;
++    unsigned long long sr = 0, sg = 0, sb = 0, nz = 0, yel = 0, ns = 0;
++    for (int y = 0; y < h; y += sy) {
++        const uint8_t *row = base + (size_t)y * (size_t)stride;
++        for (int x = 0; x < w; x += sx) {
++            const uint8_t *q = row + (size_t)x * 4;
++            const unsigned r = q[0], g = q[1], b = q[2];
++            sr += r; sg += g; sb += b; ns++;
++            if (r || g || b) nz++;
++            if (r >= 200 && g >= 150 && b <= 60) yel++;
++            if (r > s->mxr) s->mxr = r;
++            if (g > s->mxg) s->mxg = g;
++            if (b > s->mxb) s->mxb = b;
++        }
++    }
++    if (!ns) return;
++    s->mr = (unsigned)(sr / ns); s->mg = (unsigned)(sg / ns); s->mb = (unsigned)(sb / ns);
++    s->nz = (unsigned)(nz * 1000ull / ns); s->yel = (unsigned)(yel * 1000ull / ns);
++    s->ns = (unsigned)ns;
++}
++/* 通道台账：写次数 / 失败次数 / 首次 / 末次（monotonic 秒）/ 最近一次 源与目标 的 6 个统计量。 */
++static _Atomic unsigned long long g_m104a_wr[M104A_NCH], g_m104a_fl[M104A_NCH];
++static _Atomic unsigned long long g_m104a_first_us[M104A_NCH], g_m104a_last_us[M104A_NCH];
++static _Atomic unsigned long long g_m104a_sigsrc[M104A_NCH][7];   /* mr,mg,mb,mx,nz‰,yel‰,ext */
++static _Atomic unsigned long long g_m104a_sigtgt[M104A_NCH][7];
++static _Atomic unsigned long long g_m104a_fillc[M104A_NCH][3];    /* 纯色通道的 rgb */
++/* 失败计数（RequestBuffer / 句柄不可用 / mmap / Flush 拒绝）—— 「没写」与「写了但被拒」分开记。 */
++static void m104a_count_fail(int tg0)
++{
++    int tg = tg0;
++    if (tg <= 0 || tg >= M104A_NCH) tg = 1;
++    atomic_fetch_add_explicit(&g_m104a_fl[tg], 1ull, memory_order_relaxed);
++}
++/* 30 s 汇总（nvn_vk.c 心跳线程调用；返回写入 out 的字符数，格式与派活单一致）。 */
++int nvn_win_m104a_report(char *out, int cap)
++{
++    if (!out || cap <= 0) return 0;
++    static const char *nm[M104A_NCH] = { "none", "wbuf/main", "wbuf/pump", "wbuf/m67b", "wbuf/init", "other" };
++    double t0 = 0; int o = 0;
++    for (int c = 0; c < M104A_NCH; c++) {
++        const double f = (double)atomic_load_explicit(&g_m104a_first_us[c], memory_order_relaxed) / 1e6;
++        if (f > 0 && (t0 <= 0 || f < t0)) t0 = f;
++    }
++    for (int c = 0; c < M104A_NCH; c++) {
++        const unsigned long long n = atomic_load_explicit(&g_m104a_wr[c], memory_order_relaxed);
++        const unsigned long long bad = atomic_load_explicit(&g_m104a_fl[c], memory_order_relaxed);
++        if (!n && !bad) continue;
++        const double f = (double)atomic_load_explicit(&g_m104a_first_us[c], memory_order_relaxed) / 1e6 - t0;
++        const double l = (double)atomic_load_explicit(&g_m104a_last_us[c], memory_order_relaxed) / 1e6 - t0;
++        const unsigned long long *s = (const unsigned long long *)&g_m104a_sigsrc[c];
++        const unsigned long long *g = (const unsigned long long *)&g_m104a_sigtgt[c];
++        const unsigned long long *fc = (const unsigned long long *)&g_m104a_fillc[c];
++        o += snprintf(out + o, (size_t)(cap - o),
++                      " | %s writes=%llu fail=%llu first=%.1fs last=%.1fs src[mean=%llu/%llu/%llu max=%llu nz=%llu.%llu%% yel=%llu.%llu%%] "
++                      "tgt[mean=%llu/%llu/%llu max=%llu nz=%llu.%llu%% yel=%llu.%llu%%] col=%llu,%llu,%llu",
++                      nm[c], n, bad, f, l, s[0], s[1], s[2], s[3], s[4] / 10ull, s[4] % 10ull, s[5] / 10ull, s[5] % 10ull,
++                      g[0], g[1], g[2], g[3], g[4] / 10ull, g[4] % 10ull, g[5] / 10ull, g[5] % 10ull,
++                      fc[0], fc[1], fc[2]);
++        if (o >= cap - 64) break;
++    }
++    out[(o < cap) ? o : (cap - 1)] = 0;
++    return o;
++}
+ 
+ /* Returns 1 when the window was filled and flushed, 0 when the buffer could not be obtained. */
+ int nvn_win_fill(void *win, unsigned r, unsigned g, unsigned b)
+@@ -61,7 +153,28 @@
+     if (mapped) munmap(base, (size_t)h->size);
+ 
+     Region region = {0};   /* rects=nullptr + rectNumber 0 = whole buffer dirty */
+-    if (OH_NativeWindow_NativeWindowFlushBuffer(w, buf, -1, region) != 0) return 0;
++    if (OH_NativeWindow_NativeWindowFlushBuffer(w, buf, -1, region) != 0) {
++        /* M104A：纯色通道的失败也要计数（「窗口拒绝这次写」与「根本没调」是两种结论）。 */
++        int tg = atomic_load_explicit(&g_m104a_tag, memory_order_relaxed);
++        if (tg <= 0 || tg >= M104A_NCH) tg = 3;
++        atomic_fetch_add_explicit(&g_m104a_fl[tg], 1ull, memory_order_relaxed);
++        return 0;
++    }
++    /* M104A：纯色调试通道（wfill）计数 —— 每次写都把颜色记进台账，30 s 汇总一行。 */
++    {
++        int tg = atomic_load_explicit(&g_m104a_tag, memory_order_relaxed);
++        if (tg <= 0 || tg >= M104A_NCH) tg = 3;
++        const unsigned long long n = atomic_fetch_add_explicit(&g_m104a_wr[tg], 1ull, memory_order_relaxed) + 1ull;
++        atomic_store_explicit(&g_m104a_last_us[tg], (unsigned long long)(m104a_now() * 1e6), memory_order_relaxed);
++        if (!atomic_load_explicit(&g_m104a_first_us[tg], memory_order_relaxed))
++            atomic_store_explicit(&g_m104a_first_us[tg], (unsigned long long)(m104a_now() * 1e6), memory_order_relaxed);
++        atomic_store_explicit(&g_m104a_fillc[tg][0], r, memory_order_relaxed);
++        atomic_store_explicit(&g_m104a_fillc[tg][1], g, memory_order_relaxed);
++        atomic_store_explicit(&g_m104a_fillc[tg][2], b, memory_order_relaxed);
++        if (n <= 3 || (n % 60) == 0)
++            vk_boot_logf("[m104a] w wfill/t%d writes=%llu col=%u,%u,%u geo=%dx%d (纯色 CPU 填色通道)",
++                         tg, n, r, g, b, rows, words_per_row * 4);
++    }
+     return 1;
+ }
+ 
+@@ -122,13 +235,15 @@
+ int nvn_win_present_rgba(void *win, const uint8_t *src, int sw, int sh, int src_stride)
+ {
+     OHNativeWindow *w = (OHNativeWindow *)win;
+-    if (!w || !src || sw <= 0 || sh <= 0 || src_stride < sw * 4) return 0;
++    const int m104a_tg0 = atomic_load_explicit(&g_m104a_tag, memory_order_relaxed);   /* M104A：写者归属 */
++    if (!w || !src || sw <= 0 || sh <= 0 || src_stride < sw * 4) { m104a_count_fail(m104a_tg0); return 0; }
+ 
+     OHNativeWindowBuffer *buf = NULL;
+     int fence = -1;
+     int rq = OH_NativeWindow_NativeWindowRequestBuffer(w, &buf, &fence);
+     if (rq != 0 || !buf) {
+         fprintf(stderr, "[p-red] RequestBuffer rv=%d errno=%d\n", rq, errno);
++        m104a_count_fail(m104a_tg0);
+         return 0;
+     }
+     BufferHandle *h = OH_NativeWindow_GetBufferHandleFromNative(buf);
+@@ -136,6 +251,7 @@
+         fprintf(stderr, "[p-red] BufferHandle unusable size=%d stride=%d %dx%d\n",
+                 h ? h->size : -1, h ? h->stride : -1, h ? h->width : -1, h ? h->height : -1);
+         OH_NativeWindow_NativeWindowAbortBuffer(w, buf);
++        m104a_count_fail(m104a_tg0);
+         return 0;
+     }
+ 
+@@ -154,6 +270,7 @@
+         if (p == MAP_FAILED) {
+             fprintf(stderr, "[p-red] mmap(%d) errno=%d\n", h->size, errno);
+             OH_NativeWindow_NativeWindowAbortBuffer(w, buf);
++            m104a_count_fail(m104a_tg0);
+             return 0;
+         }
+         base = (uint8_t *)p;
+@@ -161,6 +278,10 @@
+     }
+ 
+     const int ow = h->width, oh = h->height, dst_stride = h->stride;
++    /* M104A：写之前的缓冲内容（= 上一轮谁留在池里的像素）。这一项是「有没有第二个写者」的
++       直接证据：若它既不是纯黑也不是我们上一次写的内容，就有别人在写同一块面。 */
++    m104a_sig_t m104a_prev;
++    m104a_sig(&m104a_prev, base, dst_stride, ow, oh);
+     /* M4cc P1：等比适配（fit）—— 目标面尺寸全部来自运行时 BufferHandle，源矩形恒为全幅。
+        dw/dh = 源按 scale 映射到面上的像素尺寸；受限轴取满，另一轴居中留黑边（letterbox）。
+        整数算术保证「同一对 (src,dst) 永远得到同一组数」，便于逐帧比对日志。 */
+@@ -290,6 +411,12 @@
+     clock_gettime(CLOCK_MONOTONIC, &ts);
+     const long long t1 = (long long)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+ 
++    /* M104A：写完之后目标面（= 屏幕上会出现的那张）与源（= staging 里要送屏的像素）各采一次。
++       判据③「结论通道的 mean/色数与截图一致」就是拿 tgt 这组数去对设备侧截图。 */
++    m104a_sig_t m104a_src, m104a_tgt;
++    m104a_sig(&m104a_src, src, src_stride, sw, sh);
++    m104a_sig(&m104a_tgt, base, dst_stride, ow, oh);
++
+     if (mapped) munmap(base, (size_t)h->size);
+ 
+     Region region = {0};
+@@ -298,6 +425,7 @@
+     const long long t2 = (long long)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+     if (fr != 0) {
+         fprintf(stderr, "[p-red] FlushBuffer rv=%d errno=%d\n", fr, errno);
++        m104a_count_fail(m104a_tg0);
+         return 0;
+     }
+ 
+@@ -314,5 +442,55 @@
+                        "src=%dx%d off=%d,%d copy=%dx%d swap=%d",
+                        n, ow, oh, h->format, dst_stride, h->size, (void *)h->virAddr,
+                        (int)syscall(__NR_gettid), sw, sh, bx, by, dw, dh, swap); }
++    /* ===== M104A：可见面写者台账（真图 blit 通道） =====================================
++       每写一次记一次；日志按 ≤1 Hz 限流（**计数不丢**：writes 是精确累计，行是采样）。
++       行格式按派活单：`[m104a] w <chan> writes=<n> last=<ts> img=<handle> mean/max ...`。
++       另给 prev（写之前池里的内容）、tgt（写完的目标面）、src（staging 源）三组统计 ——
++       判据②「三方对齐」里，tgt 对截图、src 对我们的 staging、prev 对「有没有第二个写者」。 */
++    {
++        int tg = m104a_tg0;
++        if (tg <= 0 || tg >= M104A_NCH) tg = 1;
++        const unsigned long long nw = atomic_fetch_add_explicit(&g_m104a_wr[tg], 1ull, memory_order_relaxed) + 1ull;
++        const unsigned long long us = (unsigned long long)(m104a_now() * 1e6);
++        atomic_store_explicit(&g_m104a_last_us[tg], us, memory_order_relaxed);
++        if (!atomic_load_explicit(&g_m104a_first_us[tg], memory_order_relaxed))
++            atomic_store_explicit(&g_m104a_first_us[tg], us, memory_order_relaxed);
++        atomic_store_explicit(&g_m104a_sigsrc[tg][0], m104a_src.mr, memory_order_relaxed);
++        atomic_store_explicit(&g_m104a_sigsrc[tg][1], m104a_src.mg, memory_order_relaxed);
++        atomic_store_explicit(&g_m104a_sigsrc[tg][2], m104a_src.mb, memory_order_relaxed);
++        atomic_store_explicit(&g_m104a_sigsrc[tg][3], m104a_src.mxr > m104a_src.mxg ?
++                              (m104a_src.mxr > m104a_src.mxb ? m104a_src.mxr : m104a_src.mxb) :
++                              (m104a_src.mxg > m104a_src.mxb ? m104a_src.mxg : m104a_src.mxb), memory_order_relaxed);
++        atomic_store_explicit(&g_m104a_sigsrc[tg][4], m104a_src.nz, memory_order_relaxed);
++        atomic_store_explicit(&g_m104a_sigsrc[tg][5], m104a_src.yel, memory_order_relaxed);
++        atomic_store_explicit(&g_m104a_sigsrc[tg][6], (unsigned long long)sw * (unsigned long long)sh, memory_order_relaxed);
++        atomic_store_explicit(&g_m104a_sigtgt[tg][0], m104a_tgt.mr, memory_order_relaxed);
++        atomic_store_explicit(&g_m104a_sigtgt[tg][1], m104a_tgt.mg, memory_order_relaxed);
++        atomic_store_explicit(&g_m104a_sigtgt[tg][2], m104a_tgt.mb, memory_order_relaxed);
++        atomic_store_explicit(&g_m104a_sigtgt[tg][3], m104a_tgt.mxr > m104a_tgt.mxg ?
++                              (m104a_tgt.mxr > m104a_tgt.mxb ? m104a_tgt.mxr : m104a_tgt.mxb) :
++                              (m104a_tgt.mxg > m104a_tgt.mxb ? m104a_tgt.mxg : m104a_tgt.mxb), memory_order_relaxed);
++        atomic_store_explicit(&g_m104a_sigtgt[tg][4], m104a_tgt.nz, memory_order_relaxed);
++        atomic_store_explicit(&g_m104a_sigtgt[tg][5], m104a_tgt.yel, memory_order_relaxed);
++        atomic_store_explicit(&g_m104a_sigtgt[tg][6], (unsigned long long)ow * (unsigned long long)oh, memory_order_relaxed);
++        {
++            static double lastline[M104A_NCH];
++            const double nws = m104a_now();
++            if (nw <= 3 || nws - lastline[tg] >= 1.0) {
++                lastline[tg] = nws;
++                vk_boot_logf("[m104a] w wbuf/t%d writes=%llu last=%.1fs img=%p tid=%d src=%dx%d dst=%dx%d+%d+%d "
++                             "src[mean=%u/%u/%u max=%u/%u/%u nz=%u.%u%% yel=%u.%u%%] "
++                             "tgt[mean=%u/%u/%u max=%u/%u/%u nz=%u.%u%% yel=%u.%u%%] "
++                             "prev[mean=%u/%u/%u nz=%u.%u%% yel=%u.%u%%]",
++                             tg, nw, nws, (const void *)src, (int)syscall(__NR_gettid), sw, sh, ow, oh, bx, by,
++                             m104a_src.mr, m104a_src.mg, m104a_src.mb, m104a_src.mxr, m104a_src.mxg, m104a_src.mxb,
++                             m104a_src.nz / 10u, m104a_src.nz % 10u, m104a_src.yel / 10u, m104a_src.yel % 10u,
++                             m104a_tgt.mr, m104a_tgt.mg, m104a_tgt.mb, m104a_tgt.mxr, m104a_tgt.mxg, m104a_tgt.mxb,
++                             m104a_tgt.nz / 10u, m104a_tgt.nz % 10u, m104a_tgt.yel / 10u, m104a_tgt.yel % 10u,
++                             m104a_prev.mr, m104a_prev.mg, m104a_prev.mb,
++                             m104a_prev.nz / 10u, m104a_prev.nz % 10u, m104a_prev.yel / 10u, m104a_prev.yel % 10u);
++            }
++        }
++    }
+     return 1;
+ }
+--- mario-odessy-harmony/entry/src/main/cpp/platform/vk_boot.c	2026-11-13 20:56:33
++++ mario-odessy-harmony/entry/src/main/cpp/platform/vk_boot.c	2026-11-13 21:00:26
+@@ -318,6 +318,9 @@
+ __attribute__((weak)) uint64_t dm_nvn_present_done(void);
+ __attribute__((weak)) uint64_t dm_nvn_present_proc(void);
+ __attribute__((weak)) void nvn_vk_m68b_pump_tick(unsigned tsec, unsigned long frames);
++/* M104A（2026-11-13）：可见面写者台账的 30 s 汇总（= 每条通道 writes/fail/首末时间 + 最近一次
++   源与目标的像素统计）。挂心跳 ⇒ 渲染线程卡死也照打；缺失时整条不调，旧链逐字不变。 */
++__attribute__((weak)) void nvn_vk_m104a_poll(unsigned tsec, unsigned long frames);
+ __attribute__((weak)) int  runtime_tid_info(int tid, unsigned *handle, int *op, int *wk, unsigned long long *waddr,
+                                             int *core, int *prio, unsigned long long *nsvc);   /* M6f: host tid -> KThread (threads.c) */
+ __attribute__((weak)) const char *runtime_op_name(int op);   /* threads.c: op enum -> short name */
+@@ -802,6 +805,8 @@
+         /* M68B：上屏泵起停（bit4=16）+ 泵心跳（bit5=32）。挂心跳 = present 从不被调也能起停，
+            2 s 内响应 hdc 改位；bit4=0 时该函数只做一次 smo_m67b 文件读 + 两个比较，零输出、不建线程。 */
+         if (nvn_vk_m68b_pump_tick) nvn_vk_m68b_pump_tick((unsigned)(n * 2UL), frames);
++        /* M104A：每 30 s 一行「谁在写可见面」的汇总（函数自带 30 s 门；关态也照打，因为它是账本不是实验）。 */
++        if (nvn_vk_m104a_poll) nvn_vk_m104a_poll((unsigned)(n * 2UL), frames);
+         cpu_prev = cpu;
+         if ((n % 30u) == 0u) nvn_vk_m40p_stat();   /* M40P：每 60 s 一行建图分桶（smo_m40p 关态空转） */
+         if ((n % 30u) == 0u && runtime_m40x_poll) runtime_m40x_poll((unsigned)(n * 2UL));   /* M40X：每 60 s 一行命令分类（挂心跳，smo_m40x 关态空转） */
+--- mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c	2026-11-13 20:56:33
++++ mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c	2026-11-13 21:00:12
+@@ -29514,7 +29514,10 @@
+         } else {
+             const int w = (int)atomic_load_explicit(&g_m68b_sw, memory_order_relaxed);
+             const int h = (int)atomic_load_explicit(&g_m68b_sh, memory_order_relaxed);
++            __attribute__((weak)) void nvn_win_m104a_tag(int);
++            if (nvn_win_m104a_tag) nvn_win_m104a_tag(2);   /* M104A：通道归属 = 上屏泵 */
+             const int ok = (w > 0 && h > 0) ? nvn_win_present_rgba(g_win, g_p_map, w, h, w * 4) : 0;
++            if (nvn_win_m104a_tag) nvn_win_m104a_tag(0);
+             m68b_win_release();
+             if (ok) { g_m68b_pump_ok++; g_m80a_pump_gen = gen; } else g_m68b_pump_fail++;
+             /* 这一帧在写屏过程中被新帧覆盖 / 主线程中途进场 ⇒ 计一次 torn（像素可能撕裂，只观测） */
+@@ -29585,6 +29588,135 @@
+                      g_m68b_pump_ok, g_m68b_pump_fail);
+ }
+ 
++/* ================= M104A（2026-11-13）：可见面写者台账 + 三方对齐 =================
++   派活单唯一的判断题：「屏幕上的像素到底是谁写的」。
++   M103A 留下的最锐事实是 `staging mean=0/0/0` 而屏幕 16% 纯黄 ⇒ 二者必有一个不是同一帧。
++   本块把它变成可判的账：
++     ① 写通道枚举（代码事实）：真机链上**只有**三条可能写可见面的通道 ——
++        CH1 `wbuf` = nvn_win_present_rgba（staging→XComponent 窗口 buffer，我们的拷贝路径）；
++        CH2 `sc`   = nvn_vk_present_clear（swapchain image 清色 + vkQueuePresentKHR）；
++        CH3 `wfill`= nvn_win_fill（CPU 纯色填色兜底）；
++        CH4 `wbuf/m67b` = m67b_nb_present 复用 CH1 的另一入口；
++        CH5 `none` = 本帧**没有任何通道写**（skip / 拷贝失败 ⇒ 屏幕保留上一帧）。
++        计数在 win_fill.c（唯一直接写窗口缓冲区的模块）+ 本文件（swapchain 通道）两侧各落一份。
++     ② 三方对齐数据：
++        源 = staging（`[m104a] p` 行，每 ≤1 s 一行；均值/黄色占比/非零占比），
++        目标 = 我们刚写进窗口 buffer 的整幅（`[m104a] w wbuf/…` 行的 tgt[…]），
++        写前 = 同一块 buffer 上一轮留下的内容（prev[…]）⇒ 「有没有第二个写者」的直接证据；
++        屏幕 = 设备侧截图（`snapshot_display`），判据③拿 tgt 的 mean/黄色占比去对。
++     ③ 30 s 汇总（`[m104a] sum`，挂心跳线程 ⇒ 渲染线程卡死照打）：每条通道 writes/fail/
++        首末时间/最近一次 src+tgt 统计，全部有界。
++     ④ 可选旁证 knob（默认关，**不改架构**）：`smo_m104a`
++          = -1（缺省）关；= 999 把一张**合成测试图**（固定彩条 + 随帧移动的方块）直接 blit
++          到窗口 —— 屏幕上出现彩条 ⇒ 我们这条通道确实在写可见面；不出现 ⇒ 另有写者。
++          = 0..255 把该 RT 槽当源直接 blit 到窗口（验「选中的槽内容出现在屏幕上」）。
++   =0/-1 关态：只多一次 p_file_int（每 16 次 present 一次）与两次整数比较，像素/选源一行不动。 */
++#define M104A_A P_SLOT_DIR_A "/smo_m104a"
++#define M104A_B P_SLOT_DIR_B "/smo_m104a"
++static int g_m104a_v = -2;
++static unsigned g_m104a_reads;
++static unsigned long long g_m104a_pat_n;          /* 合成测试图帧号（同一 boot 内递增） */
++static unsigned m104a_knob(void)
++{
++    if (g_m104a_v == -2) { p_file_seed(M104A_A, M104A_B); g_m104a_v = p_file_int(M104A_A, M104A_B, -1); }
++    else if ((++g_m104a_reads & 15u) == 0) g_m104a_v = p_file_int(M104A_A, M104A_B, -1);
++    return (unsigned)g_m104a_v;
++}
++/* 合成测试图（640x360 RGBA）：5 条彩条 + 按帧号横向移动的白色方块 ⇒ 一眼可判「这是我们写的」，
++   且方块位置随帧变化 ⇒ 同时证明写是活的（不是一张冻住的旧帧）。 */
++#define M104A_PAT_W 640
++#define M104A_PAT_H 360
++static uint8_t *m104a_pat_buf(void)
++{
++    static uint8_t *buf;
++    if (buf) return buf;
++    buf = (uint8_t *)calloc((size_t)M104A_PAT_W * M104A_PAT_H, 4);
++    return buf;
++}
++static void m104a_pat_fill(uint8_t *b, unsigned long long frame)
++{
++    if (!b) return;
++    static const unsigned char bars[5][3] = { {255,0,0}, {0,255,0}, {0,0,255}, {255,255,0}, {255,255,255} };
++    const int bw = M104A_PAT_W / 5;
++    for (int y = 0; y < M104A_PAT_H; y++) {
++        uint8_t *row = b + (size_t)y * (size_t)M104A_PAT_W * 4;
++        for (int x = 0; x < M104A_PAT_W; x++) {
++            const int k = (x / bw) % 5;
++            uint8_t *q = row + (size_t)x * 4;
++            q[0] = bars[k][0]; q[1] = bars[k][1]; q[2] = bars[k][2]; q[3] = 255;
++        }
++    }
++    /* 随帧移动的白块（左上 -> 右下）：x = (frame*37) % (W-80) */
++    const int mx = (int)((frame * 37ull) % (unsigned long long)(M104A_PAT_W - 80));
++    for (int y = 8; y < 88; y++) {
++        uint8_t *row = b + (size_t)y * (size_t)M104A_PAT_W * 4;
++        for (int x = mx; x < mx + 80; x++) {
++            uint8_t *q = row + (size_t)x * 4;
++            q[0] = 255; q[1] = 64; q[2] = 255; q[3] = 255;
++        }
++    }
++}
++/* 源图抽样统计（staging，口径与 win_fill.c 的 m104a_sig 相同：均值/最大/非零/黄，采样每 64 像素）。
++   只读，成本 <0.1 ms；由 `[m104a] p` 行按 ≤1 Hz 调用。 */
++static void m104a_src_sig(const unsigned char *p, unsigned w, unsigned h,
++                          unsigned *mr, unsigned *mg, unsigned *mb, unsigned *mx,
++                          unsigned *nz10, unsigned *yel10)
++{
++    unsigned long long sr = 0, sg = 0, sb = 0, nz = 0, yel = 0, ns = 0, mm = 0;
++    *mr = *mg = *mb = *mx = 0; *nz10 = *yel10 = 0;
++    if (!p || !w || !h) return;
++    const unsigned long long npx = (unsigned long long)w * (unsigned long long)h;
++    for (unsigned long long i = 0; i < npx; i += 64) {
++        const unsigned char *q = p + i * 4;
++        const unsigned r = q[0], g = q[1], b = q[2];
++        sr += r; sg += g; sb += b; ns++;
++        if (r || g || b) nz++;
++        if (r >= 200 && g >= 150 && b <= 60) yel++;
++        if (r > mm) mm = r;
++        if (g > mm) mm = g;
++        if (b > mm) mm = b;
++    }
++    if (!ns) return;
++    *mr = (unsigned)(sr / ns); *mg = (unsigned)(sg / ns); *mb = (unsigned)(sb / ns);
++    *mx = (unsigned)mm;
++    *nz10 = (unsigned)(nz * 1000ull / ns);
++    *yel10 = (unsigned)(yel * 1000ull / ns);
++}
++/* swapchain 通道（CH2 `sc`）的计数：清色 + acquire + present 每次成功写一帧就 +1。 */
++static unsigned long long g_m104a_sc_wr, g_m104a_sc_fail;
++static unsigned long long g_m104a_sc_r, g_m104a_sc_g, g_m104a_sc_b;
++static double g_m104a_sc_first, g_m104a_sc_last;
++static void m104a_sc_note(unsigned r, unsigned g, unsigned b, int ok)
++{
++    if (ok) {
++        const double now = (double)pf_now_us() / 1e6;   /* 墙钟（monotonic），只用于「首末时间」 */
++        if (!g_m104a_sc_first) g_m104a_sc_first = now;
++        g_m104a_sc_last = now;
++        g_m104a_sc_wr++; g_m104a_sc_r = r; g_m104a_sc_g = g; g_m104a_sc_b = b;
++    } else {
++        g_m104a_sc_fail++;
++    }
++}
++/* 心跳钩子（vk_boot.c 的 beat_thread 每 2 s 调一次；本函数自己按 30 s 门限流）。
++   一行给出「每条通道写了多少次 + 最近一次的目标像素」，与 win_fill.c 的台账拼成整串。 */
++void nvn_vk_m104a_poll(unsigned tsec, unsigned long frames)
++{
++    static unsigned last;
++    if ((int)(tsec - last) < 30) return;
++    last = tsec;
++    char buf[1400];
++    __attribute__((weak)) int nvn_win_m104a_report(char *, int);
++    int o = snprintf(buf, sizeof buf, "[m104a] sum t=%us frames=%lu knob=%d | sc writes=%llu fail=%llu "
++                     "col=%llu,%llu,%llu (swapchain 清色出口)",
++                     tsec, frames, g_m104a_v, g_m104a_sc_wr, g_m104a_sc_fail,
++                     g_m104a_sc_r, g_m104a_sc_g, g_m104a_sc_b);
++    if (nvn_win_m104a_report && o > 0 && o < (int)sizeof buf - 200)
++        o += nvn_win_m104a_report(buf + o, (int)sizeof buf - o);
++    else
++        o += snprintf(buf + o, sizeof buf - (size_t)o, " | win 台账不可用(符号缺)");
++    if (o > 0 && o < (int)sizeof buf) vk_boot_logf("%s", buf);
++}
++
+ /* 返 1 = 本帧屏幕内容归我们管（已上屏，或按降采样主动跳过——两种情况都不要再走纯色兜底）；
+    0 = 本帧没接（后端没起/还没画过/无窗口/拷贝失败），调用方自行回落。 */
+ int nvn_vk_present_offscreen(void)
+@@ -30440,6 +30572,35 @@
+        Old behaviour (removed): crox=(sw-1280)/2, croy=(sh-720)/2, extent 1280x720 -- that cut 160 px
+        off each side and 90 px off top/bottom of the 1600x900 composite, which is exactly what sliced
+        the SMO logo's left/top edge. */
++    /* ===== M104A（2026-11-13）可选旁证 knob（**默认关**，不改架构、不改任何选源判据）=====
++       `smo_m104a` = -1（缺省）关；= 999 把**合成测试图**（5 条彩条 + 随帧移动的紫块）直接 blit 到
++       窗口 —— 屏幕上出现彩条 ⇒ 这条窗口通道确实在写可见面，屏幕不出现 ⇒ 另有写者（判据④）。
++       = 0..255 把该 RT 槽当源直接送屏（验「选中的槽内容出现在屏幕上」）。 */
++    int m104a_pat = 0;
++    {
++        const unsigned kv = m104a_knob();
++        static int last_kv = -3;
++        if ((int)kv != last_kv) {
++            last_kv = (int)kv;
++            vk_boot_logf("[m104a] knob=%d (%s) call=%llu", (int)kv,
++                         (kv == 999) ? "合成测试图直送窗口" : ((int)kv >= 0 ? "指定槽直送窗口" : "关"),
++                         call);
++        }
++        if (kv == 999) {
++            m104a_pat = 1;
++            srcname = "m104a-pat";
++        } else if ((int)kv >= 0 && (int)kv < (int)(sizeof g_rt_tab / sizeof *g_rt_tab)) {
++            h_rt_slot *fh = &g_rt_tab[(int)kv];
++            if (fh->img && fh->w && fh->h) {
++                simg = fh->img; sw = fh->w; sh = fh->h;
++                slay = (fh == g_rt_cur) ? g_h_layout : p_slot_layout(fh);
++                srcname = "m104a-slot"; snap_used = 0;
++            } else if (call <= 3 || (call % 300) == 0) {
++                vk_boot_logf("[m104a] knob=%d unusable (img=%d ext=%ux%u) — 保持链上选源 src=%s",
++                             (int)kv, fh->img ? 1 : 0, (unsigned)fh->w, (unsigned)fh->h, srcname);
++            }
++        }
++    }
+     uint32_t cp_w = sw, cp_h = sh;
+     int cp_clamped = 0;
+     if (cp_w > (uint32_t)H_PRES_MAX_W) { cp_w = (uint32_t)H_PRES_MAX_W; cp_clamped = 1; }
+@@ -30688,12 +30849,37 @@
+     int ok = 0;
+     /* M68B：先发布「这一帧像素已就绪」（gen++），再写屏 —— 这样上屏泵拿到的永远是**完整帧**：
+        即便本帧写屏失败，泵下一个周期也能把这张已经躺在 staging 里的图推上去（bit4 的全部价值）。 */
++    /* ===== M104A：源侧（staging）≤1 Hz 口径 —— 与 tgt 逐项同指标（均值/最大/非零/黄） =====
++       这一行就是判据②三方的「② 我们拷贝路径 staging」；判据①的「另外两方」分别是
++       `[m104a] w wbuf/…` 行的 tgt[…]（我们写进窗口的整幅）与设备侧截图。 */
++    {
++        static double lastp;
++        const double nws = (double)pf_now_us() / 1e6;
++        if (call <= 3 || nws - lastp >= 1.0) {
++            lastp = nws;
++            unsigned mr = 0, mg = 0, mb = 0, mx = 0, nz10 = 0, yel10 = 0;
++            m104a_src_sig((const unsigned char *)g_p_map, cp_w, cp_h, &mr, &mg, &mb, &mx, &nz10, &yel10);
++            vk_boot_logf("[m104a] p call=%llu src=%s sel_slot=%d ext=%ux%u lay=%d pat=%d "
++                         "stag[mean=%u/%u/%u max=%u nz=%u.%u%% yel=%u.%u%%]",
++                         call, srcname, g_p_sel_slot, cp_w, cp_h, (int)slay, m104a_pat,
++                         mr, mg, mb, mx, nz10 / 10u, nz10 % 10u, yel10 / 10u, yel10 % 10u);
++        }
++    }
+     m68b_publish(cp_w, cp_h);
+     const unsigned m80a_mygen = atomic_load_explicit(&g_m68b_gen, memory_order_acquire);   /* M80A：本帧序号 */
+     int m68b_own = 0;   /* M68B：本次写屏有没有抢到窗口（抢不到＝泵正在写同一块窗口，只观测不等待） */
+     if (nvn_win_present_rgba) {
++        const uint8_t *m104a_bsrc = (const uint8_t *)g_p_map;
++        int m104a_bw = (int)cp_w, m104a_bh = (int)cp_h;
++        if (m104a_pat) {   /* M104A 旁证：合成测试图直接顶替本帧上屏源（只动这一帧的 blit 源） */
++            uint8_t *pb = m104a_pat_buf();
++            if (pb) { m104a_pat_fill(pb, ++g_m104a_pat_n); m104a_bsrc = pb; m104a_bw = M104A_PAT_W; m104a_bh = M104A_PAT_H; }
++        }
+         if (g_m68b_live) m68b_own = m68b_win_claim(2);
+-        ok = nvn_win_present_rgba(g_win, g_p_map, (int)cp_w, (int)cp_h, (int)cp_w * 4);
++        __attribute__((weak)) void nvn_win_m104a_tag(int);
++        if (nvn_win_m104a_tag) nvn_win_m104a_tag(1);          /* M104A：通道归属 = 主 present 通道 */
++        ok = nvn_win_present_rgba(g_win, m104a_bsrc, m104a_bw, m104a_bh, m104a_bw * 4);
++        if (nvn_win_m104a_tag) nvn_win_m104a_tag(0);
+     }
+     if (m68b_own) m68b_win_release();
+     else if (g_m68b_live) g_m68b_collide++;   /* 主线程与泵撞上：计数留证（不改变任何安排） */
+@@ -32211,7 +32397,10 @@
+     if (!w) { g_m67b_nowin++; vk_boot_logf("[m67b-fail] stage=win rc=nowin n=%llu", n); return 0; }
+     if (!(v & 2) && nvn_win_present_rgba) {
+         const unsigned long long ok0 = g_p_ok, sk0 = g_p_skip, wf0 = g_p_winfail, vk0 = g_p_vkfail, ck0 = g_p_calls;
++        __attribute__((weak)) void nvn_win_m104a_tag(int);
++        if (nvn_win_m104a_tag) nvn_win_m104a_tag(3);   /* M104A：通道归属 = m67b 兜底入口 */
+         const int pok = nvn_vk_present_offscreen();
++        if (nvn_win_m104a_tag) nvn_win_m104a_tag(0);
+         if (pok && g_p_ok > ok0) { g_m67b_blit_ok++; return 1; }   /* 真图已写上屏（blit_ok 就是「真正上屏」口径） */
+         if (pok) {                                                 /* 归我管但本帧不换屏：降采样 / fail-closed 保上一帧 */
+             g_m67b_keep++;
+@@ -32251,13 +32440,14 @@
+         /* M67B：兜底上屏。开关判断在旧早退**之前**（=0 时下面两行只是常量比较 ⇒ 旧链逐字不变）。
+            必须先 unlock 再进兜底：它自己要拿 present 锁 + g_vkq_lock，持 g_lock 调用会互锁。 */
+         if (m67b_on()) { pthread_mutex_unlock(&g_lock); return m67b_nb_present(r, g, b); }
++        m104a_sc_note(0, 0, 0, 0);   /* M104A：swapchain 通道在本机被整段绕开（native_buffer 被剥离） */
+         static int reported;
+         if (!reported) { reported = 1; vk_boot_logf("swapchain/present skipped: driver lacks " PROX_EXT " (OHOS layer derefs NULL in acquire)"); }
+         pthread_mutex_unlock(&g_lock);
+         return 0;
+     }
+-    if (!g_sc && !swapchain_build()) { atomic_fetch_add_explicit(&g_pf_pres_skip.n, 1, memory_order_relaxed); pthread_mutex_unlock(&g_lock); return 0; }
+-    if (!g_sc_rp) { atomic_fetch_add_explicit(&g_pf_pres_skip.n, 1, memory_order_relaxed); pthread_mutex_unlock(&g_lock); return 0; }
++    if (!g_sc && !swapchain_build()) { atomic_fetch_add_explicit(&g_pf_pres_skip.n, 1, memory_order_relaxed); m104a_sc_note(0, 0, 0, 0); pthread_mutex_unlock(&g_lock); return 0; }
++    if (!g_sc_rp) { atomic_fetch_add_explicit(&g_pf_pres_skip.n, 1, memory_order_relaxed); m104a_sc_note(0, 0, 0, 0); pthread_mutex_unlock(&g_lock); return 0; }
+     uint32_t idx = 0;
+     unsigned long long pf_p0 = pf_now_us();   /* M6e：present 全段（acquire->submit->present->栅栏） */
+     VkResult ar = vkAcquireNextImageKHR(g_dev, g_sc, UINT64_MAX, g_acq_sem[0], NULL, &idx);
+@@ -32267,7 +32457,7 @@
+         if (!swapchain_build()) { pthread_mutex_unlock(&g_lock); return 0; }
+         ar = vkAcquireNextImageKHR(g_dev, g_sc, UINT64_MAX, g_acq_sem[0], NULL, &idx);
+     }
+-    if (ar != VK_SUCCESS) { atomic_fetch_add_explicit(&g_pf_pres_skip.n, 1, memory_order_relaxed); NVK_RED("acquire = %{public}d (%{public}s)", (int)ar, vr(ar));
++    if (ar != VK_SUCCESS) { atomic_fetch_add_explicit(&g_pf_pres_skip.n, 1, memory_order_relaxed); m104a_sc_note(0, 0, 0, 0); NVK_RED("acquire = %{public}d (%{public}s)", (int)ar, vr(ar));
+         if (m7d_sw(0)) m7d_pres_record(0xFFFFFFFFu, r, g, b, 0);   /* M7d：acquire 失败也记（idx=0xFFFFFFFF 哨兵） */
+         pthread_mutex_unlock(&g_lock); return 0; }
+     if (idx >= g_sc_n || !g_sc_fb[idx]) { NVK_RED("framebuffer missing (idx %{public}u / %{public}u)", idx, g_sc_n); pthread_mutex_unlock(&g_lock); return 0; }
+@@ -32325,6 +32515,8 @@
+     if (g_pfence && sr == VK_SUCCESS) nvk_wait_fences(g_dev, 1, &g_pfence, VK_TRUE, UINT64_MAX);
+     vkFreeCommandBuffers(g_dev, g_cp, 1, &pcb);
+     g_presents++;
++    /* M104A：swapchain 通道（CH2 `sc`）—— 真正把一帧写进 swapchain image 并 present 出去的那一刻。 */
++    m104a_sc_note(r, g, b, sr == VK_SUCCESS && pr == VK_SUCCESS);
+     if (m7d_sw(0)) m7d_pres_record(idx, r, g, b, sr == VK_SUCCESS && pr == VK_SUCCESS);   /* M7d 探针（默认 0） */
+     pf_dt(&g_pf_present, pf_p0);
+     pthread_mutex_unlock(&g_lock);
+@@ -32362,6 +32554,7 @@
+     m42f_seed();   /* M42F：同上 —— 起层就把 smo_m42f 建出来（缺省 0），hdc 才能覆盖成 1 */
+     (void)m80a_bits();   /* M80A：同上 —— 起层就把 smo_m80a 种成 0（缺省 = 逐字节旧行为） */
+     m67b_seed();   /* M67B：同上 —— 起层种 smo_m67b=0（hdc shell 无创建权，只能覆盖既有文件） */
++    (void)m104a_knob();   /* M104A：同上 —— 起层就把 smo_m104a 种成 -1（缺省关），hdc 才能覆盖 */
+     vk_boot_logf("RESULT: Vulkan backend up (device ready, not stub)");
+     NVK("[vk] NVN->Vulkan backend up (batch 1: device/surface/swapchain/texture upload), surface %{public}u x %{public}u",
+         g_win_w, g_win_h);

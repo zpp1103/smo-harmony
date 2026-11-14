@@ -1,0 +1,1648 @@
+--- nvn_vk2/gfx_vk_tex.c
++++ nvn_vk2/gfx_vk_tex.c
+@@ -206,21 +206,124 @@
+ // pass that first samples B this frame. Bit 0 is the fix the four moments call for: for a slab-shared depth image B a whole-target CLEAR becomes a LOAD (its
+ // bytes keep what the sibling rendered), and it only clears while the caster has not rendered this frame. Bit 1 turns the slab on, bit 2 keeps the bytes
+ // (no zero-fill, no whole-target clear), bit 3 copies the caster's depth into B, bit 4 names the handle the sampling side binds.
++// ---- M64A: the pool's images share their slab's bytes from the moment the images exist (default 0; smo_m64a → DM_VK_M64A) ----
++// M59A ended with B (pool+0x228600, the depth the 800×450 mask pass samples) reading its own clear value whenever the slab was turned on *after* the images
++// existed: a pool's images take their memory once, at creation (m57a_bind runs from vk_tex_create), so a slab switched on later never re-binds them
++// ([m59a-pair] slab=0 same_mem=0). M64A therefore has to be on before the app creates its first image: m48a_probe.c reads the switch file in a constructor
++// (before any image exists) and puts it into the environment, and this is the one knob the four bits below hang from:
++//   bit 0 (1) = the M57A pool slab: one VkDeviceMemory per pool, every image of the layout class bound at its own pool offset (byte-level aliasing);
++//   bit 1 (2) = the decisive probe: B read back with vkCmdCopyImageToBuffer only, in the window after the caster's pass and before the pass that samples it
++//               (the M59A four-moments probe's (i)/(iv), its [m59a-pair] identity line, and the sampled handle's identity [m59a-samp]);
++//   bit 2 (4) = the fix the three outcomes call for: a whole-target CLEAR of the slab-shared depth image becomes a LOAD (the M59A bit 0 rule; implies bit 0);
++//   bit 3 (8) = the offset correlation: B's snapshot against A at row+0x28400 rows (40.25 rows) with and without a 256-texel column shift, plus the far/geom
++//               A itself would show under each of those three hypotheses ([m64a-shift], next to M59A's [m59a-corr]).
++int vk_m64a_mode(void) {
++    static int v = -1; static long last; long now = (long)time(NULL);
++    if (v >= 0 && now == last) return v;
++    last = now; const char *e = getenv("DM_VK_M64A"); v = e ? atoi(e) : 0;
++    { static int said; if (v > 0 && !said) { said = 1;
++        VKLOG("[m64a] knob on (DM_VK_M64A=%d: slab alias %s, probe %s, clear->load %s, offset corr %s)", v,
++              (v & 1) ? "on" : "off", (v & 2) ? "on" : "off", (v & 4) ? "on" : "off", (v & 8) ? "on" : "off"); } }
++    return v;
++}
+ int vk_m59a_mode(void) {
+     static int v = -1; static long last; long now = (long)time(NULL);
+     if (v >= 0 && now == last) return v;
+-    last = now; const char *e = getenv("DM_VK_M59A"); v = e ? atoi(e) : 0; return v;
++    last = now; const char *e = getenv("DM_VK_M59A"); v = e ? atoi(e) : 0;
++    // M64A bit 1 = the four-moments probe plus the sampled handle's identity; M64A bit 2 = the CLEAR→LOAD fix (it needs the slab: M59A bit 0 turns it on)
++    { int m64 = vk_m64a_mode(); if (m64 & 2) v |= 48; if (m64 & 4) v |= 1; }
++    return v;
+ }
++// ---- M66A: measure the two KPIs where the frames are (default 0; smo_m66a → DM_VK_M66A) ----
++// The 800×450 frame type of this game only lasts t≈124–128 s (a 4 s window), so a passdump trigger does not reliably land in it (M64A/M65A both missed).
++// M66A puts the measurement inside the frame instead: at a pass's end the pass's colour target is copied by transfer (vkCmdCopyImageToBuffer, exactly what
++// pass_dump does) and the host computes the same nearwhite the offline passstat did. bit 0 (1) = one line per 800×450 pass (the mask chain), bit 1 (2) = B
++// (the 1024² depth the mask pass samples, pool+0x228600) and the caster A read back at the two moments the alias would show in. Probe only: no render state
++// is touched, and with the knob at 0 there is no copy, no allocation and no log line.
++int vk_m66a_mode(void) {
++    static int v = -1; static long last; long now = (long)time(NULL);
++    if (v >= 0 && now == last) return v;
++    last = now; const char *e = getenv("DM_VK_M66A"); v = e ? atoi(e) : 0;
++    { static int said; if (v > 0 && !said) { said = 1;
++        VKLOG("[m66a] knob on (DM_VK_M66A=%d: 800x450 mask stat %s, B/A depth stat %s)", v,
++              (v & 1) ? "on" : "off", (v & 2) ? "on" : "off"); } }
++    return v;
++}
++// ---- M67A: is the 800×450 mask's near-white a function of the depth it samples at all? (default 0; smo_m67a → DM_VK_M67A) ----
++// M66A left one question open: the alias is real (B's bytes are A's, corr 100.00%) yet the mask chain did not move (Δ≤0.06 pp), so the near-white is not a
++// function of B's *content*. M67A asks one level up — is it a function of the *binding*? While the 800×450 pass samples B (the 1024² depth at pool+0x228600)
++// the descriptor is pointed at a constant-depth stand-in instead: an 8×8 image of B's own format, filled once by vkCmdClearDepthStencilImage (no loadOp, no
++// render pass), so every texture coordinate of that quad reads the same value:
++//   bit 0 (1) = the stand-in holds 0.0 (nearest — the mask should go all-shadow if the sampled depth decides it), bit 1 (2) = 0.5, bit 2 (4) = 1.0 (far, the
++//               value B holds now: the "current state" control);
++//   bit 3 (8) = E2, record only: the sampled object (image/pool offset/extent/format/aspect/mip/layers) and the sampler's registered state, no render change;
++//   bit 4 (16) = E3, record only: the image M66A's near-white is measured on and every later pass that samples it, no render change.
++// With the whole knob at 0 nothing is created, nothing is logged and no descriptor changes. With a const bit set the stand-in is created on first sight and
++// filled at the next submission's start (vk_m67a_fill_const, called from vk_exec_reset — outside any render pass), so the override begins one frame later.
++enum { M67AC_MAX = 6 };
++typedef struct { VkFormat fmt; VkImageAspectFlags as; float val; VkImage img; VkDeviceMemory mem; VkImageView view; int cleared; } m67ac_t;
++static m67ac_t g_m67ac[M67AC_MAX]; static int g_m67ac_n;
++int vk_m67a_mode(void) {
++    static int v = -1; static long last; long now = (long)time(NULL);
++    if (v >= 0 && now == last) return v;
++    last = now; const char *e = getenv("DM_VK_M67A"); v = e ? atoi(e) : 0;
++    { static int said = -1; if (v != said) { said = v;
++        VKLOG("[m67a] knob %s (DM_VK_M67A=%d: const depth 0.0 %s / 0.5 %s / 1.0 %s, E2 record %s, E3 record %s)", v ? "on" : "off", v,
++              (v & 1) ? "on" : "off", (v & 2) ? "on" : "off", (v & 4) ? "on" : "off", (v & 8) ? "on" : "off", (v & 16) ? "on" : "off"); } }
++    return v;
++}
++// the constant the stand-in must hold for this knob value; < 0 = no substitution (the caller keeps B's own view)
++float vk_m67a_const_value(int m) { return (m & 1) ? 0.0f : (m & 2) ? 0.5f : (m & 4) ? 1.0f : -1.0f; }
++VkImageView vk_m67a_const_depth(const vkimg_t *im, float val) {   // the sampling view of the stand-in, VK_NULL_HANDLE until it has been filled
++    if (!im || !(val >= 0.0f)) return VK_NULL_HANDLE;
++    VkImageAspectFlags as = im->aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
++    if (!(as & VK_IMAGE_ASPECT_DEPTH_BIT)) return VK_NULL_HANDLE;
++    for (int i = 0; i < g_m67ac_n; i++) if (g_m67ac[i].fmt == im->fmt && g_m67ac[i].as == as && g_m67ac[i].val == val)
++        return g_m67ac[i].cleared ? g_m67ac[i].view : VK_NULL_HANDLE;
++    if (g_m67ac_n >= M67AC_MAX) return VK_NULL_HANDLE;
++    m67ac_t *c = &g_m67ac[g_m67ac_n]; memset(c, 0, sizeof *c); c->fmt = im->fmt; c->as = as; c->val = val;
++    VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, im->fmt, {8, 8, 1}, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
++                            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
++    if (vkCreateImage(V.dev, &ci, NULL, &c->img)) { VKLOG("[m67a-const] vkCreateImage failed (fmt %d)", (int)im->fmt); return VK_NULL_HANDLE; }
++    VkMemoryRequirements rq; vkGetImageMemoryRequirements(V.dev, c->img, &rq);
++    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, rq.size, vk_mem_type(rq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0)};
++    if (vkAllocateMemory(V.dev, &ai, NULL, &c->mem) || vkBindImageMemory(V.dev, c->img, c->mem, 0)) {
++        if (c->mem) vkFreeMemory(V.dev, c->mem, NULL); vkDestroyImage(V.dev, c->img, NULL); c->mem = VK_NULL_HANDLE; c->img = VK_NULL_HANDLE; return VK_NULL_HANDLE; }
++    VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, c->img, VK_IMAGE_VIEW_TYPE_2D, im->fmt,
++                                {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY}, {as, 0, 1, 0, 1}};
++    if (vkCreateImageView(V.dev, &vi, NULL, &c->view)) { vkDestroyImage(V.dev, c->img, NULL); vkFreeMemory(V.dev, c->mem, NULL); c->img = VK_NULL_HANDLE; c->mem = VK_NULL_HANDLE; return VK_NULL_HANDLE; }
++    g_m67ac_n++;
++    VKLOG("[m67a-const] created an 8x8 stand-in: fmt %d aspect 0x%x value %g (filled by vkCmdClearDepthStencilImage at the next submission start; until then the real binding stays)", (int)im->fmt, (unsigned)as, val);
++    return VK_NULL_HANDLE;
++}
++void vk_m67a_fill_const(VkCommandBuffer cb) {   // vk_exec_reset: no render pass is open, the main command buffer is recording
++    for (int i = 0; i < g_m67ac_n; i++) {
++        m67ac_t *c = &g_m67ac[i]; if (c->cleared || !c->img) continue;
++        VkImageSubresourceRange rg = {c->as, 0, 1, 0, 1};
++        VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
++                                  VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, c->img, rg};
++        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &b);
++        VkClearDepthStencilValue cv; cv.depth = c->val; cv.stencil = 0;
++        vkCmdClearDepthStencilImage(cb, c->img, VK_IMAGE_LAYOUT_GENERAL, &cv, 1, &rg);
++        vk_img_barrier_all(cb);
++        c->cleared = 1;
++        VKLOG("[m67a-const] stand-in filled: fmt %d aspect 0x%x value %g (vkCmdClearDepthStencilImage, layout GENERAL)", (int)c->fmt, (unsigned)c->as, c->val);
++    }
++}
+ extern uint64_t g_tex_frame;
+ static int64_t m59a_b_off(void) {   // the sampled sibling under test (DM_VK_M59A_OFF, hexadecimal; default pool+0x228600)
+     static int64_t t = -1; if (t >= 0) return t;
+     const char *e = getenv("DM_VK_M59A_OFF"); t = (e && *e) ? (int64_t)strtoll(e, NULL, 16) : (int64_t)0x228600; return t;
+ }
++int64_t vk_m59a_b_off(void) { return m59a_b_off(); }
+ // M59A bit 0: this depth image is the slab-shared one the sampler reads (B). Its whole-target clears are the suspect: they run after the caster rendered.
+ int vk_m59a_load_wanted(const vkimg_t *im) {
+     if (!(vk_m59a_mode() & 1) || !im || !im->m57a_slab || !im->size) return 0;
+     if (!(im->aspect & VK_IMAGE_ASPECT_DEPTH_BIT)) return 0;
+-    return im->off <= m59a_b_off() && m59a_b_off() < im->off + im->size;
++    /* M66A fix 1: M59A matched any slab-shared depth image whose bytes *contained* the sampled sibling's offset. The 1600×900 main-scene depth sits at
++       pool+0, so it contains +0x228600 and its whole-target clear was turned into a LOAD as well: all 6 [m59a-fix] lines of M65A are that image, and the
++       snow lit with coloured noise after the hot switch (M65A §5.1). Only the image that *is* B, at B's own pool offset, may become a LOAD. */
++    return im->off == m59a_b_off();
+ }
+ static uint64_t g_m59a_caster_frame;   // M59A bit 0: 1 + the present in which the caster's pass last ended
+ void vk_m59a_note_caster(void) { g_m59a_caster_frame = g_tex_frame + 1; }
+@@ -237,6 +340,7 @@
+     static int v = -1; static long last; long now = (long)time(NULL);
+     if (v >= 0 && now == last) return v;
+     last = now; const char *e = getenv("DM_VK_M57A"); v = e ? atoi(e) : 0;
++    { int m64 = vk_m64a_mode(); if (m64 & 1) v |= 1; }   // M64A bit 0: the pool slab — set from the switch file before the app creates its first image
+     { int m59 = vk_m59a_mode();   // M59A: bit 0 = the fix (it needs the slab: one pool, one VkDeviceMemory), bit 1 = the slab with the M57A probes,
+                                   // bit 2 = keep an aliased depth image's bytes (the M57A clear keep)
+       if (m59 & 1) v |= 1; if (m59 & 2) v |= 3; if (m59 & 4) v |= 8; }
+@@ -642,6 +746,7 @@
+         if (keyed && vk_m55a_on()) { int64_t tg = m55a_target_off();
+             if (((im->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) && im->w == 1024 && im->h == 1024) || (im->off <= tg && tg < im->off + im->size)) m55a_img_note(im); }
+         if (keyed && (vk_m56a_mode() & 2)) m56a_img_note(im);   // M56A bit1：目标区间 + 1024² 深度图创建探针
++        if (keyed && vk_m72a_mode()) vk_m72a_img_note(im);       // M72A：深度图身份 + 重叠者（同 pool 内存段），只读
+     }
+     im->used = g_tex_frame;
+     pthread_mutex_unlock(&g_img_mu);
+--- nvn_vk2/gfx_vk.h
++++ nvn_vk2/gfx_vk.h
+@@ -181,6 +181,26 @@
+ int vk_m59a_load_wanted(const vkimg_t *im);   // M59A bit 0: this whole-target clear of a slab-shared depth image is a LOAD, not a clear
+ int vk_m59a_caster_drawn(void);   // M59A bit 0: the caster (24-draw 1024² depth pass) has rendered in the present being recorded
+ void vk_m59a_note_caster(void);   // M59A bit 0: the caster's pass just ended in this present
++int vk_m64a_mode(void);   // M64A (gfx_vk_tex.c, DM_VK_M64A, live but must be set before the first image exists): bit 0 (1) the pool slab (an image bound at its
++                          // own pool offset into one VkDeviceMemory per pool), bit 1 (2) the decisive transfer-copy read of B (four-moments (i)/(iv) + the sampled
++                          // handle's identity), bit 2 (4) a whole-target CLEAR of the slab-shared depth image becomes a LOAD (implies bit 0), bit 3 (8) the offset
++                          // correlation against A at row+40 / row+40,col+256 and the far/geom A would show under each shift
++int64_t vk_m59a_b_off(void);   // M66A: B's pool offset (DM_VK_M59A_OFF, default pool+0x228600); M66A fix 1 matches the CLEAR→LOAD rule on this exactly
++int vk_m66a_mode(void);   // M66A (gfx_vk_tex.c, DM_VK_M66A, live, probe only): bit 0 (1) one in-place nearwhite/mean line per 800×450 pass (the mask chain),
++                          // bit 1 (2) B and the caster A read back by transfer copy at the moments the alias would show in (far/geom + the shift correlation)
++int vk_m67a_mode(void);   // M67A (gfx_vk_tex.c, DM_VK_M67A, live): is the 800×450 mask's near-white a function of the depth it samples at all? bit 0 (1) the
++                          // stand-in bound at B's slot holds 0.0, bit 1 (2) 0.5, bit 2 (4) 1.0 (far, the current value); bit 3 (8) E2 record only (sampled object +
++                          // sampler state), bit 4 (16) E3 record only (the image the near-white is measured on and its downstream samplers). 0 = nothing happens
++float vk_m67a_const_value(int m);                        // the stand-in's depth value for this knob value, < 0 = no substitution
++VkImageView vk_m67a_const_depth(const vkimg_t *im, float val);   // M67A: the stand-in's sampling view (created on first use, NULL until filled)
++void vk_m67a_fill_const(VkCommandBuffer cb);             // M67A: fill the pending stand-ins (vk_exec_reset, outside any render pass)
++int vk_m72a_mode(void);   // M72A (rec/gfx_vk_exec.c, DM_VK_M72A, probe only): who is supposed to write that 800x450 D32 the fog pass samples?
++                          // bit0 (1) the pass census (each pass's depth attachment identity, loadOp/clearDepth/storeOp, draw count, the draws'
++                          // depthTest/depthWrite/compare/bias, the pass's depth clear count, colour target 0); bit1 (2) transfer-copy read-back of the
++                          // 800x450 depth at each such pass's end; bit2 (4) the same for every other depth image w>=512 (to find the one that holds
++                          // the geometry); bit3 (8) which pass samples which depth image. Everything is logged for the 4 presents that follow the
++                          // first frame showing an 800x450 attachment. 0 = no log, no allocation, no copy.
++void vk_m72a_img_note(const vkimg_t *im);   // M72A: a depth image was created (identity, overlap list); probe only
+ VkImageView vk_m56a_retarget_view(vkimg_t *im);   // M56A: a whole-image sampling view of a single-level single-layer 2D image (made once, freed with the image)
+ void vk_m56a_set_target(uint64_t lo, uint64_t hi);   // M56A probe: the sampled target image's guest memory range
+ int vk_m56a_wrote(uint64_t a, uint64_t n);        // M56A probe: a GPU write landing in the sampled target image's pool range (see gfx_vk_core.c vk_gpu_wrote)
+--- nvn_vk2/rec/gfx_vk_exec.c
++++ nvn_vk2/rec/gfx_vk_exec.c
+@@ -279,6 +279,7 @@
+     S.pass_open = 0; S.bound_pipe = VK_NULL_HANDLE; g_cb_draws = 0; g_ord_parts = 0; g_psplit_now = 0; g_set_epoch++; x_read();
+     if (g_prof_on) { extern uint64_t g_pkg_ns, g_pkg_n; memset(g_prof_ns, 0, sizeof g_prof_ns); g_prof_t0 = tick(); g_prof_pkg0 = g_pkg_ns; g_prof_npkg0 = g_pkg_n; g_prof_pipes0 = g_vkst.pipes_built; }
+     { extern volatile int g_vk_samp_log; if (g_vk_samp_log > 0) VKLOG("submission begins (present %llu, thread %d)", (unsigned long long)g_tex_frame, (int)gettid()); }
++    if (vk_m67a_mode()) vk_m67a_fill_const(vk_cmd());   // M67A: fill the constant-depth stand-ins (this runs outside every render pass)
+ }
+ 
+ // ---------------- render passes ----------------
+@@ -460,11 +461,33 @@
+ static void m55a_pass_end(void);
+ void vk_m55a_poll(uint64_t done_fence);
+ static void m59a_pass_end(void);                                       // M59A 决定性一刀（默认关）
++static void m66a_note_sampled(const vkimg_t *im);                       // M66A 就地测量：采样 B 的那条 pass（smo_m66a bit1）
++static void m66a_pass_end(void);                                       // M66A 就地测量：800×450 mask 链 + B/A 深度读回（默认关）
++int vk_m70a_mode(void);                                                 // M70A：pass 颜色目标近白统计 / pass 表 / 逐 draw 武装（默认关）
++static void m70a_pass_end(void);
++static void m70a_bind(int st, const dmsv_bind *b, uint64_t h, VkDescriptorImageInfo *ii, vkimg_t *im);
++static void m70a_draw(int prim, uint32_t count, uint32_t inst, int indexed, uint64_t ibuf, int itype, int basev, uint32_t first, int isind);
++int vk_m71a_mode(void);                                                 // M71A：雾/泛光链常量 A/B（默认关；见本文件 M71A 块）
++static int m71a_ubo_patch(int st, const vkshader_t *s, const dmsv_bind *b, VkDescriptorBufferInfo *bi);   // cbuf_desc：pass 71 的 FS 读的那份常量银行换成打了补丁的副本
++static void m71a_bind(int st, const dmsv_bind *b, uint64_t h, VkDescriptorImageInfo *ii, vkimg_t *im);      // 记下 pass 71 采样的 800×450 D32（bit4）
++static void m71a_pass_end(void);                                        // bit4：深度直方图读回 + 收尾
++int vk_m73a_mode(void);                                                 // M73A：pass 71 的 z→视距换算式重标定（默认关；见本文件 M73A 块）
++static int m73a_ubo_patch(int st, const vkshader_t *s, const dmsv_bind *b, VkDescriptorBufferInfo *bi);   // 同一份常量银行，按 M73A 的预设置 c1[2]/c2[2]/c2[3]/c4[0]/c4[1]
++float m71a_bconst(void);                                                // bit3 的压缩系数（DM_VK_M71A_BC，默认 0.55）
++static int g_m71a_bc;   // 这一笔 draw 的输出要不要乘 DM_VK_M71A_BC（bit3；prepare_draw 顶部按 pass 尺寸置位，set_dynamic 取用）
++int vk_m72a_mode(void);                                                 // M72A：谁该写那张 800×450 D32（默认关；见本文件 M72A 块）
++void m72a_pass_end(int m);                                              // bit0 的 pass 表 + bit1/bit2 的深度读回 + bit3 的窗口判定
++void m72a_draw(int m);                                                  // 逐 draw 的 depthTest / depthWrite / compare / bias 汇总
++void m72a_clear_note(float depth, int dmask);                           // 本 pass 的 depth clear（含没折叠成 loadOp 的那条 vkCmdClearAttachments）
++void m72a_samp(int st, const dmsv_bind *b, vkimg_t *im);                // bit3：谁采样哪张深度（顺带认出 pass 71 采样的那张 800×450）
+ void vk_m59a_poll(uint64_t done_fence);
+ static void pass_dump(void) {
+     { extern void m48a_poll(void); m48a_poll(); }   // M48A：smo_m48a_passdump → DM_VK_PASSDUMP（内部 1 s 限速）
+     if (vk_m55a_on()) m55a_pass_end();   // M55A：pass 归属 + 别名判定 dump（默认关）
+     { int m59 = vk_m59a_mode(); if (m59) m59a_pass_end(); }   // M59A：A 写完、采样 B 之前的窗口里用 transfer copy 直接读 B（默认关）
++    { int m66 = vk_m66a_mode(); if (m66) m66a_pass_end(); }   // M66A：KPI 就地测量（800×450 mask 链 / B 与 A 的深度快照，默认关）
++    { int m70 = vk_m70a_mode(); if (m70) m70a_pass_end(); }   // M70A：颜色目标近白 / pass 表 / 逐 draw 武装（默认关）
++    { int m71 = vk_m71a_mode(); if (m71) m71a_pass_end(); }   // M71A：末级压缩（无 pass 内动作）+ bit4 的深度直方图读回（默认关）
+     /* M47A / S4-lite：每个 pass 结束时把一个候选合成 RT 记进 m47a_present.c（门控 smo_m47a，关态零副作用）：
+        ext == 窗口尺寸 + 本 pass 有 draw + 颜色格式可读；strong = 命中已知交换链纹理 (pool,off)。 */
+     { extern void m47a_pass_note(const tex_t *, vkimg_t *, int, int); extern int m47a_on(void);
+@@ -715,8 +738,24 @@
+ static float g_m59a4_cval; static int g_m59a4_cpass;
+ static void m59a4_reset(uint64_t f) { g_m59a4_frame = f; g_m59a4_clears = 0; g_m59a4_pend = 0; g_m59a4_samp = 0; g_m59a4_sampnum = -1; g_m59a4_done_i = 0; }
+ static int m59a4_pass(void) { return g_sub_pass - 1 + (S.pass_open == 2); }
++/* ---- M65A (defect 1.1): the four-moment budget of M59A reset only when the present number changed. This device has no swapchain, so
++   g_tex_frame stays 0 for the whole run: the reset never fired and the two-frame budget was spent on the first caster of the run (a
++   NON-overlapping one, sub 834), leaving the real pair (subs 837-840) unread. Reset on the submission serial instead, and bound the total
++   number of transfer readbacks so a long run cannot flood the queue. */
++static uint64_t g_m65a_sub = ~0ull; static int g_m65a_arm, g_m65a_frames, g_m65a_dumps;
++static void m65a_maybe_reset(void) {
++    uint64_t sub = (uint64_t)mtl_last_fence() + 1;   // the serial every moment of one submission prints; it only changes between submissions
++    if (sub == g_m65a_sub) return;
++    if (g_m65a_frames > 0) VKLOG("[m65a-budget] sub=%llu: four-moment state reset for this submission (present stays %llu; probed frames so far %d, dumps %d)",
++        (unsigned long long)sub, (unsigned long long)g_tex_frame, g_m65a_frames, g_m65a_dumps);
++    g_m65a_sub = sub; g_m65a_arm = 0;
++    g_m59a4_frame = ~0ull;   // the M59A per-frame reset lines below fire once per submission even though the present never changes
++    g_m59a4_frames = 0;      // fresh four-moment budget for this submission
++}
+ static void m59a_note_sampled(const vkimg_t *im) {   // the first pass of the present that binds B for sampling: its end is moment (iv)
+-    if (!(vk_m59a_mode() & 32) || !im || im->w != 1024 || im->h != 1024 || !(im->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) || g_m59a4_samp) return;
++    if (!(vk_m59a_mode() & 32) || !im || im->w != 1024 || im->h != 1024 || !(im->aspect & VK_IMAGE_ASPECT_DEPTH_BIT)) return;
++    m65a_maybe_reset();   // M65A 1.1: before g_m59a4_samp is consulted, otherwise a new submission would never arm its own (iv)
++    if (g_m59a4_samp) return;
+     if (!(im->off <= g_m59a_b_off && g_m59a_b_off < im->off + im->size)) return;
+     if (g_m59a4_frame != g_tex_frame) m59a4_reset(g_tex_frame);
+     g_m59a4_samp = 1; g_m59a4_sampnum = m59a4_pass();
+@@ -769,14 +808,16 @@
+     if (!g_m59a_init) { g_m59a_init = 1; const char *e = getenv("DM_VK_M59A_OFF"); if (e && *e) g_m59a_b_off = (int64_t)strtoll(e, NULL, 16);
+         VKLOG("[m59a] probe on: the sampled sibling is pool+%#llx; the caster is the 1024² depth a pass with draws renders into (DM_VK_M59A_OFF overrides)",
+             (unsigned long long)g_m59a_b_off); }
++    m65a_maybe_reset();   // M65A 1.1: one fresh four-moment budget per submission
+     if (g_m59a4_frame != g_tex_frame) m59a4_reset(g_tex_frame);
+     vkimg_t *a = S.rt_has_dep ? vk_tex(&S.rt_dep) : NULL;
++    vkimg_t *b = vk_m55a_find_depth(1024, 1024, g_m59a_b_off);
+     int caster = a && (a->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) && a->w == 1024 && a->h == 1024 && g_pass_draws >= 8 && a->off != g_m59a_b_off;
++    int same_mem = 0, overlap = 0;
+     if (caster) vk_m59a_note_caster();   // M59A bit 0: from here on this present's clears of B must keep the caster's bytes
+-    vkimg_t *b = vk_m55a_find_depth(1024, 1024, g_m59a_b_off);
+     if (caster && b) {
+-        int same_mem = b->mem == a->mem, overlap = b->off < a->off + a->size && a->off < b->off + b->size;
+-        { static int npair; if (npair < 8) { npair++;
++        same_mem = b->mem == a->mem, overlap = b->off < a->off + a->size && a->off < b->off + b->size;
++        { static int npair; if (npair < 8 || (same_mem && overlap)) { npair++;   // M65A: an accepted (overlapping) pair is always printed, the cap only trims the repeats
+             VKLOG("[m59a-pair] present=%llu pass=%d sub=%llu epoch=%llu draws=%llu: A %p img=%p mem=%p moff=%#llx off=+%#llx..%#llx slab=%p | B %p img=%p mem=%p moff=%#llx off=+%#llx..%#llx slab=%p | same_mem=%d overlap=%d",
+                 (unsigned long long)g_tex_frame, m59a4_pass(), (unsigned long long)mtl_last_fence() + 1, (unsigned long long)g_set_epoch, (unsigned long long)g_pass_draws,
+                 (const void *)a, (void *)a->img, (const void *)a->mem, (unsigned long long)a->moff, (unsigned long long)a->off, (unsigned long long)(a->off + a->size), a->m57a_slab,
+@@ -784,26 +825,38 @@
+                 same_mem, overlap); } }
+         if (m & 8) m59a_sync(a, b);   // bit 3 (a candidate fix): the caster's depth copied into the sampled sibling's bytes, in this window
+     }
+-    if (!(m & 32) || g_nm59ad > M59AD_MAX - 2) return;   // bit 5: the four moments below
++    /* M65A (defect 1.2): the probe may only take a caster that really shares bytes with B. M64A spent its only readback on sub 834, whose caster
++       sat at pool+0x828a00 (overlap=0) while the pair under test is A at pool+0x200200 against B at pool+0x228600. Acceptance = same_mem=1 &&
++       overlap>0 (a caster at B's own offset is still excluded). The M59A bit-0 fix below keeps its wider caster test on purpose. */
++    int pick = caster && b && same_mem && overlap;
++    if (caster) { static int npk; if (npk < 24) { npk++;
++        VKLOG("[m65a-pick] present=%llu pass=%d sub=%llu draws=%llu: cand A off=+%#llx..%#llx mem=%p slab=%p | B%s off=+%#llx..%#llx mem=%p slab=%p | same_mem=%d overlap=%d accepted=%c",
++            (unsigned long long)g_tex_frame, m59a4_pass(), (unsigned long long)mtl_last_fence() + 1, (unsigned long long)g_pass_draws,
++            (unsigned long long)a->off, (unsigned long long)(a->off + a->size), (const void *)a->mem, a->m57a_slab,
++            b ? "" : "(missing)", b ? (unsigned long long)b->off : 0ull, b ? (unsigned long long)(b->off + b->size) : 0ull,
++            b ? (const void *)b->mem : NULL, b ? b->m57a_slab : NULL, same_mem, overlap, pick ? 'Y' : 'N'); } }
++    if (!(m & 32) || g_m65a_frames >= 4 || g_m65a_dumps >= 12 || g_nm59ad > M59AD_MAX - 2) return;   // bit 5: the four moments below (M65A caps the total)
+     if (g_m59a4_frames >= 2) return;   // two presents are enough to see the same four numbers twice (and a third frame would fill the queue)
+-    if (caster && b && !g_m59a4_done_i) {   // (i) A's 24-draw caster pass just ended, in the same submission
+-        g_m59a4_done_i = 1; g_m59a_runs++;
++    if (pick && !g_m59a4_done_i) {   // (i) A's 24-draw caster pass just ended, in the same submission
++        g_m59a4_done_i = 1; g_m59a_runs++; g_m65a_arm = 1; g_m65a_frames++; g_m65a_dumps += 2;
+         { static int said; if (!said++) VKLOG("[m59a4] moment (i): present=%llu pass=%d sub=%llu: A's 1024² depth pass (24 draws) ended; reading A and B by transfer copy next", (unsigned long long)g_tex_frame, m59a4_pass(), (unsigned long long)mtl_last_fence() + 1); }
++        VKLOG("[m65a-probe] moment (i) accepted: same_mem=%d overlap=%d A=+%#llx B=+%#llx (probe frame %d of 4)", same_mem, overlap,
++            (unsigned long long)a->off, (unsigned long long)b->off, g_m65a_frames);
+         m59a_dump(a, 0, g_m59a_runs); m59a_dump(b, 1, g_m59a_runs);
+         g_m59a4_frames++;
+     }
+     if (!g_m59a4_pend && a && a->off == g_m59a_b_off && a->w == 1024 && a->h == 1024 && P_da.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
+         g_m59a4_pend = 1; g_m59a4_cval = P_da.clearValue.depthStencil.depth;   // the clear of B was folded into this pass's load op
+     }
+-    if (g_m59a4_pend > 0 && b) {   // (ii)/(iii) a whole-target clear of B was recorded in this pass: the clear runs at its begin, so its end sees the result
+-        int n = g_m59a4_clears++;
++    if (g_m65a_arm && g_m65a_dumps < 12 && g_nm59ad <= M59AD_MAX - 1 && g_m59a4_pend > 0 && b) {   // (ii)/(iii) a whole-target clear of B was recorded in this pass: the clear runs at its begin, so its end sees the result
++        int n = g_m59a4_clears++; g_m65a_dumps++;
+         VKLOG("[m59a4] moment (%s): present=%llu pass=%d sub=%llu: whole-target depth clear of B (depth %g) in this pass (%llu draws), reading B next",
+             n ? "iii" : "ii", (unsigned long long)g_tex_frame, m59a4_pass(), (unsigned long long)mtl_last_fence() + 1, g_m59a4_cval, (unsigned long long)g_pass_draws);
+         m59a_dump(b, n ? 3 : 2, g_m59a_runs ? g_m59a_runs : 1);
+     }
+     g_m59a4_pend = 0;
+-    if (g_m59a4_samp == 1 && g_m59a4_sampnum == m59a4_pass() && b) {   // (iv) the pass that first samples B this present (B is not its attachment: read-only)
+-        g_m59a4_samp = 2;
++    if (g_m65a_arm && g_m65a_dumps < 12 && g_nm59ad <= M59AD_MAX - 1 && g_m59a4_samp == 1 && g_m59a4_sampnum == m59a4_pass() && b) {   // (iv) the pass that first samples B this present (B is not its attachment: read-only)
++        g_m59a4_samp = 2; g_m65a_dumps++;
+         VKLOG("[m59a4] moment (iv): present=%llu pass=%d sub=%llu: the pass that samples B (1024², +%#llx) ended; reading what the sampler saw",
+             (unsigned long long)g_tex_frame, m59a4_pass(), (unsigned long long)mtl_last_fence() + 1, (unsigned long long)b->off);
+         m59a_dump(b, 4, g_m59a_runs ? g_m59a_runs : 1);
+@@ -811,10 +864,12 @@
+ }
+ void vk_m59a_poll(uint64_t done_fence) {   // the transfer copies are read once the GPU passed them: stats of both, and B against A row-shifted by 0x28400
+     if (g_nm59ad <= 0) return;
+-    int k = 0;
++    /* M66A fix 2 (use-after-free): every B moment's correlation reads A's snapshot, and A's entry usually sits *earlier* in this queue. Freeing each entry at
++       the end of its own iteration left the later B moments (ii)/(iii)/(iv) correlating against released memory — M65A's 0.00% for (ii)/(iv) is that, not a
++       result. Read every finished entry first; free only once the whole pass is done, then compact. */
+     for (int i = 0; i < g_nm59ad; i++) {
+         m59ad_t *d = &g_m59ad[i];
+-        if (done_fence < d->fence) { g_m59ad[k++] = *d; continue; }
++        if (done_fence < d->fence) continue;
+         if (!d->b) continue;
+         size_t np = (size_t)d->w * d->h; uint64_t far = 0, geo = 0, zero = 0; float lo = 1e30f, hi = -1e30f; double sum = 0;
+         for (size_t q = 0; q < np; q++) { float v = m59a_dval(d, q); if (v >= 0.999f) far++; if (v < 0.5f) geo++; if (v < lo) lo = v; if (v > hi) hi = v; sum += v;
+@@ -839,11 +894,218 @@
+                     VKLOG("[m59a-corr] %s %s present=%llu per=%d vs A same present: %s exact=%.2f%% near(1e-6)=%.2f%% mean|diff|=%.6f", m59a_moment(d->tag), sh[s].n,
+                         (unsigned long long)d->present, d->per, sh[s].n, 100.0 * eq / cnt, 100.0 * near / cnt, ad / cnt);
+                 }
++                // M64A bit 3: the offset correlation as a prediction — what far/geom A itself shows under each shift, so B's measured far/geom (printed just above)
++                // can be read against the hypothesis instead of against A as-is. 0x28400 = 40.25 rows of 4096 B: B row r should hold A row r+40, 256 texels across.
++                if (vk_m64a_mode() & 8) {
++                    for (int s = 0; s < 3; s++) {
++                        uint64_t n2 = 0, far2 = 0, geo2 = 0; double sum2 = 0; float lo2 = 1e30f, hi2 = -1e30f;
++                        for (uint32_t y = 0; y < d->h; y += 4) { uint32_t ay = y + (uint32_t)sh[s].dy; if (ay >= a->h) continue;
++                            for (uint32_t x = 0; x < d->w; x += 4) { uint32_t ax = x + (uint32_t)sh[s].dx; if (ax >= a->w) continue;
++                                float va = m59a_dval(a, (size_t)ay * a->w + ax); n2++; if (va >= 0.999f) far2++; if (va < 0.5f) geo2++; sum2 += va;
++                                if (va < lo2) lo2 = va; if (va > hi2) hi2 = va; } }
++                        if (!n2) continue;
++                        VKLOG("[m64a-shift] %s present=%llu per=%d: A under %s predicts far=%.2f%% geom=%.2f%% min=%.6f max=%.6f mean=%.6f | B measured far=%.2f%% geom=%.2f%%",
++                            m59a_moment(d->tag), (unsigned long long)d->present, d->per, sh[s].n, 100.0 * far2 / n2, 100.0 * geo2 / n2, lo2, hi2, sum2 / n2,
++                            np ? 100.0 * far / np : 0.0, np ? 100.0 * geo / np : 0.0);
++                    }
++                }
+             }
+         }
+-        vkDestroyBuffer(V.dev, d->b, NULL); vkFreeMemory(V.dev, d->m, NULL);
+     }
+-    g_nm59ad = k;
++    { int k = 0;   // M66A fix 2: only now, with every correlation already computed, are the read-back buffers released
++      for (int i = 0; i < g_nm59ad; i++) { m59ad_t *d = &g_m59ad[i];
++          if (done_fence < d->fence) { g_m59ad[k++] = *d; continue; }
++          if (d->b) { vkDestroyBuffer(V.dev, d->b, NULL); vkFreeMemory(V.dev, d->m, NULL); d->b = VK_NULL_HANDLE; d->p = NULL; } }
++      g_nm59ad = k; }
++}
++// ============================ M66A：主 KPI 就地测量（默认关；smo_m66a → DM_VK_M66A）============================
++/* 派活单 §1.3：800×450 帧型窗口只有 t≈124–128 s（4 s 宽），passdump 抓不稳（M64A/M65A 两单都没命中）。所以把 KPI 的测量放进帧本身 —— 与 pass_dump
++   同一手法（vkCmdCopyImageToBuffer 到 host-visible buffer，pass 结束后读），只是不等 passdump、不落盘、就地算：
++   bit 0 (1) = 每一条 800×450 的 pass 结束时读回它的第一个颜色目标，算 nearwhite(R,G,B>=250)/ge240/mean(R,G,B)——定义与 logs/m59a/passstat.py 逐字一致
++               ⇒ 可与历史 mask 链（99.74/96.44/…）直接对照。samp=Y 标出「采样 B 的那条 pass」。
++   bit 1 (2) = 采样 B 的那条 pass 结束时读回 B（1024² 深度，pool+0x228600）算 far/geom；caster A（1024² 深度、>=8 draws、off≠B）在它自己的 pass
++               结束时读回；两者同 present 时做三档偏移相关（as-is / row+40 / row+40,col+256，0x28400 = 40.25 行）。
++               别名在 ⇒ B 的 far/geom 应等于 A（M65A：far 86.68 / geom 8.72）；不在 ⇒ B 是自己的 clear 值（far 100 / geom 0）。
++   预算：8 个副本在飞；mask 行数 <= 300、深度副本 <= 40。默认 0 = 零日志、零分配、零行为变化（纯探针，不碰任何渲染状态）。 */
++enum { M66ANW_MAX = 16, M66ANW_MASK = 0, M66ANW_DEPTH = 1 };
++typedef struct { VkBuffer b; VkDeviceMemory m; void *p; uint32_t w, h; VkFormat f; int kind, pass, samp, tag; uint64_t fence, present, sub; } m66anw_t;
++static m66anw_t g_m66anw[M66ANW_MAX]; static int g_m66anw_n;
++static int g_m66a_sampnum = -1; static uint64_t g_m66a_samp_sub = ~0ull;
++static int g_m66a_nwlines, g_m66a_deepcopies;
++static float m66a_dval(VkFormat f, const void *p, size_t q) {
++    if (f == VK_FORMAT_D16_UNORM) return ((const uint16_t *)p)[q] / 65535.f;
++    if (f == VK_FORMAT_D32_SFLOAT || f == VK_FORMAT_D32_SFLOAT_S8_UINT) { float v; memcpy(&v, (const uint8_t *)p + 4 * q, 4); return v; }
++    return (((const uint32_t *)p)[q] & 0xffffff) / 16777215.f;   // D24S8 / X8_D24
++}
++static void m66a_note_sampled(const vkimg_t *im) {   // the pass that binds B for sampling (the mask pass the KPI chain runs through)
++    if (!(vk_m66a_mode() & 2) || !im) return;
++    if (im->w != 1024 || im->h != 1024 || !(im->aspect & VK_IMAGE_ASPECT_DEPTH_BIT)) return;
++    int64_t bo = vk_m59a_b_off(); if (!(im->off <= bo && bo < im->off + im->size)) return;
++    uint64_t sub = mtl_last_fence() + 1;
++    if (sub != g_m66a_samp_sub) { g_m66a_samp_sub = sub; g_m66a_sampnum = -1; }
++    if (g_m66a_sampnum >= 0) return;
++    g_m66a_sampnum = m59a4_pass();
++}
++// ============================ M67A：近白到底由什么决定（默认关；smo_m67a → DM_VK_M67A）============================
++/* M66A 已定：别名在字节层成立（B≡A，corr 100.00%）而 mask 链不动（Δ≤0.06 pp）⇒ 近白不是 B 内容的函数。M67A 再上问一层：**近白是不是这个绑定的函数**。
++   在该 800×450 pass 采样 B（1024² 深度，pool+0x228600）的描述符槽位上，把 view 换成一个常量深度替身（8×8、B 自己的格式、vkCmdClearDepthStencilImage 填值，
++   不走 loadOp）——于是那条 quad 的每个 UV 都读同一个值：
++   bit0(1)=0.0（最近：若采样深度决定 mask，mask 该变全阴影）/ bit1(2)=0.5 / bit2(4)=1.0（远＝现状对照）；
++   bit3(8)=E2 只记录（采样对象 img/off/extent/format/cmp/mip/layers + 采样器登记状态），bit4(16)=E3 只记录（nearwhite 量在哪张图上 + 下游谁采样它）。
++   全 0 = 不创建、不打印、不改任何描述符。 */
++int g_m67a_sid; uint64_t g_m67a_sseq;   // samp_for: the sampler this binding resolved to (the E2 line describes it)
++static vkimg_t *g_m67a_maskimg;         // E3: the image M66A's near-white is measured on
++static int g_m67a_e2n, g_m67a_e1n, g_m67a_e3n, g_m67a_dn;
++static int m67a_is_b(const vkimg_t *im) {   // B itself: the 1024² depth whose bytes contain pool+0x228600
++    if (!im || im->w != 1024 || im->h != 1024 || !(im->aspect & VK_IMAGE_ASPECT_DEPTH_BIT)) return 0;
++    int64_t bo = vk_m59a_b_off(); return im->off <= bo && bo < im->off + im->size;
++}
++static void m67a_samp_text(char *out, size_t n) {   // the registered state behind the sampler this binding resolved to
++    void vk_samp_describe_at(int sid, uint64_t seq, char *o, size_t m);
++    vk_samp_describe_at(g_m67a_sid, g_m67a_sseq, out, n);
++}
++static void m67a_bind_hook(int st, const dmsv_bind *b, uint64_t h, VkDescriptorImageInfo *ii, vkimg_t *im) {
++    int m = vk_m67a_mode();
++    if (!m || !im || !ii->imageView) return;
++    int isb = m67a_is_b(im);
++    int inmask = (S.pass_w == 800 && S.pass_h == 450);
++    /* E2（只记录）：这条 pass 采样 B 的对象与采样器状态 —— 每帧第一笔（每个 submission 一次），cap 80 行 */
++    if ((m & 8) && isb && inmask && g_m67a_e2n < 80) {
++        static uint64_t said_sub = ~0ull; uint64_t sub = mtl_last_fence() + 1;
++        if (sub != said_sub) { said_sub = sub; g_m67a_e2n++;
++            char sd[256]; m67a_samp_text(sd, sizeof sd);
++            VKLOG("[m67a-e2] present=%llu pass=%d sub=%llu draws=%llu binding=%d: sampled img=%p vkimg=%p pool=%#llx off=+%#llx..%#llx extent=%ux%u fmt=%d aspect=%#x cmp=%d mip=%u layers=%u | %s | view=%p",
++                  (unsigned long long)g_tex_frame, g_sub_pass - 1, (unsigned long long)sub, (unsigned long long)g_pass_draws, b->binding,
++                  (void *)im->img, (const void *)im, (unsigned long long)im->pool, (unsigned long long)im->off, (unsigned long long)(im->off + im->size),
++                  im->w, im->h, (int)im->fmt, (unsigned)im->aspect, b->dim == 0xff ? 1 : b->dim, im->levels, im->layers, sd, (void *)ii->imageView);
++        }
++    }
++    /* E1：把 B 的槽位换成常量深度替身（只在这条 800×450 的 pass 上，其它 pass 一律不动） */
++    if (inmask && isb) {
++        float val = vk_m67a_const_value(m);
++        if (val >= 0.0f) {
++            VkImageView cv = vk_m67a_const_depth(im, val);
++            if (cv) {
++                ii->imageView = cv;
++                if (g_m67a_e1n < 40) { g_m67a_e1n++;
++                    VKLOG("[m67a-e1] present=%llu pass=%d sub=%llu binding=%d: B's slot now reads the constant-depth stand-in (%g) instead of the 1024² depth at +%#llx",
++                          (unsigned long long)g_tex_frame, g_sub_pass - 1, (unsigned long long)(mtl_last_fence() + 1), b->binding, val, (unsigned long long)im->off); }
++            }
++        }
++    }
++    /* E3（只记录）：M66A 量近白的那张图之后被谁采样（下游），每条 ≤8 行 */
++    if ((m & 16) && g_m67a_maskimg && im == g_m67a_maskimg && g_m67a_dn < 8) { g_m67a_dn++;
++        char sd[256]; m67a_samp_text(sd, sizeof sd);
++        VKLOG("[m67a-e3-down] present=%llu pass=%d (%ux%u) sub=%llu binding=%d shader=%#llx: the near-white target (img=%p +%#llx) is sampled here | %s",
++              (unsigned long long)g_tex_frame, g_sub_pass - 1, S.pass_w, S.pass_h, (unsigned long long)(mtl_last_fence() + 1), b->binding,
++              (unsigned long long)(S.sh[1] ? S.sh[1]->key : 0), (void *)im->img, (unsigned long long)im->off, sd);
++    }
++}
++static void m67a_note_measured(const vkimg_t *im, int ci) {   // E3: what M66A's near-white is actually measured on
++    int m = vk_m67a_mode();
++    if (!(m & 16) || !im) return;
++    g_m67a_maskimg = (vkimg_t *)im;
++    if (g_m67a_e3n++ >= 8) return;
++    VKLOG("[m67a-e3] present=%llu pass=%d sub=%llu: nearwhite is measured on the pass's COLOUR attachment #%d (img=%p pool=%#llx off=+%#llx %ux%u fmt=%d aspect=%#x d=%u layers=%u levels=%u gpu_w=%d) | this pass: ncol=%d has_dep=%d dfmt=%d",
++          (unsigned long long)g_tex_frame, g_sub_pass - 1, (unsigned long long)(mtl_last_fence() + 1), ci, (void *)im->img, (unsigned long long)im->pool,
++          (unsigned long long)im->off, im->w, im->h, (int)im->fmt, (unsigned)im->aspect, im->d, im->layers, im->levels, im->gpu_w,
++          S.ncol, S.rt_has_dep, (int)S.dfmt);
++}
++static int m66a_copy(VkImage img, uint32_t w, uint32_t h, VkImageAspectFlags as, VkFormat f, int kind, int pass, int samp, int tag) {
++    if (!img || g_m66anw_n >= M66ANW_MAX) return 0;
++    uint32_t bpp = kind == M66ANW_DEPTH ? (f == VK_FORMAT_D16_UNORM ? 2u : 4u) : 4u;
++    VkDeviceSize n = (VkDeviceSize)w * h * bpp;
++    m66anw_t *d = &g_m66anw[g_m66anw_n]; memset(d, 0, sizeof *d);
++    d->w = w; d->h = h; d->f = f; d->kind = kind; d->pass = pass; d->samp = samp; d->tag = tag;
++    d->present = g_tex_frame; d->sub = mtl_last_fence() + 1; d->fence = mtl_last_fence() + 1;
++    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, n, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE};
++    if (vkCreateBuffer(V.dev, &bi, NULL, &d->b)) return 0;
++    VkMemoryRequirements rq; vkGetBufferMemoryRequirements(V.dev, d->b, &rq);
++    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, rq.size, vk_mem_type(rq.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, 0)};
++    if (vkAllocateMemory(V.dev, &ai, NULL, &d->m) || vkBindBufferMemory(V.dev, d->b, d->m, 0) || vkMapMemory(V.dev, d->m, 0, VK_WHOLE_SIZE, 0, &d->p)) {
++        if (d->m) vkFreeMemory(V.dev, d->m, NULL); vkDestroyBuffer(V.dev, d->b, NULL); d->b = VK_NULL_HANDLE; d->m = VK_NULL_HANDLE; d->p = NULL; return 0; }
++    VkCommandBuffer cb = vk_cmd(); vk_img_barrier_all(cb);
++    VkBufferImageCopy c = {0, 0, 0, {as, 0, 0, 1}, {0, 0, 0}, {w, h, 1}};
++    vkCmdCopyImageToBuffer(cb, img, VK_IMAGE_LAYOUT_GENERAL, d->b, 1, &c); vk_img_barrier_all(cb);
++    g_m66anw_n++;
++    return 1;
++}
++static void m66a_poll(uint64_t done_fence) {   // same rule as M59A's poll: read every finished copy first, free afterwards (see M66A fix 2)
++    if (g_m66anw_n <= 0) return;
++    for (int i = 0; i < g_m66anw_n; i++) {
++        m66anw_t *d = &g_m66anw[i];
++        if (done_fence < d->fence || !d->p || !d->b) continue;
++        if (d->kind == M66ANW_MASK) {
++            size_t np = (size_t)d->w * d->h; uint64_t nw = 0, ge = 0, sr = 0, sg = 0, sb = 0; int bgr = d->f == VK_FORMAT_B8G8R8A8_UNORM;
++            const uint8_t *p = (const uint8_t *)d->p;
++            for (size_t q = 0; q < np; q++) { const uint8_t *t = p + 4 * q; uint8_t r = t[bgr ? 2 : 0], g = t[1], b = t[bgr ? 0 : 2];
++                if (r >= 250 && g >= 250 && b >= 250) nw++; if (r >= 240 || g >= 240 || b >= 240) ge++; sr += r; sg += g; sb += b; }
++            VKLOG("[m66a-nw] present=%llu pass=%d sub=%llu %ux%u fmt=%d samp=%c: nearwhite(>=250)=%.2f%% ge240=%.2f%% mean(R)=%.1f R=%.1f G=%.1f B=%.1f",
++                (unsigned long long)d->present, d->pass, (unsigned long long)d->sub, (unsigned)d->w, (unsigned)d->h, (int)d->f, d->samp ? 'Y' : 'N',
++                np ? 100.0 * (double)nw / np : 0.0, np ? 100.0 * (double)ge / np : 0.0, np ? (double)sr / np : 0.0, np ? (double)sr / np : 0.0,
++                np ? (double)sg / np : 0.0, np ? (double)sb / np : 0.0);
++        } else {
++            size_t np = (size_t)d->w * d->h; uint64_t far = 0, geo = 0; float lo = 1e30f, hi = -1e30f; double sum = 0;
++            for (size_t q = 0; q < np; q++) { float v = m66a_dval(d->f, d->p, q); if (v >= 0.999f) far++; if (v < 0.5f) geo++; if (v < lo) lo = v; if (v > hi) hi = v; sum += v; }
++            VKLOG("[m66a-%s] present=%llu pass=%d sub=%llu %ux%u fmt=%d: far(>=0.999)=%.2f%% geom(<0.5)=%.2f%% min=%.6f max=%.6f mean=%.6f",
++                d->tag ? "B(iv)at-sampling" : "A-caster", (unsigned long long)d->present, d->pass, (unsigned long long)d->sub, (unsigned)d->w, (unsigned)d->h, (int)d->f,
++                np ? 100.0 * (double)far / np : 0.0, np ? 100.0 * (double)geo / np : 0.0, lo, hi, np ? sum / np : 0.0);
++            if (d->tag) {   // B against the caster A of the same present, at the three offset hypotheses
++                m66anw_t *a = NULL;
++                for (int j = 0; j < g_m66anw_n; j++) { m66anw_t *o = &g_m66anw[j];
++                    if (o != d && o->kind == M66ANW_DEPTH && !o->tag && o->present == d->present && o->w == d->w && o->h == d->h && o->p) { a = o; break; } }
++                if (a && done_fence >= a->fence) {
++                    struct { int dy, dx; const char *n; } sh[3] = {{0, 0, "as-is"}, {40, 0, "row+40"}, {40, 256, "row+40,col+256"}};
++                    for (int s = 0; s < 3; s++) {
++                        uint64_t eq = 0, cnt = 0; double ad = 0;
++                        for (uint32_t y = 0; y < d->h; y += 4) { uint32_t ay = y + (uint32_t)sh[s].dy; if (ay >= a->h) continue;
++                            for (uint32_t x = 0; x < d->w; x += 4) { uint32_t ax = x + (uint32_t)sh[s].dx; if (ax >= a->w) continue;
++                                float vb = m66a_dval(d->f, d->p, (size_t)y * d->w + x), va = m66a_dval(a->f, a->p, (size_t)ay * a->w + ax);
++                                if (((const uint32_t *)d->p)[(size_t)y * d->w + x] == ((const uint32_t *)a->p)[(size_t)ay * a->w + ax]) eq++;
++                                ad += (vb > va ? vb - va : va - vb); cnt++; } }
++                        if (!cnt) continue;
++                        VKLOG("[m66a-corr] B(iv) %s present=%llu sub=%llu: exact=%.2f%% mean|diff|=%.6f", sh[s].n,
++                            (unsigned long long)d->present, (unsigned long long)d->sub, 100.0 * (double)eq / cnt, ad / cnt);
++                    }
++                }
++            }
++        }
++    }
++    { int k = 0;
++      for (int i = 0; i < g_m66anw_n; i++) { m66anw_t *d = &g_m66anw[i];
++          if (done_fence < d->fence) { g_m66anw[k++] = *d; continue; }
++          if (d->b) { vkDestroyBuffer(V.dev, d->b, NULL); vkFreeMemory(V.dev, d->m, NULL); } d->b = VK_NULL_HANDLE; d->p = NULL; m66anw_t z; memset(&z, 0, sizeof z); *d = z; }
++      g_m66anw_n = k; }
++}
++static int m66a_nwcap(void) {   // M67A: the M65A/M66A budget was 400 lines; four segments (baseline + three constants) need more, so it is settable (DM_VK_M66A_NWMAX)
++    static int v = -1; if (v >= 0) return v;
++    const char *e = getenv("DM_VK_M66A_NWMAX"); v = (e && *e) ? atoi(e) : 400;
++    if (v <= 0) v = 400;
++    if (v != 400) VKLOG("[m67a] M66A nearwhite line budget raised to %d (DM_VK_M66A_NWMAX)", v);
++    return v;
++}
++static void m66a_pass_end(void) {
++    int m = vk_m66a_mode();
++    if (!m) return;
++    m66a_poll(mtl_last_fence());   // drain what earlier submissions left
++    if ((m & 1) && g_m66a_nwlines < m66a_nwcap() && S.ncol && S.pass_w == 800 && S.pass_h == 450) {   // the 800×450 mask chain, one line per pass
++        int ci = 0; while (ci < S.ncol && ci < 8 && !S.rt_has_col[ci]) ci++;
++        vkimg_t *im = (ci < S.ncol && ci < 8) ? vk_tex(&S.rt_col[ci]) : NULL;
++        if (im && (im->fmt == VK_FORMAT_R8G8B8A8_UNORM || im->fmt == VK_FORMAT_R8G8B8A8_SRGB || im->fmt == VK_FORMAT_B8G8R8A8_UNORM) && im->d == 1 && im->layers == 1) {
++            int samp = (g_m66a_sampnum == g_sub_pass - 1 && g_m66a_samp_sub == mtl_last_fence() + 1);
++            if (m66a_copy(im->img, im->w, im->h, VK_IMAGE_ASPECT_COLOR_BIT, im->fmt, M66ANW_MASK, g_sub_pass - 1, samp, 0)) { g_m66a_nwlines++; m67a_note_measured(im, ci); }   // M67A E3
++        }
++    }
++    if ((m & 2) && g_m66a_deepcopies < 40) {
++        vkimg_t *b = vk_m55a_find_depth(1024, 1024, vk_m59a_b_off());
++        if (b && g_m66a_sampnum == g_sub_pass - 1 && g_m66a_samp_sub == mtl_last_fence() + 1)   // (iv) the pass that samples B just ended
++            { if (m66a_copy(b->img, b->w, b->h, VK_IMAGE_ASPECT_DEPTH_BIT, b->fmt, M66ANW_DEPTH, g_sub_pass - 1, 1, 1)) g_m66a_deepcopies++; }
++        if (g_m66a_nwlines > 0 && S.rt_has_dep) {   // (i) the caster A at its own pass end (budget only opens once the mask chain has been seen)
++            vkimg_t *a = vk_tex(&S.rt_dep);
++            if (a && (a->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) && a->w == 1024 && a->h == 1024 && g_pass_draws >= 8 && a->off != vk_m59a_b_off())
++                { if (m66a_copy(a->img, a->w, a->h, VK_IMAGE_ASPECT_DEPTH_BIT, a->fmt, M66ANW_DEPTH, g_sub_pass - 1, 0, 0)) g_m66a_deepcopies++; }
++        }
++    }
+ }
+ // DM_VK_CRUMBS=1 (start-up), for a device lost (a GPU hang): every pass end and dispatch writes {submission, pass} into host-visible memory after a full barrier, and the host
+ // keeps the shaders each pass drew with; when the device is lost (vk_crumbs_report), the last work the GPU finished and the passes after it are logged
+@@ -899,10 +1161,12 @@
+         { static int n; if (n++ < 4) VKLOG("linear render target %ux%u (nvn format %#x, stride %zu) copied back to its storage %p", im->w, im->h, t->d.format, stride, (void *)t->mem); }
+     }
+ }
++static void vk_m69a_pass_end(void);   // M69A (defined with the rest of the M69A block, below draw)
+ void vk_end_pass(void) {
+     if (g_x_listpasses && S.pass_open == 1) { Dl_info di; void *ra = __builtin_return_address(0); uintptr_t base = dladdr((void *)vk_end_pass, &di) ? (uintptr_t)di.dli_fbase : 0; VKLOG("    ended from %#llx (%llu draws)", (unsigned long long)((uintptr_t)ra - base), (unsigned long long)g_pass_draws); list_reads("it"); }   // (DM_VK_TRACE_PASS=-2: who ends each pass)
+     if (S.pass_open == 2 && P_cleared) (void)pass_commit();   // only clears: the pass still runs, for its load ops
+     if (S.pass_open == 1) { if (S.rp_pass) vkCmdEndRenderPass(vk_cmd()); else vkCmdEndRendering(vk_cmd()); void vk_pass_ts(int end, uint32_t w, uint32_t h, uint32_t fmt, uint32_t draws); vk_pass_ts(1, S.pass_w, S.pass_h, (uint32_t)S.cfmt[0], (uint32_t)g_pass_draws | (g_pass_draws ? (uint32_t)((g_pass_bb[2] - g_pass_bb[0]) & 0xffff) << 16 : 0));  pass_dump(); if (g_x_tracepass >= 0 && g_sub_pass - 1 == g_x_tracepass) { setenv("DM_VK_TRACE_PASS", "-1", 1); g_x_tracepass = -1; } }
++    vk_m69a_pass_end();   // M69A: 1024x1024 depth pass summary + detail-frame accounting (no-op with the knob at 0)
+     if (g_shpass_on && S.pass_open == 1 && S.daspect && S.pass_w == S.pass_h && (S.pass_w == 1024 || S.pass_w == 256))
+         VKLOG("shpass: pass %d END %ux%u draws %llu clears %d clear_depth %g clear_stencil %d; scissor bbox %d %d %d %d; dep pool %#llx+%#llx",
+               g_sub_pass - 1, S.pass_w, S.pass_h, (unsigned long long)g_pass_draws, g_sh_clear_n, g_sh_clear_d, g_sh_clear_s,
+@@ -930,6 +1194,7 @@
+                       lo == 1 ? P_da.clearValue.depthStencil.depth : 0.0, lo == 1 ? P_da.clearValue.depthStencil.stencil : 0u,
+                       (int)P_da.storeOp, d->off == 0x228600 ? " (the sampled one)" : ""); } } }
+     }
++    { int m72 = vk_m72a_mode(); if (m72) m72a_pass_end(m72); }   // M72A：谁该写那张 800×450 D32（pass 表 / 深度读回；默认关）
+     if (S.pass_open == 1) crumb_mark(0);
+     S.pass_open = 0; S.bound_pipe = VK_NULL_HANDLE; g_tf_in_pass = 0;
+ }
+@@ -1132,24 +1397,37 @@
+     VkClearAttachment a = {as, 0, {.depthStencil = {c->depth, (uint32_t)c->stencil}}};
+     if (shpass_want()) { g_sh_clear_d = c->depth; g_sh_clear_s = c->stencil; g_sh_clear_n++; }   // M51A: the shadow candidate's clear value
+     VkClearRect r = {scissor_rect(), 0, P_ri.layerCount ? P_ri.layerCount : 1};   // every layer (clear_color)
++    { int m72 = vk_m72a_mode(); if (m72) m72a_clear_note(c->depth, (int)c->depth_mask); }   // M72A：本 pass 的 depth clear（含没折叠成 loadOp 的那条）
+     { int tr = g_x_tracepass == -2 || (g_x_tracepass >= 0 && g_sub_pass - 1 + (S.pass_open == 2) == g_x_tracepass);   // M51A: 被 trace 的那个 pass 也打深度清屏（原来只有 pass 列表模式 DM_VK_TRACE_PASS=-2 才打，shadow 链拿不到清屏值）
+       if (tr) VKLOG("--- depth-stencil clear: depth %g (mask %d), stencil %d (mask %#x), %ux%u at %d,%d, in pass %d%s", c->depth, (int)c->depth_mask, (int)c->stencil, (unsigned)c->stencil_mask,
+         r.rect.extent.width, r.rect.extent.height, r.rect.offset.x, r.rect.offset.y, g_sub_pass - 1 + (S.pass_open == 2), S.pass_open == 2 ? " (before its first draw)" : ""); }
+     // M59A bit 5: a whole-target clear of the slab-shared depth image B is one of the four moments: mark this pass, the copy is recorded at its end.
+     { int m59 = vk_m59a_mode();
++      if (m59 & 32) m65a_maybe_reset();   // M65A 1.1: the clear can be the first probe event of a submission
+       if ((m59 & 32) && S.pass_open == 2 && pass_whole(r.rect) && (as & VK_IMAGE_ASPECT_DEPTH_BIT) && P_att[8].im && P_att[8].im->w == 1024 && P_att[8].im->h == 1024 &&
+           P_att[8].im->off <= g_m59a_b_off && g_m59a_b_off < P_att[8].im->off + P_att[8].im->size) {
+           if (g_m59a4_frame != g_tex_frame) m59a4_reset(g_tex_frame);
+           g_m59a4_pend = 1; g_m59a4_cval = c->depth; g_m59a4_cpass = m59a4_pass(); } }
+     // M59A bit 0 (the fix): B is the slab-shared depth image the sampler reads, and its whole-target CLEAR runs after the caster rendered into the same bytes:
+     // loading them is what the device would do (one buffer). Only while the caster has not rendered this present does the clear stand (an explicit initial value).
+-    if (S.pass_open == 2 && pass_whole(r.rect) && (as & VK_IMAGE_ASPECT_DEPTH_BIT) && P_att[8].im && vk_m59a_load_wanted(P_att[8].im)) {
+-        if (vk_m59a_caster_drawn()) {
++    /* M66A fix 1 (the CLEAR→LOAD rule is B's alone): vk_m59a_load_wanted now matches B's own pool offset exactly, so the 1600×900 main-scene depth at pool+0
++       — whose bytes merely *contain* +0x228600 — keeps its clear (M65A turned it into a LOAD as well and the snow came out with coloured noise). One line per
++       decision says which image the rule looked at and what it decided; it prints whenever the slab is on, so alias-only runs show applied=N for the main
++       scene's depth and the exact offset the rule would accept. */
++    if (S.pass_open == 2 && pass_whole(r.rect) && (as & VK_IMAGE_ASPECT_DEPTH_BIT) && P_att[8].im) {
++        vkimg_t *m66dim = P_att[8].im; int m66lw = vk_m59a_load_wanted(m66dim);
++        if (m66dim->m57a_slab && (vk_m57a_mode() & 1)) { static int nfix; if (nfix < 24) { nfix++;
++            int64_t m66bo = vk_m59a_b_off();
++            VKLOG("[m66a-fix] present=%llu pass=%d sub=%llu: whole-target depth clear %g of slab-shared %ux%u depth off=+%#llx (slab %p) | at-B-offset=%c (%#llx) bit2=%s applied=%c",
++                (unsigned long long)g_tex_frame, m59a4_pass(), (unsigned long long)mtl_last_fence() + 1, c->depth, m66dim->w, m66dim->h,
++                (unsigned long long)m66dim->off, m66dim->m57a_slab, m66dim->off == m66bo ? 'Y' : 'N', (unsigned long long)m66bo,
++                (vk_m59a_mode() & 1) ? "on" : "off", (m66lw && vk_m59a_caster_drawn()) ? 'Y' : 'N'); } }
++        if (m66lw && vk_m59a_caster_drawn()) {
+             static int nsaid; if (nsaid++ < 6) VKLOG("[m59a-fix] present=%llu pass=%d: whole-target depth clear %g of B (%ux%u at +%#llx) is a LOAD: the caster rendered these bytes this present",
+                 (unsigned long long)g_tex_frame, m59a4_pass(), c->depth, P_att[8].w, P_att[8].h, (unsigned long long)P_att[8].im->off);
+             return; }
+-        static int nsaid2; if (nsaid2++ < 6) VKLOG("[m59a-fix] present=%llu pass=%d: clear %g of B kept (the caster has not rendered this present: the bytes hold no rendering yet)",
+-            (unsigned long long)g_tex_frame, m59a4_pass(), c->depth);
++        if (m66lw) { static int nsaid2; if (nsaid2++ < 6) VKLOG("[m59a-fix] present=%llu pass=%d: clear %g of B kept (the caster has not rendered this present: the bytes hold no rendering yet)",
++            (unsigned long long)g_tex_frame, m59a4_pass(), c->depth); }
+     }
+     // M57A bit 3: the depth image of this pass shares its pool's bytes with an image a recent pass rendered into (the device: one buffer). Nothing draws into it,
+     // so its whole-target clear would only destroy that rendering — the far plane a sampled pass then reads. Keep the bytes (default off: vk_m57a_clear_keep = 0).
+@@ -1249,6 +1527,7 @@
+     uint32_t ncol, cfmt[8], dfmt, samples, a2c, blend_en, logic_en, logic_op, wmask[8];
+     struct { uint32_t src, dst, srca, dsta, eq, eqa; } bl[8];
+     uint32_t clip_neg1, alt, fdz, dual;   // fdz: the fragment shader's variant that writes gl_FragDepth = gl_FragCoord.z (fdz below); dual: its dual-source variant (below)
++    uint32_t m71abc;   // M71A bit3: this pipeline's output is multiplied by DM_VK_M71A_BC (blend src = CONSTANT_COLOR, dst = ZERO)
+     uint64_t um[3], im[3];   // each stage's sampled bindings given integer views (vk_shader_module)
+ } pkey;
+ static nvn_hmap g_pipes = {.klen = sizeof(pkey)}; static pthread_mutex_t g_pipe_mu = PTHREAD_MUTEX_INITIALIZER;   // the replay thread and the prewarm threads
+@@ -1447,10 +1726,14 @@
+     if (flat & 32) ds.depthTestEnable = ds.depthWriteEnable = 0;
+     if (flat & 64) ds.stencilTestEnable = 0;
+     VkPipelineColorBlendAttachmentState cba[8];
+-    for (uint32_t i = 0; i < k->ncol; i++) cba[i] = (VkPipelineColorBlendAttachmentState){(k->blend_en >> i) & 1, bfac(k->bl[i].src), bfac(k->bl[i].dst), bop(k->bl[i].eq),
++    for (uint32_t i = 0; i < k->ncol; i++) cba[i] = k->m71abc   // M71A bit3：out = 常数 · src（dst 项为零，末级目标每次都是整块重画）
++        ? (VkPipelineColorBlendAttachmentState){VK_TRUE, VK_BLEND_FACTOR_CONSTANT_COLOR, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD,
++                                                VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD, k->wmask[i]}
++        : (VkPipelineColorBlendAttachmentState){(k->blend_en >> i) & 1, bfac(k->bl[i].src), bfac(k->bl[i].dst), bop(k->bl[i].eq),
+         bfac(k->bl[i].srca), bfac(k->bl[i].dsta), bop(k->bl[i].eqa), k->wmask[i]};
+     if (flat & 4) for (uint32_t i = 0; i < k->ncol; i++) { cba[i].blendEnable = 0; cba[i].colorWriteMask = 0xf; }
+-    VkPipelineColorBlendStateCreateInfo cb = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, NULL, 0, k->logic_en, (VkLogicOp)k->logic_op, k->ncol, cba, {0, 0, 0, 0}};
++    VkPipelineColorBlendStateCreateInfo cb = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, NULL, 0, k->logic_en, (VkLogicOp)k->logic_op, k->ncol, cba,
++                                              {k->m71abc ? m71a_bconst() : 0.f, k->m71abc ? m71a_bconst() : 0.f, k->m71abc ? m71a_bconst() : 0.f, 1.f}};   // (VK_DYNAMIC_STATE_BLEND_CONSTANTS 也是动态的，set_dynamic 每笔再设)
+     VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
+                             VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_DEPTH_BIAS, VK_DYNAMIC_STATE_LINE_WIDTH};
+     VkPipelineDynamicStateCreateInfo dy = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, sizeof dyn / sizeof *dyn, dyn};
+@@ -1537,6 +1820,7 @@
+     case RS_UBO: sid = (int)(mem_handle(ubo_word(st, b->samp_arg & 0xff, b->samp_arg >> 8) & ~0xfffffull) >> 20); break;
+     default: break;
+     }
++    g_m67a_sid = sid; g_m67a_sseq = seq;   // M67A E2: the sampler state this binding resolved to (described at the descriptor write below)
+     VkSampler vk_samp_by_id_nearest(int sid), vk_samp_at(int sid, uint64_t seq, int nearest); uint64_t mtl_samp_seq(void);
+     if (!g_samp_snap || seq >= mtl_samp_seq()) seq = 0;   // no registration since the bind: the newest (the cached lookups)
+     VkSampler s = !sid ? VK_NULL_HANDLE : seq ? vk_samp_at(sid, seq, nearest) : nearest ? vk_samp_by_id_nearest(sid) : samp_cached(sid);
+@@ -1599,6 +1883,11 @@
+     if (tid && g_var_now != 3 && !g_tracing && !logfs && g_tvc[ck].epoch == g_set_epoch && g_tvc[ck].gen == g_tex_gen && g_tvc[ck].tid == tid && g_tvc[ck].dim == b->dim && g_tvc[ck].arr == (b->flags & 1) && g_tvc[ck].sc == sc && !(m56a_m && g_tvc[ck].im && g_tvc[ck].im->novl)) {
+         ii->imageView = g_tvc[ck].v; if (g_tvc[ck].im) g_tvc[ck].im->last_use = mtl_last_fence() + 1; vk_texdump_note(g_tvc[ck].im);
+         if (!storage) m59a_note_sampled(g_tvc[ck].im);   // M59A bit 5: the pass that samples B (cached binding)
++        if (!storage) m66a_note_sampled(g_tvc[ck].im);   // M66A: mark the pass that samples B (stats at its end)
++        if (!storage) m67a_bind_hook(st, b, h, ii, g_tvc[ck].im);   // M67A: E2 record / E1 constant-depth stand-in at B's slot / E3 downstream
++        if (!storage) m70a_bind(st, b, h, ii, g_tvc[ck].im);   // M70A: the armed pass's textures and samplers
++        if (!storage) m71a_bind(st, b, h, ii, g_tvc[ck].im);   // M71A: pass 71 采样的 800×450 D32（bit4 的直方图对象）
++        if (!storage) m72a_samp(st, b, g_tvc[ck].im);   // M72A：谁采样哪张深度（bit3）
+         if (g_tvc[ck].num && !storage) ii->sampler = samp_for(st, b, h, 1);
+         return g_tvc[ck].num;
+     }
+@@ -1612,6 +1901,11 @@
+         if (tf && !tf->compressed && !tf->dec && !tf->depth && !tf->stencil) vf = vk_int_fmt(tf->bpb, sc == 2);
+         vkimg_t *im = NULL; ii->imageView = vf ? vk_tex_view_as(t, v, b->dim, b->flags & 1, 0, &im, vf) : vk_tex_view(t, v, b->dim, b->flags & 1, 0, &im); if (storage && im) im->gpu_w = 1;
+         if (!storage) m59a_note_sampled(im);   // M59A bit 5: the pass that samples B
++        if (!storage) m66a_note_sampled(im);   // M66A: mark the pass that samples B
++        if (!storage) m67a_bind_hook(st, b, h, ii, im);   // M67A: E2 record / E1 constant-depth stand-in at B's slot / E3 downstream
++        if (!storage) m70a_bind(st, b, h, ii, im);   // M70A: the armed pass's textures and samplers
++        if (!storage) m71a_bind(st, b, h, ii, im);   // M71A: pass 71 采样的 800×450 D32（bit4 的直方图对象）
++        if (!storage) m72a_samp(st, b, im);   // M72A：谁采样哪张深度（bit3）
+         // M59A bit 4：采样侧到底绑了谁（回答「绑定/句柄用错」：被采样的 1024² 深度是不是按 pool+0x228600 找到的那一张，mem/off 是否一致）
+         if (!storage && im && (vk_m59a_mode() & 16) && im->w == 1024 && im->h == 1024 && (im->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) &&
+             im->off <= 0x228600 && 0x228600 < im->off + im->size) {
+@@ -1684,6 +1978,8 @@
+ }
+ // a constant buffer binding's descriptor (stage_set, set_memo_get): its pool's buffer from the alignment boundary below it, or the shadow of the deferred updates over it
+ static void cbuf_desc(int st, const vkshader_t *s, const dmsv_bind *b, VkDescriptorBufferInfo *bi) {
++    if (m73a_ubo_patch(st, s, b, bi)) return;   // M73A：pass 71 的 FS 常量银行 = 按新 t 曲线打了补丁的副本（默认关，见 M73A 块）
++    if (m71a_ubo_patch(st, s, b, bi)) return;   // M71A：pass 71 的 FS 看到的常量银行 = 打了补丁的副本（默认关，见 M71A 块）
+     const p_bind_buf *u = b->reg >= 0 && b->reg < 16 ? &S.ubo[st][b->reg] : NULL;
+     uint64_t n = u && u->size ? (u->size > 65536 ? 65536 : u->size) : 65536; VkBuffer buf; VkDeviceSize off;
+     vkpool_t *p = g_var_now != 9 && u && u->addr ? vk_pool_of(u->addr, 1) : NULL;
+@@ -1940,7 +2236,9 @@
+     { int32_t vx0 = (int32_t)fmaxf(vp.x, 0), vy0 = (int32_t)fmaxf(fminf(vp.y, vp.y + vp.height), 0), vx1 = (int32_t)(vp.x + vp.width), vy1 = (int32_t)fmaxf(vp.y, vp.y + vp.height);   // what this draw can touch
+       int32_t x0 = sc.offset.x > vx0 ? sc.offset.x : vx0, y0 = sc.offset.y > vy0 ? sc.offset.y : vy0, x1 = sc.offset.x + (int32_t)sc.extent.width < vx1 ? sc.offset.x + (int32_t)sc.extent.width : vx1, y1 = sc.offset.y + (int32_t)sc.extent.height < vy1 ? sc.offset.y + (int32_t)sc.extent.height : vy1;
+       if (x0 < g_pass_bb[0]) g_pass_bb[0] = x0; if (y0 < g_pass_bb[1]) g_pass_bb[1] = y0; if (x1 > g_pass_bb[2]) g_pass_bb[2] = x1; if (y1 > g_pass_bb[3]) g_pass_bb[3] = y1; }
+-    if (!BC_SAME(bc, S.blendc)) { vkCmdSetBlendConstants(cb, S.blendc); memcpy(g_bc.bc, S.blendc, sizeof g_bc.bc); }
++    { float bcs[4]; memcpy(bcs, S.blendc, sizeof bcs);   // M71A bit3: this draw's output compression (the pipeline blends with CONSTANT_COLOR)
++      if (g_m71a_bc) { const float v = m71a_bconst(); bcs[0] = bcs[1] = bcs[2] = v; bcs[3] = 1.f; }
++      if (!BC_SAME(bc, bcs)) { vkCmdSetBlendConstants(cb, bcs); memcpy(g_bc.bc, bcs, sizeof g_bc.bc); } }
+     if (!BC_SAME(sm, S.smask)) { vkCmdSetStencilCompareMask(cb, VK_STENCIL_FACE_FRONT_BIT, (uint32_t)S.smask[0]); vkCmdSetStencilCompareMask(cb, VK_STENCIL_FACE_BACK_BIT, (uint32_t)S.smask[1]); memcpy(g_bc.sm, S.smask, sizeof g_bc.sm); }
+     if (!BC_SAME(sw, S.swmask)) { vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_FRONT_BIT, (uint32_t)S.swmask[0]); vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_BACK_BIT, (uint32_t)S.swmask[1]); memcpy(g_bc.sw, S.swmask, sizeof g_bc.sw); }
+     if (!BC_SAME(sr, S.sref)) { vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_BIT, (uint32_t)S.sref[0]); vkCmdSetStencilReference(cb, VK_STENCIL_FACE_BACK_BIT, (uint32_t)S.sref[1]); memcpy(g_bc.sr, S.sref, sizeof g_bc.sr); }
+@@ -1993,6 +2291,10 @@
+     return 0;
+ }
+ static int prepare_draw(int prim, int indexed) {
++    /* M71A bit3：末级（渲染面 ≤40×24 的那一级）的每一笔 draw 把输出等比例压缩（blend src=CONSTANT_COLOR、dst=ZERO，
++       常数在 set_dynamic 里按 DM_VK_M71A_BC 设）。按 pass 尺寸认，不认 pass 号（帧型换了 pass 号会动）；关态只读一个 env。 */
++    { int mk = vk_m71a_mode();   // 40×22（游玩 1280×720）/ 25×14（800×450 动态分辨率）那一级；20×11 也在内；2×1 的曝光 pass 与 128² 阴影不在
++      g_m71a_bc = (mk & 8) && S.pass_w >= 16 && S.pass_w <= 40 && S.pass_h >= 8 && S.pass_h <= 24 ? 1 : 0; }
+     // DM_VK_CB_DRAWS (read every submission, default 128, 0 = never): the replay is cut every that many draws and what is recorded goes to the GPU at once
+     // (vk_cmd_split), so the GPU works on the frame while the rest is replayed instead of after all of it: NEO's Scramble Crossing 36.7 → 15.7 ms a frame
+     g_cb_draws++;   // the cut itself happens between passes (begin_pass); inside one only with DM_VK_PASS_SPLIT (below): a pass cut in two stores and reloads its attachments
+@@ -2100,6 +2402,7 @@
+     for (int i = 0; i < S.ncol; i++) {
+         k.cfmt[i] = S.cfmt[i];
+         k.wmask[i] = S.cfmt[i] && S.sh[1] ? (S.chmask.mask >> (4 * i)) & 0xf : 0;   // no fragment shader: no colour written
++        if (g_m71a_bc) k.blend_en |= 1u << i;   // M71A bit3: the constant-colour blend is on for every colour target of this draw (see cba below)
+         const vkfmt_t *f = S.rt_has_col[i] ? vk_fmt(S.rt_col[i].d.format) : NULL;
+         if (((S.color.blend_en >> i) & 1) && f && !f->is_int) {
+             k.blend_en |= 1u << i;
+@@ -2112,6 +2415,7 @@
+     #define SRC1F(x) ((x) >= 0x10 && (x) <= 0x13)
+     k.dual = (k.blend_en & 1) && S.sh[1] && !k.raster_discard && (SRC1F(k.bl[0].src) || SRC1F(k.bl[0].dst) || SRC1F(k.bl[0].srca) || SRC1F(k.bl[0].dsta));
+     #undef SRC1F
++    if (g_m71a_bc) k.m71abc = 1;   // M71A bit3: out = DM_VK_M71A_BC · src (the pipeline's colour blend)
+     k.clip_neg1 = !g_depth_zero;
+     // layout and pipeline
+     VkDescriptorSetLayout dsl[5] = {0}; int nsets = 0;
+@@ -2403,14 +2707,781 @@
+     if (!vk_buf_at(cnt, 4, cb, co)) { VKRED_ONCE(55, "multi-draw indirect: count outside the memory pools, nothing drawn"); return 1; }
+     { static int n; if (!n++) VKLOG("multi-draw indirect with a count: drawn by the GPU's count (first: max %d, stride %d)", max, stride); }
+     return 0;
++}
++// ============================ M69A：caster map 的 24 笔几何到底进了 NDC 没有（默认关；smo_m69a → DM_VK_M69A）============================
++/* 派活单 §2：caster pass（1024² D32、pool+0x200200，每帧 24 笔）的深度里只有 13.28% 有几何（far 86.68% / geom 8.72%）。要回答的是：
++   「这 24 笔本来就这么少」还是「被矩阵/viewport/裁剪推出屏幕」。本探针**只读 CPU 内存、不发任何 GPU 命令**（vk_ubd_read = memcpy + 延迟更新）：
++   bit0(1) = 逐 draw 状态表 [m69a-draw] + 该 draw 绑定的 UBO/SSBO 原样 [m69a-ubo]/[m69a-sbuf]（按 (stage,reg,addr,size) 去重）
++             + 索引解引用后的前 64 个顶点原样 [m69a-vw]（stream 0 全 stride 的 32-bit 原始字，宿主侧按 [m69a-attr] 的 vk 格式解码）
++             —— 宿主侧据此做一次 CPU 的 M·v，得到每笔的 inside_ndc%/bbox_ndc/clipped_all；
++   bit1(2) = 每条 1024² 深度 pass 结束时一行汇总 [m69a-pass]（draws / 深度 pool+off / ncol / drange）——用来确认"哪条 pass 是 caster"；
++   bit2(4) = 不设帧数上限（默认只记前 3 个 caster 帧的明细，之后只记 pass 汇总）。
++   判据只认深度附件的 pool offset（默认 0x200200，DM_VK_M69A_OFF 十六进制可换）——**不硬编码 pass 号**：帧型不同 pass 号就不同
++   （1024² 帧型有 14 个等宽域，caster 在不同帧型里落在不同编号上）。全 0 = 零日志、零读取、零行为变化。 */
++static long long g_m69a_off = 0x200200;
++static int g_m69a_frames;        // 已记过明细的 caster 帧数
++static int g_m69a_detail;        // 当前打开的 pass 就是记明细的 caster pass
++static uint64_t g_m69a_frame = ~0ull;
++static struct { int st, reg; uint64_t addr, size; } g_m69a_ubo[48]; static int g_m69a_nubo;
++int vk_m69a_mode(void) {
++    static int v = -1; static long last; long now = (long)time(NULL);
++    if (v >= 0 && now == last) return v;
++    last = now; const char *e = getenv("DM_VK_M69A"); v = e ? atoi(e) : 0;
++    { const char *o = getenv("DM_VK_M69A_OFF"); g_m69a_off = o && *o ? strtoll(o, NULL, 16) : 0x200200; }
++    { static int said = -1; if (v != said) { said = v; if (v > 0)
++        VKLOG("[m69a] knob on (DM_VK_M69A=%d: draw table + UBO/vertex dump %s, 1024x1024 pass summary %s, detail frame cap %s; caster depth off %#llx)", v,
++              (v & 1) ? "on" : "off", (v & 2) ? "on" : "off", (v & 4) ? "none" : "3", (unsigned long long)g_m69a_off); } }
++    return v;
++}
++static int m69a_is_caster(void) {   // 这个 draw 落在我们要记的 caster pass 里吗（按深度附件的 pool offset 认，不认 pass 号）
++    if (!(vk_m69a_mode() & 1)) return 0;
++    if (S.pass_open != 1 || !S.daspect || S.pass_w != 1024 || S.pass_h != 1024) return 0;
++    if (!S.rt_dep.pool) return 0;
++    if (S.rt_dep.off != g_m69a_off) return 0;
++    return (g_m69a_frames < 3 || (vk_m69a_mode() & 4)) ? 1 : 0;
++}
++static void m69a_words(int idx, const char *tag, int st, int reg, uint64_t addr, uint64_t size) {   // 一块内存的前 256 B，按 float 打（矩阵用）
++    uint8_t buf[512]; uint64_t n = size < sizeof buf ? size : sizeof buf; if (!n) return;
++    void vk_ubd_read(uint64_t a, uint64_t n, uint8_t *dst); vk_ubd_read(addr, n, buf);
++    char t[3072]; int k = 0;
++    for (uint64_t i = 0; i + 4 <= n; i += 4) { float f; memcpy(&f, buf + i, 4); k += snprintf(t + k, sizeof t - (size_t)k, "%s%.9g", i ? " " : "", f); if (k > (int)sizeof t - 40) break; }
++    VKLOG("[m69a-%s] f=%llu i=%d st=%d c%d addr=%#llx size=%llu bytes=%llu words=%s", tag, (unsigned long long)g_tex_frame, idx, st, reg,
++          (unsigned long long)addr, (unsigned long long)size, (unsigned long long)n, t);
++}
++static int m69a_seen(int st, int reg, uint64_t addr, uint64_t size) {
++    for (int i = 0; i < g_m69a_nubo; i++) if (g_m69a_ubo[i].st == st && g_m69a_ubo[i].reg == reg && g_m69a_ubo[i].addr == addr && g_m69a_ubo[i].size == size) return 1;
++    if (g_m69a_nubo < 48) { g_m69a_ubo[g_m69a_nubo].st = st; g_m69a_ubo[g_m69a_nubo].reg = reg; g_m69a_ubo[g_m69a_nubo].addr = addr; g_m69a_ubo[g_m69a_nubo].size = size; g_m69a_nubo++; }
++    return 0;
++}
++static void m69a_ubo_dump(int idx) {   // 这个 draw 读的全部 uniform（stage 0/1）与 storage buffer（stage 0），每帧每个 (reg,addr,size) 只打一次
++    for (int st = 0; st < 2; st++) for (int reg = 0; reg < 16; reg++) {
++        const uint64_t a = S.ubo[st][reg].addr, sz = S.ubo[st][reg].size; if (!a || !sz) continue;
++        if (!m69a_seen(st, reg, a, sz)) m69a_words(idx, "ubo", st, reg, a, sz);
++    }
++    for (int reg = 0; reg < 16; reg++) {
++        const uint64_t a = S.ssbo[0][reg].addr, sz = S.ssbo[0][reg].size; if (!a || !sz) continue;
++        if (!m69a_seen(0, 100 + reg, a, sz)) m69a_words(idx, "sbuf", 0, reg, a, sz);
++    }
++}
++static uint32_t m69a_idx_at(const uint8_t *p, uint32_t i, uint32_t isz) { return isz == 1 ? p[i] : isz == 2 ? ((const uint16_t *)p)[i] : ((const uint32_t *)p)[i]; }
++static void m69a_vtx_dump(int idx, int indexed, uint64_t ibuf, int itype, int basev, uint32_t first, uint32_t count) {
++    vkshader_t *vsh = S.sh[0]; if (!vsh) return;
++    uint32_t in_mask = vsh->local[0], im = vsh->local[1] | vsh->local[2], sm = vsh->local[1];
++    for (int loc = 0; loc < 16; loc++) {   // 顶点输入布局（宿主侧解码 raw word 用）
++        if (!(in_mask >> loc & 1)) continue;
++        va_st a; memcpy(&a, &S.vattr[loc], 4);
++        VkFormat f = a.fmt ? vertex_format(a.fmt, im >> loc & 1, sm >> loc & 1) : VK_FORMAT_UNDEFINED;
++        VKLOG("[m69a-attr] f=%llu i=%d loc=%d fmt=%#x st=%u off=%u stride=%u div=%u vk=%d bytes=%u vb=%#llx+%llu",
++              (unsigned long long)g_tex_frame, idx, loc, a.fmt, a.stream, a.offset, S.vstream[a.stream].stride, S.vstream[a.stream].divisor,
++              (int)f, f == VK_FORMAT_UNDEFINED ? 0u : vfmt_bytes(f), (unsigned long long)S.vbuf[a.stream].address, (unsigned long long)S.vbuf[a.stream].size);
++    }
++    uint32_t st0 = S.vstream[0].stride; if (!st0) st0 = 16;
++    uint32_t nw = st0 / 4 > 8 ? 8 : st0 / 4; if (!nw) nw = 4;
++    static uint8_t ixb[1 << 16]; uint32_t nx = 0, imin = 0, imax = 0, itr = 0;
++    uint32_t isz = itype == 0 ? 1 : itype == 1 ? 2 : 4;
++    if (indexed && ibuf) {   // 索引：前 min(count,16384) 个读出来（同时给全量 min/max）
++        uint64_t nb = (uint64_t)count * isz; if (nb > sizeof ixb) nb = sizeof ixb;
++        void vk_ubd_read(uint64_t a, uint64_t n, uint8_t *dst); vk_ubd_read(ibuf, nb, ixb);
++        nx = (uint32_t)(nb / isz);
++        for (uint32_t i = 0; i < nx; i++) { uint32_t v = m69a_idx_at(ixb, i, isz); if (!i) { imin = imax = v; } else { if (v < imin) imin = v; if (v > imax) imax = v; } }
++        itr = (uint64_t)count * isz > sizeof ixb;
++        VKLOG("[m69a-idx] f=%llu i=%d itype=%d isz=%u count=%u basev=%d read=%u min=%u max=%u%s", (unsigned long long)g_tex_frame, idx, itype, isz, count, basev, nx, imin, imax, itr ? " (truncated)" : "");
++    }
++    uint32_t nv = indexed ? (nx < 64 ? nx : 64) : (count < 64 ? count : 64);
++    for (uint32_t v = 0; v < nv; v++) {
++        uint32_t vi = indexed ? m69a_idx_at(ixb, v, isz) : (first + v);
++        int64_t vidx = (int64_t)vi + (indexed ? basev : 0);
++        uint64_t off = (uint64_t)vidx * st0;
++        if (vidx < 0 || off + (uint64_t)nw * 4 > S.vbuf[0].size) { VKLOG("[m69a-vw] f=%llu i=%d v=%u STOP vidx=%lld off=%llu past stream 0 (%llu B)", (unsigned long long)g_tex_frame, idx, v, (long long)vidx, (unsigned long long)off, (unsigned long long)S.vbuf[0].size); break; }
++        uint32_t w[8] = {0}; void vk_ubd_read(uint64_t a, uint64_t n, uint8_t *dst); vk_ubd_read(S.vbuf[0].address + off, (uint64_t)nw * 4, (uint8_t *)w);
++        VKLOG("[m69a-vw] f=%llu i=%d v=%u vi=%u s0=%08x %08x %08x %08x %08x %08x %08x %08x", (unsigned long long)g_tex_frame, idx, v, vi,
++              w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
++    }
++    for (int s = 1; s < 4; s++) {   // 其它 stream 只取前 4 个顶点：万一位置不在 stream 0，宿主侧还有据可查
++        uint32_t sts = S.vstream[s].stride; if (!S.vbuf[s].address || !sts) continue;
++        uint32_t nws = sts / 4 > 8 ? 8 : (sts / 4 ? sts / 4 : 4);
++        for (uint32_t v = 0; v < 4 && v < nv; v++) {
++            uint32_t vi = indexed ? m69a_idx_at(ixb, v, isz) : (first + v); int64_t vidx = (int64_t)vi + (indexed ? basev : 0);
++            uint64_t off = (uint64_t)vidx * sts; if (vidx < 0 || off + (uint64_t)nws * 4 > S.vbuf[s].size) break;
++            uint32_t w[8] = {0}; void vk_ubd_read(uint64_t a, uint64_t n, uint8_t *dst); vk_ubd_read(S.vbuf[s].address + off, (uint64_t)nws * 4, (uint8_t *)w);
++            VKLOG("[m69a-vw] f=%llu i=%d v=%u vi=%u s%d=%08x %08x %08x %08x %08x %08x %08x %08x", (unsigned long long)g_tex_frame, idx, v, vi, s,
++                  w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
++        }
++    }
+ }
++static void m69a_draw(int prim, uint32_t count, uint32_t inst, int indexed, uint64_t ibuf, int itype, int basev, uint32_t first, int isind) {
++    if (!m69a_is_caster()) return;
++    if (g_tex_frame != g_m69a_frame) { g_m69a_frame = g_tex_frame; g_m69a_nubo = 0; }
++    g_m69a_detail = 1;
++    int idx = (int)g_pass_draws;   // 本 pass 的第几笔（1 起）
++    VKLOG("[m69a-draw] f=%llu p=%d i=%d kind=%s prim=%d n=%u inst=%u vp=%.1f %.1f %.1f %.1f sc=%d %d %d %d drange=%.9g %.9g dt=%d dw=%d df=%d cull=%d front=%d mode=%d clamp=%d pofs=%.9g %g %g bias_en=%d vb0=%#llx+%llu ib=%#llx itype=%d basev=%d first=%u sh0=%016llx sh1=%016llx sh2=%016llx dep=%#llx+%#llx ncol=%d ind=%d",
++          (unsigned long long)g_tex_frame, g_sub_pass - 1, idx, indexed ? "idx" : "arr", prim, count, inst,
++          S.vp[0][0], S.vp[0][1], S.vp[0][2], S.vp[0][3], S.sc.x, S.sc.y, S.sc.w, S.sc.h, S.dnear, S.dfar,
++          (int)S.ds.dt, (int)S.ds.dw, (int)S.ds.df, (int)S.poly.cull, (int)S.poly.front, (int)S.poly.mode, S.depth_clamp,
++          S.pofs.units, S.pofs.factor, S.pofs.clamp,
++          (int)((S.poly.offset_en & (S.poly.mode == 0 ? 1 : S.poly.mode == 1 ? 2 : 4)) != 0),
++          (unsigned long long)S.vbuf[0].address, (unsigned long long)S.vbuf[0].size,
++          (unsigned long long)ibuf, itype, basev, first,
++          (unsigned long long)(S.sh[0] ? S.sh[0]->key : 0), (unsigned long long)(S.sh[1] ? S.sh[1]->key : 0), (unsigned long long)(S.sh[2] ? S.sh[2]->key : 0),
++          (unsigned long long)(uintptr_t)S.rt_dep.pool, (unsigned long long)S.rt_dep.off, S.ncol, isind);
++    m69a_ubo_dump(idx);
++    { vkshader_t *vsh = S.sh[0]; if (vsh) VKLOG("[m69a-locs] f=%llu i=%d in=%#x out=%#x sam=%#x", (unsigned long long)g_tex_frame, idx, vsh->local[0], vsh->local[1], vsh->local[2]); }
++    if (isind) VKLOG("[m69a-draw] f=%llu i=%d indirect: count/instances live in GPU memory, no vertex dump", (unsigned long long)g_tex_frame, idx);
++    else m69a_vtx_dump(idx, indexed, ibuf, itype, basev, first, count);
++}
++static void vk_m69a_pass_end(void) {   // pass 结束：1024² 深度 pass 的汇总（确认 caster 身份），并给"明细帧"计数
++    int m = vk_m69a_mode(); if (!m) return;
++    if (S.pass_open == 1 && S.daspect && S.pass_w == 1024 && S.pass_h == 1024 && (m & 2))
++        VKLOG("[m69a-pass] f=%llu p=%d %ux%u draws=%llu dep=%#llx+%#llx ncol=%d drange=%.9g %.9g %s", (unsigned long long)g_tex_frame, g_sub_pass - 1,
++              S.pass_w, S.pass_h, (unsigned long long)g_pass_draws, (unsigned long long)(uintptr_t)S.rt_dep.pool, (unsigned long long)S.rt_dep.off,
++              S.ncol, S.dnear, S.dfar, (g_m69a_detail && S.rt_dep.off == g_m69a_off) ? "DETAIL" : "-");
++    if (g_m69a_detail) { g_m69a_detail = 0; g_m69a_frames++; g_m69a_nubo = 0;
++        VKLOG("[m69a-frame] f=%llu detail frame #%d done (cap 3 unless bit2)", (unsigned long long)g_tex_frame, g_m69a_frames); }
++}
++// ============================ M70A：画面左右两团白斑是哪条 pass / 哪一笔画的（默认关；smo_m70a → DM_VK_M70A）============================
++/* 派活单 §2：游玩帧画面左右各一大团近白。本探针回答三问：① 哪条 pass 的输出是近白（含 bloom/glare 链）② 那条 pass 里是哪一笔 draw、
++   屏幕覆盖多少 ③ 尺寸/亮度来自哪里。全 0 = 零日志、零分配、零 copy、零行为变化。分位：
++     bit0(1) = 面积 > 256×256 的 pass 结束时用 vkCmdCopyImageToBuffer 读回它的颜色目标，就地算 nearwhite(>=250/255)/ge240/mean(R,G,B)/max
++               + 8×8 近白网格（白斑在哪一侧、多大）；与 logs/m59a/passstat.py、[m66a-nw] 同一口径。小目标（2×1 曝光、128×128/256×256 阴影）
++               一律不 copy：否则 copy 预算被每帧前 9 条 pass 吃光（M70A 第一轮的实测教训）；
++     bit1(2) = 前 3 帧每条 pass 一行元数据（尺寸/颜色格式/ncol/draws/颜色目标 pool+off/深度 pool+off）——bloom/glare 链就是这张表的尺寸序列；
++     bit2(4) = 自动武装：一帧里**最早**出现「左右两侧都有近白格」且 nearwhite>=1.5% 的那条 pass，下一帧记它的逐 draw 明细
++               （[m70a-draw] + 该笔 UBO/顶点原样 + [m70a-tex] 绑定贴图/采样器，供宿主侧追上游是哪条 pass 写的）；
++     bit3(8) = 不自动武装，改为手动指定：DM_VK_M70A_PASS=<pass 号> 和/或 DM_VK_M70A_OFF=<颜色目标 pool offset（十六进制）>。
++   copy 预算 DM_VK_M70A_MAXCP（默认 900）、武装阈值 DM_VK_M70A_NW（默认 1.5%）、统计帧上限 DM_VK_M70A_FRAMES（默认 0 = 不按帧限）。 */
++#define M70ACP_MAX 32
++typedef struct { VkBuffer b; VkDeviceMemory m; void *p; uint32_t w, h; VkFormat f; uint32_t bpp; int pass; uint64_t present, fence, pool; int64_t off; } m70acp_t;
++static m70acp_t g_m70acp[M70ACP_MAX]; static int g_m70acp_n;
++static int g_m70a_copies, g_m70a_frames, g_m70a_last_pass = -1, g_m70a_detail_frames, g_m70a_draws_in_pass;
++static int g_m70a_armed, g_m70a_arm_pass, g_m70a_arm_pw, g_m70a_arm_ph;
++static uint64_t g_m70a_arm_pool; static int64_t g_m70a_arm_off = -1;
++static float g_m70a_armed_nw;
++static int g_m70a_cand_ok, g_m70a_cand_pass; static float g_m70a_cand_nw;
++static uint32_t g_m70a_cand_w, g_m70a_cand_h; static uint64_t g_m70a_cand_pool; static int64_t g_m70a_cand_off = -1;
++static int g_m70a_mpass = -2, g_m70a_moff_set; static int64_t g_m70a_moff = -2;
++int vk_m70a_mode(void) {
++    static int v = -1; static long last; long now = (long)time(NULL);
++    if (v >= 0 && now == last) return v;
++    last = now; const char *e = getenv("DM_VK_M70A"); v = e ? atoi(e) : 0;
++    { const char *p = getenv("DM_VK_M70A_PASS"), *o = getenv("DM_VK_M70A_OFF");   // 每秒重读（运行期可指定 pass）
++        g_m70a_mpass = (p && *p) ? atoi(p) : -1; g_m70a_moff = (o && *o) ? (int64_t)strtoll(o, NULL, 16) : -1; g_m70a_moff_set = 1; }
++    { static int said = -1; if (v != said) { said = v; if (v > 0)
++        VKLOG("[m70a] knob on (DM_VK_M70A=%d: pass colour nearwhite %s, pass table %s, per-draw detail %s, manual pick %s (pass %d, off %#llx))", v,
++              (v & 1) ? "on" : "off", (v & 2) ? "on" : "off", (v & 4) ? "on" : "off", (v & 8) ? "on" : "off", g_m70a_mpass,
++              (unsigned long long)(g_m70a_moff < 0 ? 0 : g_m70a_moff)); } }
++    return v;
++}
++static int m70a_ienv(const char *k, int def) { const char *e = getenv(k); return (e && *e) ? atoi(e) : def; }
++static unsigned m70a_bpp(VkFormat f) {   // 颜色目标一个 texel 的字节数（不认识的格式返回 0 = 不 copy）
++    switch (f) {
++    case VK_FORMAT_R8_UNORM: return 1;
++    case VK_FORMAT_R16_SFLOAT: return 2;
++    case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB: case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB:
++    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
++    case VK_FORMAT_B10G11R11_UFLOAT_PACK32: case VK_FORMAT_R32_SFLOAT: return 4;
++    case VK_FORMAT_R16G16B16A16_SFLOAT: return 8;
++    case VK_FORMAT_R32G32B32A32_SFLOAT: return 16;
++    default: return 0; }
++}
++static void m70a_px(VkFormat f, const uint8_t *t, float *o) {   // 一个 texel → 0..1 的 RGB（与 passdump 同一套解码）
++    o[0] = o[1] = o[2] = 0.f;
++    switch (f) {
++    case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB: o[0] = t[0] / 255.f; o[1] = t[1] / 255.f; o[2] = t[2] / 255.f; break;
++    case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB: o[0] = t[2] / 255.f; o[1] = t[1] / 255.f; o[2] = t[0] / 255.f; break;
++    case VK_FORMAT_R8_UNORM: o[0] = o[1] = o[2] = t[0] / 255.f; break;
++    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: { uint32_t w; memcpy(&w, t, 4); o[0] = (w & 0x3ff) / 1023.f; o[1] = ((w >> 10) & 0x3ff) / 1023.f; o[2] = ((w >> 20) & 0x3ff) / 1023.f; } break;
++    case VK_FORMAT_A2R10G10B10_UNORM_PACK32: { uint32_t w; memcpy(&w, t, 4); o[0] = ((w >> 20) & 0x3ff) / 1023.f; o[1] = ((w >> 10) & 0x3ff) / 1023.f; o[2] = (w & 0x3ff) / 1023.f; } break;
++    case VK_FORMAT_R16G16B16A16_SFLOAT: { const uint16_t *h = (const uint16_t *)t; o[0] = half2f(h[0]); o[1] = half2f(h[1]); o[2] = half2f(h[2]); } break;
++    case VK_FORMAT_R16_SFLOAT: { float v = half2f(*(const uint16_t *)t); o[0] = o[1] = o[2] = v; } break;
++    case VK_FORMAT_B10G11R11_UFLOAT_PACK32: { uint32_t w; memcpy(&w, t, 4); o[0] = half2f((uint16_t)((w & 0x7ff) << 4)); o[1] = half2f((uint16_t)((w >> 11 & 0x7ff) << 4)); o[2] = half2f((uint16_t)((w >> 22 & 0x3ff) << 5)); } break;
++    case VK_FORMAT_R32_SFLOAT: { float v; memcpy(&v, t, 4); o[0] = o[1] = o[2] = v; } break;
++    case VK_FORMAT_R32G32B32A32_SFLOAT: { const float *p = (const float *)t; o[0] = p[0]; o[1] = p[1]; o[2] = p[2]; } break;
++    }
++}
++static void m70a_stats(m70acp_t *d) {   // 一张颜色目标的 nearwhite / 均值 / 8×8 网格（宿主侧与 off-line passstat 同口径）
++    const unsigned bpp = d->bpp; const double np = (double)d->w * (double)d->h;
++    uint64_t nw = 0, ge = 0, cnw[64] = {0}, ctot[64] = {0}; double sr = 0, sg = 0, sb = 0; double mx = 0;
++    for (uint32_t y = 0; y < d->h; y++) {
++        const uint8_t *row = (const uint8_t *)d->p + (size_t)y * d->w * bpp; const int gy = (int)((uint64_t)y * 8 / d->h);
++        for (uint32_t x = 0; x < d->w; x++) {
++            float c[3]; m70a_px(d->f, row + (size_t)x * bpp, c);
++            for (int k = 0; k < 3; k++) { if (!(c[k] == c[k])) c[k] = 0.f; else if (c[k] < 0.f) c[k] = 0.f; else if (c[k] > 1.f) c[k] = 1.f; }
++            const double r = c[0] * 255.0, g = c[1] * 255.0, b = c[2] * 255.0;
++            sr += r; sg += g; sb += b; if (r > mx) mx = r; if (g > mx) mx = g; if (b > mx) mx = b;
++            const int isw = (r >= 250.0 && g >= 250.0 && b >= 250.0);
++            if (isw) nw++; if (r >= 240.0 || g >= 240.0 || b >= 240.0) ge++;
++            const int cell = gy * 8 + (int)((uint64_t)x * 8 / d->w); ctot[cell]++; if (isw) cnw[cell]++;
++        }
++    }
++    char grid[400]; int k = 0;
++    for (int gy = 0; gy < 8 && k < (int)sizeof grid - 8; gy++) { if (gy) grid[k++] = '/'; for (int gx = 0; gx < 8 && k < (int)sizeof grid - 6; gx++) {
++        const int ci = gy * 8 + gx; const int pc = ctot[ci] ? (int)(100.0 * (double)cnw[ci] / (double)ctot[ci] + .5) : 0;
++        k += snprintf(grid + k, sizeof grid - (size_t)k, "%s%d", gx ? "," : "", pc); } }
++    grid[k] = 0;
++    const double pct = np > 0 ? 100.0 * (double)nw / np : 0.0;
++    VKLOG("[m70a-nw] f=%llu p=%d %ux%u fmt=%d col=%#llx+%#llx: nearwhite(>=250)=%.2f%% ge240=%.2f%% mean(R)=%.1f R=%.1f G=%.1f B=%.1f max=%.1f draws=%llu ncol=%d grid=%s",
++          (unsigned long long)d->present, d->pass, d->w, d->h, (int)d->f, (unsigned long long)d->pool, (unsigned long long)d->off,
++          pct, np > 0 ? 100.0 * (double)ge / np : 0.0, np > 0 ? sr / np : 0.0, np > 0 ? sr / np : 0.0, np > 0 ? sg / np : 0.0, np > 0 ? sb / np : 0.0, mx,
++          (unsigned long long)g_pass_draws, S.ncol, grid);
++    /* 武装候选：一帧里最早出现「左右两侧都有近白格」的那条 pass（白斑的形态判据），面积已由 copy 条件保证 > 256×256 */
++    if (pct >= (double)m70a_ienv("DM_VK_M70A_NW", 15) / 10.0) {
++        int nl = 0, nr = 0, nm = 0;   // 白斑形态：左三分之一与右三分之一都有近白格，而中间两列基本不白（两团分开）
++        for (int gy = 0; gy < 8; gy++) for (int gx = 0; gx < 8; gx++) { const int ci = gy * 8 + gx;
++            const int pc = ctot[ci] ? (int)(100.0 * (double)cnw[ci] / (double)ctot[ci] + .5) : 0;
++            if (pc >= 60) { if (gx < 3) nl++; else if (gx > 4) nr++; else nm++; } }
++        if (nl >= 3 && nr >= 3 && nm * 2 <= nl + nr && (!g_m70a_cand_ok || d->pass < g_m70a_cand_pass)) {
++            g_m70a_cand_ok = 1; g_m70a_cand_pass = d->pass; g_m70a_cand_nw = (float)pct; g_m70a_cand_w = d->w; g_m70a_cand_h = d->h;
++            g_m70a_cand_pool = d->pool; g_m70a_cand_off = d->off;
++            VKLOG("[m70a-cand] f=%llu p=%d %ux%u fmt=%d col=%#llx+%#llx: nearwhite %.2f%%, white cells left=%d right=%d middle=%d (blob signature)",
++                  (unsigned long long)d->present, d->pass, d->w, d->h, (int)d->f, (unsigned long long)d->pool, (unsigned long long)d->off, pct, nl, nr, nm);
++        }
++    }
++}
++static void m70a_poll(uint64_t done_fence) {   // 只读已完成的 copy（与 M66A 同一条规则：先读完再释放）
++    if (g_m70acp_n <= 0) return;
++    for (int i = 0; i < g_m70acp_n; i++) {
++        m70acp_t *d = &g_m70acp[i];
++        if (!d->b || done_fence < d->fence) continue;
++        m70a_stats(d);
++        vkDestroyBuffer(V.dev, d->b, NULL); vkFreeMemory(V.dev, d->m, NULL);
++        d->b = VK_NULL_HANDLE; d->m = VK_NULL_HANDLE; d->p = NULL;
++    }
++    { int q = 0; for (int i = 0; i < g_m70acp_n; i++) if (g_m70acp[i].b) g_m70acp[q++] = g_m70acp[i]; g_m70acp_n = q; }
++}
++static int m70a_copy(vkimg_t *im) {   // 颜色目标 → host-visible buffer（transfer copy，与 passdump 同一条路径）
++    if (!im || !im->img || !im->w || !im->h) return 0;
++    const unsigned bpp = m70a_bpp(im->fmt);
++    if (!bpp || g_m70acp_n >= M70ACP_MAX) return 0;
++    const VkDeviceSize n = (VkDeviceSize)im->w * im->h * bpp;
++    if (n > ((VkDeviceSize)256 << 20)) return 0;
++    m70acp_t *d = &g_m70acp[g_m70acp_n]; memset(d, 0, sizeof *d);
++    d->w = im->w; d->h = im->h; d->f = im->fmt; d->bpp = bpp; d->pass = g_sub_pass - 1; d->present = g_tex_frame;
++    d->fence = mtl_last_fence() + 1; d->pool = im->pool; d->off = im->off;
++    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, n, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE};
++    if (vkCreateBuffer(V.dev, &bi, NULL, &d->b)) { d->b = VK_NULL_HANDLE; return 0; }
++    VkMemoryRequirements rq; vkGetBufferMemoryRequirements(V.dev, d->b, &rq);
++    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, rq.size, vk_mem_type(rq.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, 0)};
++    if (vkAllocateMemory(V.dev, &ai, NULL, &d->m) || vkBindBufferMemory(V.dev, d->b, d->m, 0) || vkMapMemory(V.dev, d->m, 0, VK_WHOLE_SIZE, 0, &d->p)) {
++        if (d->m) vkFreeMemory(V.dev, d->m, NULL); vkDestroyBuffer(V.dev, d->b, NULL); d->b = VK_NULL_HANDLE; d->m = VK_NULL_HANDLE; d->p = NULL; return 0; }
++    VkCommandBuffer cb = vk_cmd(); vk_img_barrier_all(cb);
++    VkBufferImageCopy c = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {d->w, d->h, 1}};
++    vkCmdCopyImageToBuffer(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, d->b, 1, &c); vk_img_barrier_all(cb);
++    g_m70acp_n++; g_m70a_copies++;
++    return 1;
++}
++static int m70a_cur_col(uint64_t *pool, int64_t *off) {   // 当前 pass 的第一个颜色目标（只看状态影子，不创建/刷新图像）
++    int ci = 0; while (ci < S.ncol && ci < 8 && !S.rt_has_col[ci]) ci++;
++    if (!(S.ncol && ci < S.ncol && ci < 8 && S.rt_has_col[ci])) return 0;
++    *pool = (uint64_t)(uintptr_t)S.rt_col[ci].pool; *off = S.rt_col[ci].off; return 1;
++}
++static int m70a_armed_now(void) {   // 这一笔落在被武装的 pass 里吗（pass 号 + 尺寸 + 颜色目标 pool+off 三重确认）
++    if (!g_m70a_armed || S.pass_open != 1) return 0;
++    if (g_sub_pass - 1 != g_m70a_arm_pass) return 0;
++    if ((int)S.pass_w != g_m70a_arm_pw || (int)S.pass_h != g_m70a_arm_ph) return 0;
++    uint64_t pool = 0; int64_t off = -1;
++    if (m70a_cur_col(&pool, &off) && g_m70a_arm_off >= 0 && (off != g_m70a_arm_off || pool != g_m70a_arm_pool)) return 0;
++    return 1;
++}
++static int m70a_manual_now(void) {   // bit3 手动指定：pass 号和/或颜色目标 offset
++    if (!(vk_m70a_mode() & 8) || S.pass_open != 1) return 0;
++    if (g_m70a_mpass < 0 && (!g_m70a_moff_set || g_m70a_moff < 0)) return 0;
++    if (g_m70a_mpass >= 0 && g_sub_pass - 1 != g_m70a_mpass) return 0;
++    if (g_m70a_moff_set && g_m70a_moff >= 0) { uint64_t pool = 0; int64_t off = -1; if (!m70a_cur_col(&pool, &off) || off != g_m70a_moff) return 0; }
++    return 1;
++}
++static int m70a_detail_on(void) { return m70a_armed_now() || m70a_manual_now(); }
++static void m70a_draw(int prim, uint32_t count, uint32_t inst, int indexed, uint64_t ibuf, int itype, int basev, uint32_t first, int isind) {
++    const int m = vk_m70a_mode(); if (!(m & (4 | 8))) return;
++    if (!m70a_detail_on()) return;
++    if (g_m70a_draws_in_pass >= 64) return;
++    const int idx = ++g_m70a_draws_in_pass;
++    const blend_st *bl = &S.blend[0];
++    VKLOG("[m70a-draw] f=%llu p=%d i=%d kind=%s prim=%d n=%u inst=%u vp=%.1f %.1f %.1f %.1f sc=%d %d %d %d blend_en=%#x bl0(tgt=%d src=%d dst=%d srca=%d dsta=%d eq=%d eqa=%d) dt=%d dw=%d df=%d cull=%d front=%d mode=%d sh0=%016llx sh1=%016llx sh2=%016llx vb0=%#llx+%llu ib=%#llx itype=%d basev=%d first=%u ncol=%d cfmt0=%d ind=%d",
++          (unsigned long long)g_tex_frame, g_sub_pass - 1, idx, indexed ? "idx" : "arr", prim, count, inst,
++          S.vp[0][0], S.vp[0][1], S.vp[0][2], S.vp[0][3], S.sc.x, S.sc.y, S.sc.w, S.sc.h,
++          S.color.blend_en, (int)bl->target, (int)bl->src_rgb, (int)bl->dst_rgb, (int)bl->src_a, (int)bl->dst_a, (int)bl->eq_rgb, (int)bl->eq_a,
++          (int)S.ds.dt, (int)S.ds.dw, (int)S.ds.df, (int)S.poly.cull, (int)S.poly.front, (int)S.poly.mode,
++          (unsigned long long)(S.sh[0] ? S.sh[0]->key : 0), (unsigned long long)(S.sh[1] ? S.sh[1]->key : 0), (unsigned long long)(S.sh[2] ? S.sh[2]->key : 0),
++          (unsigned long long)S.vbuf[0].address, (unsigned long long)S.vbuf[0].size, (unsigned long long)ibuf, itype, basev, first,
++          S.ncol, (int)S.cfmt[0], isind);
++    m69a_ubo_dump(idx);   // 复用 M69A 的 UBO/SSBO 原样（[m69a-ubo]/[m69a-sbuf]，宿主侧做 CPU 的 M·v / 找 scale）
++    { vkshader_t *vsh = S.sh[0]; if (vsh) VKLOG("[m70a-locs] f=%llu i=%d in=%#x out=%#x sam=%#x", (unsigned long long)g_tex_frame, idx, vsh->local[0], vsh->local[1], vsh->local[2]); }
++    if (isind) VKLOG("[m70a-draw] f=%llu i=%d indirect: count/instances live in GPU memory, no vertex dump", (unsigned long long)g_tex_frame, idx);
++    else m69a_vtx_dump(idx, indexed, ibuf, itype, basev, first, count);   // [m69a-attr]/[m69a-vw]/[m69a-idx]：顶点原样（位置/UV/世界位置+scale）
++}
++static void m70a_bind(int st, const dmsv_bind *b, uint64_t h, VkDescriptorImageInfo *ii, vkimg_t *im) {   // 武装 pass 的贴图/采样器
++    const int m = vk_m70a_mode(); if (!(m & (4 | 8)) || !im) return;
++    if (!m70a_detail_on()) return;
++    static int n; if (n >= 240) return; n++;
++    char sd[256]; m67a_samp_text(sd, sizeof sd);
++    VKLOG("[m70a-tex] f=%llu p=%d i=%d st=%d binding=%d samp=%d handle=%#llx: img=%p pool=%#llx off=+%#llx..%#llx extent=%ux%u fmt=%d aspect=%#x levels=%u layers=%u d=%u gpu_w=%d view=%p | %s",
++          (unsigned long long)g_tex_frame, g_sub_pass - 1, g_m70a_draws_in_pass, st, b->binding, (int)b->samp, (unsigned long long)h,
++          (void *)im, (unsigned long long)im->pool, (unsigned long long)im->off, (unsigned long long)(im->off + im->size), im->w, im->h, (int)im->fmt,
++          (unsigned)im->aspect, im->levels, im->layers, im->d, im->gpu_w, (void *)ii->imageView, sd);
++}
++static void m70a_pass_end(void) {   // pass 结束：元数据 / 颜色目标统计 / 帧边界上的武装与收尾
++    const int m = vk_m70a_mode(); if (!m) return;
++    m70a_poll(mtl_last_fence());
++    const int p = g_sub_pass - 1;
++    if (p <= g_m70a_last_pass) {   // 帧边界：pass 号回到 1（g_tex_frame 在本 build 里恒 0，不能用它分帧）
++        g_m70a_frames++;
++        if ((m & 4) && !g_m70a_armed && g_m70a_detail_frames < 1 && g_m70a_cand_ok) {
++            g_m70a_armed = 1; g_m70a_arm_pass = g_m70a_cand_pass; g_m70a_arm_pw = (int)g_m70a_cand_w; g_m70a_arm_ph = (int)g_m70a_cand_h;
++            g_m70a_arm_pool = g_m70a_cand_pool; g_m70a_arm_off = g_m70a_cand_off; g_m70a_armed_nw = g_m70a_cand_nw; g_m70a_draws_in_pass = 0;
++            VKLOG("[m70a-arm] frame %d: pass %d (%dx%d, colour pool+off %#llx+%#llx, nearwhite %.2f%%) armed for per-draw detail",
++                  g_m70a_frames, g_m70a_arm_pass, g_m70a_arm_pw, g_m70a_arm_ph,
++                  (unsigned long long)g_m70a_arm_pool, (unsigned long long)g_m70a_arm_off, (double)g_m70a_armed_nw);
++        }
++        if (g_m70a_cand_ok && !(m & 4)) g_m70a_cand_ok = 0;
++    }
++    g_m70a_last_pass = p;
++    int ci = 0; while (ci < S.ncol && ci < 8 && !S.rt_has_col[ci]) ci++;
++    vkimg_t *c0 = (S.ncol && ci < S.ncol && ci < 8 && S.rt_has_col[ci]) ? vk_tex(&S.rt_col[ci]) : NULL;
++    if ((m & 2) && S.ncol && (g_m70a_frames <= 6 || m70a_armed_now()))
++        VKLOG("[m70a-pass] f=%llu p=%d %ux%u ncol=%d cfmt0=%d cfmt1=%d dfmt=%d hasdep=%d draws=%llu col%d=%#llx+%#llx %ux%u fmt=%d dep=%#llx+%#llx",
++              (unsigned long long)g_tex_frame, p, S.pass_w, S.pass_h, S.ncol, (int)S.cfmt[0], (int)S.cfmt[1], (int)S.dfmt, (int)S.rt_has_dep,
++              (unsigned long long)g_pass_draws, ci, (unsigned long long)(c0 ? c0->pool : 0), (unsigned long long)(c0 ? c0->off : 0),
++              c0 ? c0->w : 0, c0 ? c0->h : 0, c0 ? (int)c0->fmt : -1,
++              (unsigned long long)(uintptr_t)S.rt_dep.pool, (unsigned long long)S.rt_dep.off);
++    const int maxframes = m70a_ienv("DM_VK_M70A_FRAMES", 0);
++    if ((m & 1) && c0 && (uint64_t)c0->w * c0->h > 65536u && (maxframes <= 0 || g_m70a_frames <= maxframes)
++        && g_m70a_copies < m70a_ienv("DM_VK_M70A_MAXCP", 4000)) {
++        m70a_copy(c0);
++    }
++    if (!g_m70a_armed && g_m70a_draws_in_pass > 0) {   // 手动指定（bit3）：每条 pass 各自统计（不武装）
++        VKLOG("[m70a-arm] frame %d p=%d: manual pick detail, draws=%d %ux%u", g_m70a_frames, p, g_m70a_draws_in_pass, S.pass_w, S.pass_h);
++        g_m70a_draws_in_pass = 0;
++    }
++    if (m70a_armed_now()) {   // 被武装的 pass 结束：明细收尾（只记这一帧的这一条 pass）
++        VKLOG("[m70a-arm] frame %d p=%d: per-draw detail done, draws=%d (armed from colour nearwhite %.2f%% of pass %d %dx%d)",
++              g_m70a_frames, p, g_m70a_draws_in_pass, (double)g_m70a_armed_nw, g_m70a_arm_pass, g_m70a_arm_pw, g_m70a_arm_ph);
++        g_m70a_armed = 0; g_m70a_detail_frames++; g_m70a_draws_in_pass = 0; g_m70a_cand_ok = 0;
++    }
++}
++
++// ============================ M71A：雾/泛光链常量 A/B（默认关；smo_m71a → DM_VK_M71A）============================
++/* 派活单 §1：M70A 把两团白斑钉在「pass 71–80 的屏空间雾/亮度累加链」上，pass 71 的 FS（key 4761cab3adf56549，全帧只有这一条 pass 用它）
++   读一份 65536 B 的 c0 程序常量银行（[m69a-ubo] 实测：bank 头 12 个 float 就是 c0=(2.98912,5.86610,1.14478,-2)、c1=(100,0,0.06,10000)、
++   c2=(49.9975,-1,33.3317,-0.333333)）：out.rgb = col·c1[2]·(t²+luma)、t = clamp(f·c2[2] − 0.3333,0,1)。本块只做「仅本单生效」的替换：
++     bit0(1)  = c2[2] 减半（33.3317→16.66585）：雾项 t 的斜率，只压缩过渡带（远平面仍 clamp 到 1）
++     bit1(2)  = c1[2] 减半（0.06→0.03）：雾/亮度项的整体增益
++     bit2(4)  = 两者都减半
++     bit3(8)  = 末级（渲染面那一级：宽 16–40、高 8–24 = 40×22 / 25×14 / 20×11，随动态分辨率缩放；2×1 曝光与 128² 阴影不在内）
++                **每条 pass 的输出等比例压缩**：
++                blend src = CONSTANT_COLOR、dst = ZERO、add ⇒ out = DM_VK_M71A_BC·src（默认 0.55）。是「等比例压缩」不是 min 截断
++                （Vulkan 的 blend 不能取 min；派活单允许两者之一，实现方式在此写清）。纯 pass 状态改动，不碰游戏数据
++     bit4(16) = 诊断：把 pass 71 采样的 800×450 D32 深度在 pass 结束时 transfer copy 读回，算四档直方图（d≥0.999 / 0.9–0.999 /
++                0.5–0.9 / <0.5）——回答「这张深度是不是真的远平面饱和」
++   实现（bit0/1/2）不用 render pass 内的写内存（vkCmdUpdateBuffer 在 render pass 里非法）：在描述符构建处把 pass 71 的 FS 看到的
++   **那一份** c0 常量银行重定向到一块打了补丁的 scratch 副本（本 submission 内的 host-visible 环，vk_scratch），VS 与其它 pass 一律不动。
++   两个偏移先在 bank 头里按实测的 float 组合验证（100,0,0.06,10000 / 49.9975,-1,33.3317,-0.3333），对不上再在前 512 B 里按这个组合扫；
++   都对不上就一行 [m71a-miss] 并放弃（不猜）。全 0 = 零日志、零分配、零行为变化。 */
++#define M71A_FOG_FS 0x4761cab3adf56549ull
++static int g_m71a_ubo_lines, g_m71a_hist_n, g_m71a_bc_lines;
++static vkimg_t *g_m71a_dep; static uint64_t g_m71a_dep_sub; static int g_m71a_dep_ready;
++static uint64_t g_m71a_fog_sub, g_m71a_patched_sub;   // 这一帧 pass 71 画过没有 / 它的常量银行这一帧被改道过没有（两者不一致 = 银行不是走 cbuf_desc 绑的）
++float m71a_bconst(void) { const char *e = getenv("DM_VK_M71A_BC"); return e && *e ? (float)atof(e) : 0.55f; }
++int vk_m71a_mode(void) {
++    static int v = -1; static long last; long now = (long)time(NULL);
++    if (v >= 0 && now == last) return v;
++    last = now; const char *e = getenv("DM_VK_M71A"); v = e ? atoi(e) : 0;
++    { static int said = -1; if (v != said) { said = v; g_ubo_gen[1]++;   // 变档要让 stage 1 的描述符重算（否则 set memo 会把上一档的 set 直接复给这一帧）
++        VKLOG("[m71a-seg] knob now DM_VK_M71A=%d, 2 s cache (probe lines after this one belong to this variant)", v);
++        if (v > 0) VKLOG("[m71a] knob on (DM_VK_M71A=%d: c2[2]/2 %s, c1[2]/2 %s, both %s, last-stage x%g %s, 800x450 depth histogram %s)", v,
++                         (v & 1) ? "on" : "off", (v & 2) ? "on" : "off", (v & 4) ? "on" : "off", (double)m71a_bconst(), (v & 8) ? "on" : "off",
++                         (v & 16) ? "on" : "off");
++        if (v > 0) VKLOG("[m71a-seg] variant (pass 71 FS %016llx%s%s%s%s%s)", (unsigned long long)M71A_FOG_FS,
++                         (v & 1) ? ", c2[2]/2" : "", (v & 2) ? ", c1[2]/2" : "", (v & 4) ? ", both/2" : "", (v & 8) ? ", last-stage compressed" : "",
++                         (v & 16) ? ", depth histogram" : ""); } }
++    return v;
++}
++static int m71a_near(float a, float bb) { float d = a - bb; if (d < 0) d = -d; float s = bb < 0 ? -bb : bb; return d <= (s > 1.f ? s * 2e-5f : 1e-6f); }
++static int m71a_ubo_patch(int st, const vkshader_t *s, const dmsv_bind *b, VkDescriptorBufferInfo *bi) {
++    const int m = vk_m71a_mode(); if (!((m & 7) && st == 1 && s && s->key == M71A_FOG_FS)) return 0;
++    const p_bind_buf *u = b->reg >= 0 && b->reg < 16 ? &S.ubo[st][b->reg] : NULL;
++    if (!u || !u->addr || u->size < 64) return 0;
++    void vk_ubd_read(uint64_t a, uint64_t n, uint8_t *dst);
++    float f[128]; const uint64_t nread = u->size < sizeof f ? u->size : sizeof f;
++    memset(f, 0, sizeof f); vk_ubd_read(u->addr, nread, (uint8_t *)f);
++    int o1 = -1, o2 = -1;   // c1[2]（0.06）与 c2[2]（33.3317）在银行里的字节偏移
++    if (m71a_near(f[4], 100.f) && m71a_near(f[7], 10000.f) && m71a_near(f[6], 0.06f) && m71a_near(f[8], 49.9975f) && m71a_near(f[10], 33.331665f) && m71a_near(f[11], -0.3333333f)) { o1 = 24; o2 = 40; }
++    else for (int i = 2; i < (int)(nread / 4) - 2; i++) {
++        if (o1 < 0 && m71a_near(f[i], 0.06f) && m71a_near(f[i - 2], 100.f) && m71a_near(f[i + 2], 10000.f)) o1 = i * 4;
++        if (o2 < 0 && m71a_near(f[i], 33.331665f) && m71a_near(f[i - 2], 49.9975f) && m71a_near(f[i + 2], -0.3333333f)) o2 = i * 4;
++    }
++    const int want1 = (m & 2) || (m & 4), want2 = (m & 1) || (m & 4);
++    if ((want1 && o1 < 0) || (want2 && o2 < 0)) {
++        if (g_m71a_ubo_lines < 4) { g_m71a_ubo_lines++;
++            VKLOG("[m71a-miss] pass 71 FS %016llx bank=%#llx+%llu: c1[2]@%d c2[2]@%d (wanted %d/%d) are not where the pattern says; not patched. head floats: %g %g %g %g | %g %g %g %g | %g %g %g %g",
++                  (unsigned long long)M71A_FOG_FS, (unsigned long long)u->addr, (unsigned long long)u->size, o1, o2, want1, want2,
++                  (double)f[0], (double)f[1], (double)f[2], (double)f[3], (double)f[4], (double)f[5], (double)f[6], (double)f[7], (double)f[8], (double)f[9], (double)f[10], (double)f[11]); }
++        return 0;
++    }
++    const uint64_t n = u->size > 65536 ? 65536 : u->size; VkBuffer sb; VkDeviceSize so;
++    uint8_t *d = vk_scratch(n, V.props.limits.minUniformBufferOffsetAlignment, &sb, &so);
++    vk_ubd_read(u->addr, n, d);
++    float v1 = 0, v2 = 0, *p1 = (float *)(d + o1), *p2 = (float *)(d + o2);
++    if (want1 && o1 >= 0) { v1 = *p1; *p1 = v1 * 0.5f; }
++    if (want2 && o2 >= 0) { v2 = *p2; *p2 = v2 * 0.5f; }
++    bi->buffer = sb; bi->offset = so; bi->range = n; g_m71a_patched_sub = mtl_last_fence() + 1;
++    if (g_m71a_ubo_lines < 8) { g_m71a_ubo_lines++;
++        VKLOG("[m71a-ubo] pass 71 FS %016llx bank=%#llx+%llu n=%llu: c1[2] +%d %g->%g, c2[2] +%d %g->%g (this draw reads a patched copy; no other pass/stage is touched)",
++              (unsigned long long)M71A_FOG_FS, (unsigned long long)u->addr, (unsigned long long)u->size, (unsigned long long)n,
++              o1, (double)v1, (double)(want1 && o1 >= 0 ? v1 * 0.5f : v1), o2, (double)v2, (double)(want2 && o2 >= 0 ? v2 * 0.5f : v2)); }
++    return 1;
++}
++static void m71a_bind(int st, const dmsv_bind *b, uint64_t h, VkDescriptorImageInfo *ii, vkimg_t *im) {   // 记下 pass 71 这一帧画过；bit4 还要它采样的那张 800×450 D32
++    const int m = vk_m71a_mode(); if (!(m && im && st == 1 && S.sh[1] && S.sh[1]->key == M71A_FOG_FS)) return;
++    g_m71a_fog_sub = mtl_last_fence() + 1;
++    if (!(m & 16) || !(im->aspect & VK_IMAGE_ASPECT_DEPTH_BIT)) return;
++    if (im->w != 800 || im->h != 450) { static int other; if (!other) { other = 1;
++        VKLOG("[m71a-depth] pass 71 samples a %ux%u depth (not the expected 800x450): the histogram will not read it", im->w, im->h); } return; }
++    if (g_m71a_dep != im) { g_m71a_dep = im;
++        VKLOG("[m71a-depth] pass %d binds its 800x450 D32: img=%p pool=%#llx off=+%#llx..%#llx fmt=%d aspect=%#x levels=%u layers=%u (sampled at binding %d)",
++              g_sub_pass - 1, (void *)im->img, (unsigned long long)im->pool, (unsigned long long)im->off, (unsigned long long)(im->off + im->size),
++              (int)im->fmt, (unsigned)im->aspect, im->levels, im->layers, b->binding); }
++    g_m71a_dep_sub = mtl_last_fence() + 1; g_m71a_dep_ready = 1;
++}
++typedef struct { VkBuffer b; VkDeviceMemory m; void *p; uint32_t w, h, bpp; VkFormat f; uint64_t fence; } m71ahcp_t;
++static m71ahcp_t g_m71ahcp[8]; static int g_m71ahcp_n;
++static void m71a_hist_poll(uint64_t done_fence) {
++    int keep = 0;
++    for (int i = 0; i < g_m71ahcp_n; i++) {
++        m71ahcp_t *d = &g_m71ahcp[i];
++        if (!d->b) continue;
++        if (done_fence < d->fence) { g_m71ahcp[keep++] = *d; continue; }
++        const uint64_t np = (uint64_t)d->w * d->h; uint64_t far = 0, a = 0, bb = 0, c = 0; double sum = 0; float lo = 1e9f, hi = -1e9f;
++        for (uint64_t q = 0; q < np; q++) {
++            float v = d->bpp == 2 ? half2f(((const uint16_t *)d->p)[q]) : ((const float *)d->p)[q];
++            if (!(v == v)) v = 0.f;
++            sum += v; if (v < lo) lo = v; if (v > hi) hi = v;
++            if (v >= 0.999f) far++; else if (v >= 0.9f) a++; else if (v >= 0.5f) bb++; else c++;
++        }
++        if (np) VKLOG("[m71a-hist] pass 71's sampled %ux%u depth (fmt=%d): d>=0.999 %.2f%% | 0.9-0.999 %.2f%% | 0.5-0.9 %.2f%% | <0.5 %.2f%% (min %.6f max %.6f mean %.6f)",
++                      d->w, d->h, (int)d->f, 100.0 * (double)far / (double)np, 100.0 * (double)a / (double)np, 100.0 * (double)bb / (double)np, 100.0 * (double)c / (double)np,
++                      (double)lo, (double)hi, sum / (double)np);
++        vkDestroyBuffer(V.dev, d->b, NULL); vkFreeMemory(V.dev, d->m, NULL); memset(d, 0, sizeof *d);
++    }
++    g_m71ahcp_n = keep;
++}
++static void m71a_pass_end(void) {
++    const int m = vk_m71a_mode(); if (!m) return;
++    if ((m & 8) && g_m71a_bc_lines < 4 && g_m71a_bc) { g_m71a_bc_lines++;
++        VKLOG("[m71a-bc] pass %d (%ux%u, %d draws so far, colour write mask %#x): last-stage outputs compressed x%g (blend src=CONSTANT_COLOR dst=ZERO)", g_sub_pass - 1, S.pass_w, S.pass_h,
++              (int)g_pass_draws, S.chmask.mask, (double)m71a_bconst()); }
++    if ((m & 7) && g_m71a_fog_sub == mtl_last_fence() + 1 && g_m71a_patched_sub != mtl_last_fence() + 1) {   // 改道没发生 ⇒ 银行不是走 cbuf_desc 绑的（否则就是 pattern 没对上，那行由 [m71a-miss] 报）
++        static int said; if (!said && g_m71a_ubo_lines == 0) { said = 1;
++            VKLOG("[m71a-nobank] pass 71 drew this submission, but none of its constant-buffer descriptors went through cbuf_desc: c1[2]/c2[2] were NOT patched"); } }
++    if (!(m & 16)) return;
++    m71a_hist_poll(mtl_last_fence());
++    if (g_m71a_dep_ready && g_m71a_dep && g_m71a_dep->img && g_m71a_dep_sub == mtl_last_fence() + 1 && g_m71a_hist_n < 24 && g_m71ahcp_n < 8) {
++        g_m71a_dep_ready = 0;
++        vkimg_t *im = g_m71a_dep;
++        const uint32_t bpp = im->fmt == VK_FORMAT_D16_UNORM ? 2u : 4u; const VkDeviceSize n = (VkDeviceSize)im->w * im->h * bpp;
++        m71ahcp_t *d = &g_m71ahcp[g_m71ahcp_n]; memset(d, 0, sizeof *d);
++        d->w = im->w; d->h = im->h; d->bpp = bpp; d->f = im->fmt; d->fence = mtl_last_fence() + 1;
++        VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, n, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE};
++        int ok = vkCreateBuffer(V.dev, &bi, NULL, &d->b) == VK_SUCCESS;
++        if (ok) { VkMemoryRequirements rq; vkGetBufferMemoryRequirements(V.dev, d->b, &rq);
++            VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, rq.size, vk_mem_type(rq.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, 0)};
++            ok = !vkAllocateMemory(V.dev, &ai, NULL, &d->m) && !vkBindBufferMemory(V.dev, d->b, d->m, 0) && !vkMapMemory(V.dev, d->m, 0, VK_WHOLE_SIZE, 0, &d->p); }
++        if (!ok) { if (d->m) vkFreeMemory(V.dev, d->m, NULL); if (d->b) vkDestroyBuffer(V.dev, d->b, NULL); d->b = VK_NULL_HANDLE; d->m = VK_NULL_HANDLE; d->p = NULL; return; }
++        VkCommandBuffer cb = vk_cmd(); vk_img_barrier_all(cb);
++        VkBufferImageCopy c = {0, 0, 0, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {0, 0, 0}, {d->w, d->h, 1}};
++        vkCmdCopyImageToBuffer(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, d->b, 1, &c); vk_img_barrier_all(cb);
++        g_m71ahcp_n++; g_m71a_hist_n++;
++    }
++}
++
++// ============================ M73A：pass 71 的 z→视距换算式重标定（默认关；smo_m73a → DM_VK_M73A）============================
++/* 派活单（2026-11-12 11:20）：M72A 已证明那张 800×450 D32 **就是场景深度本身**（0.9–0.999 是 f/n≈10⁴ 投影下的正常落位，
++   0.5–0.9 与 <0.5 两档构造上永远为空），白斑的物理入口在 **pass 71**（200×112 / 320×180，1 笔全屏三角形，FS 4761cab3adf56549）
++   把 z 换算成视距的那一步 + t 的二值化。M70A 的 SPIR-V 反汇编给出这一步的完整数学：
++     d   = tex(binding1, uv).x                                        （800×450 D32 场景深度，落在 0.9698…1.0）
++     h   = 1/(1 − d·c4[0]) − 1                                        （c4[0]=0.99995, c4[1]=5.0003e-05）
++     f   = c4[1]·h
++     t   = clamp(f·c2[2] + c2[3], 0, 1)                               （c2[2]=33.3317, c2[3]=−0.3333）
++     out.rgb = col.rgb · c1[2] · (t² + luma)、out.a = col.a · 同一系数  （c1[2]=0.06；luma = clamp(dot(col,c0)))
++   把投影的 d =(f/(f−n))·(1 − n/z) 代进 h：1−d = (n/(f−n))·(f/z − 1) ⇒ **h ≈ z/n − 1、f ≈ z/20000**（n=1、far=10000 时
++   c4 的两个系数正好是 1−n/far=0.9999 与 1/far=1e-4 的近似）。⇒ t = 0 在 z≈200 单位、t = 1 在 z≈741 单位：
++   实测帧里 d≥0.999（z≳1000，天穹 + 月亮）的 38.71% 像素 **t 恒 1**，d 在 0.9698–0.994（z≈33–200，雪丘/马里奥/白塔）的
++   61.29% 像素 **t 恒 0**，过渡带只剩 d∈[0.995,0.999] 一条细缝 ⇒ 雾项在整块天穹上二值饱和，被下游 8 级累加放大成两团白斑。
++   本块**只改 pass 71 的 FS 常量银行**（不碰深度图/场景 pass/几何/分辨率，不碰其它 pass 或阶段）：把这条 draw 的 FS 常量银行
++   重定向到打了补丁的 scratch 副本（`vk_scratch`；render pass 里不能 vkCmdUpdateBuffer），按预设置位改 5 个 float：
++     c1[2]（增益） / c2[2]（斜率 A） / c2[3]（偏置 B） / c4[0] / c4[1]（后两个 = 双曲反演的两个系数）。
++   预设 = smo_m73a 的 bit（都可 2 s 热切；变一次打一行 [m73a-seg]，之后每笔 draw 打在 [m73a-ubo]）：
++     bit0(1)  双曲反演按投影做**精确**：c4 = (1−n/far, 1/far) = (0.9999, 1e-4)（far 取银行里的 c1[3]=10000、near=1），
++               f 因此翻倍 ⇒ A 减半成 16.665825，t 的零点/满点仍落在 z≈200/800（= 基线但反演形式正确、不再用 0.99995 那笔压缩）；
++     bit1(2)  远平面压缩项按 far 动态（同 bit0 的 c4）+ **只雾真远**：t 重标到 z∈[700,2500]（A=5.555556, B=−0.388889）
++               ⇒ 场景带 33–200 一律 t=0，天穹仍有连续梯度直到 z≈2500 才夹到 1；
++     bit2(4)  线性视距插值：t = clamp((z−50)/(800−50))（保持原 c4；f≈z/2e4 ⇒ A=26.666667, B=−0.0666667）；
++     bit3(8)  取消饱和（放弃夹到 1）：t = 0.30·f（A=0.30, B=0）⇒ 天穹最高 0.30、t² 从 1 降到 0.09，仍随视距连续变化；
++     bit4(16) bit1 + 增益 c1[2] 0.06→0.045（同一 pass 的常量，一起做「远雾 + 电平」联合臂）；
++     bit5(32) 只压增益 c1[2] 0.06→0.045（对照臂：把「症状级电平」与「换算式」分开计量）。
++   另有一条字符串开关 `smo_m73a_p = "A B gain [c4_0 c4_1]"`：非空就覆盖上面的 A/B/gain（给了后两项再覆盖 c4），
++   用来在**同一个 build** 里细扫 fog_near/far，不必为每一档再 build 一次。全 0 = 零日志、零分配、零行为变化。 */
++typedef struct { float A, B, gain, c40, c41; } m73p_t;
++static m73p_t g_m73p; static int g_m73a_lines;   // g_m73p = 当前生效的 5 个 float（vk_m73a_mode 每次重读时写）
++static void m73a_preset(int m, m73p_t *p) {   // 基线（c4 原样、A/B/gain 原值），再按 bit 叠
++    p->A = 33.331665f; p->B = -0.3333333f; p->gain = 0.06f; p->c40 = 0.f; p->c41 = 0.f;
++    if (m & 1)  { p->c40 = 0.9999f; p->c41 = 1e-4f; p->A = 16.665825f; }
++    if (m & 2)  { p->c40 = 0.9999f; p->c41 = 1e-4f; p->A = 5.555556f; p->B = -0.3888889f; }
++    if (m & 4)  { p->A = 26.666667f; p->B = -0.0666667f; }
++    if (m & 8)  { p->A = 0.30f; p->B = 0.f; }
++    if (m & 16) { p->c40 = 0.9999f; p->c41 = 1e-4f; p->A = 5.555556f; p->B = -0.3888889f; p->gain = 0.045f; }
++    if (m & 32) { p->gain = 0.045f; }
++}
++int vk_m73a_mode(void) {
++    static int v = -1, last = 0, have = 0; static m73p_t prev;
++    const long now = (long)time(NULL);
++    if (v >= 0 && now == last) return v;
++    last = now;
++    const char *e = getenv("DM_VK_M73A"); const int nv = e ? atoi(e) : 0;
++    const char *s = getenv("DM_VK_M73A_P");
++    float fv[5]; int nf = 0;
++    if (s && *s) { const char *q = s; while (*q && nf < 5) { char *end = NULL; const float x = (float)strtod(q, &end); if (end == q) break; fv[nf++] = x; q = end; } }
++    const int on = nv > 0 || nf >= 3;
++    m73p_t p; m73a_preset(nv, &p);
++    if (nf >= 3) { p.A = fv[0]; p.B = fv[1]; p.gain = fv[2]; if (nf >= 5) { p.c40 = fv[3]; p.c41 = fv[4]; } }
++    if (!on) {
++        v = 0;
++        if (have) { have = 0; g_ubo_gen[1]++; VKLOG("[m73a-seg] off (DM_VK_M73A=0, no override): pass 71 reads the game's own constants again"); }
++        return 0;
++    }
++    v = nv > 0 ? nv : 64;   // 64 = 只用字符串覆盖（没有预设 bit）
++    g_m73p = p;             // ← 打补丁用的是这一份（少了这句，patch 会把 5 个 float 全写成 0 = 雾项整块熄掉）
++    if (!have || memcmp(&prev, &p, sizeof p)) {
++        have = 1; prev = p; g_ubo_gen[1]++;   // 变档要让 stage 1 的描述符重算（否则 set memo 会把上一档的 set 直接复给这一帧）
++        VKLOG("[m73a-seg] pass 71 FS constants: A=%g B=%g gain=%g c4=%s (bits=%d override=\"%s\"); every [m73a-*] line after this one belongs to this variant",
++              (double)p.A, (double)p.B, (double)p.gain, p.c40 > 0.f ? "patched(1-n/far,1/far)" : "game's", nv, s && *s ? s : "");
++    }
++    return v;
++}
++static int m73a_ubo_patch(int st, const vkshader_t *s, const dmsv_bind *b, VkDescriptorBufferInfo *bi) {
++    const int m = vk_m73a_mode(); if (!m || st != 1 || !s || s->key != M71A_FOG_FS) return 0;
++    const p_bind_buf *u = b->reg >= 0 && b->reg < 16 ? &S.ubo[st][b->reg] : NULL;
++    if (!u || !u->addr || u->size < 80) return 0;
++    void vk_ubd_read(uint64_t a, uint64_t n, uint8_t *dst);
++    float f[128]; const uint64_t nread = u->size < sizeof f ? u->size : sizeof f;
++    memset(f, 0, sizeof f); vk_ubd_read(u->addr, nread, (uint8_t *)f);
++    int o1 = -1, o2 = -1;   // c1[2]（0.06）与 c2[2]（33.3317）在银行里的字节偏移
++    if (m71a_near(f[4], 100.f) && m71a_near(f[7], 10000.f) && m71a_near(f[6], 0.06f) && m71a_near(f[8], 49.9975f) && m71a_near(f[10], 33.331665f) && m71a_near(f[11], -0.3333333f)) { o1 = 24; o2 = 40; }
++    else for (int i = 2; i < (int)(nread / 4) - 2; i++) {
++        if (o1 < 0 && m71a_near(f[i], 0.06f) && m71a_near(f[i - 2], 100.f) && m71a_near(f[i + 2], 10000.f)) o1 = i * 4;
++        if (o2 < 0 && m71a_near(f[i], 33.331665f) && m71a_near(f[i - 2], 49.9975f) && m71a_near(f[i + 2], -0.3333333f)) o2 = i * 4;
++    }
++    if (o1 < 0 || o2 < 0 || o2 + 32 > (int)nread) {
++        if (g_m73a_lines < 4) { g_m73a_lines++;
++            VKLOG("[m73a-miss] pass 71 bank=%#llx+%llu: c1[2]@%d c2[2]@%d are not where the pattern says; not patched (head floats %g %g %g %g | %g %g %g %g | %g %g %g %g)",
++                  (unsigned long long)u->addr, (unsigned long long)u->size, o1, o2,
++                  (double)f[0], (double)f[1], (double)f[2], (double)f[3], (double)f[4], (double)f[5], (double)f[6], (double)f[7], (double)f[8], (double)f[9], (double)f[10], (double)f[11]); }
++        return 0;
++    }
++    const int i2 = o2 / 4;   // c4[0]/c4[1] 紧跟 c3 之后 = c2 起点 + 24 B/+32 B；先按实测值验，不符就只改 t 曲线不动 c4
++    const int c4ok = (i2 + 7 < (int)(nread / 4)) && f[i2 + 6] > 0.98f && f[i2 + 6] < 1.01f && f[i2 + 7] > 1e-6f && f[i2 + 7] < 1e-3f;
++    const uint64_t n = u->size > 65536 ? 65536 : u->size; VkBuffer sb; VkDeviceSize so;
++    uint8_t *d = vk_scratch(n, V.props.limits.minUniformBufferOffsetAlignment, &sb, &so);
++    vk_ubd_read(u->addr, n, d);
++    float *pa = (float *)(d + o2), *pg = (float *)(d + o1);
++    const float oldA = pa[0], oldB = pa[1], oldG = *pg;
++    pa[0] = g_m73p.A; pa[1] = g_m73p.B; *pg = g_m73p.gain;
++    if (g_m73p.c40 > 0.f && c4ok) { float *pc = (float *)(d + o2 + 24); pc[0] = g_m73p.c40; pc[1] = g_m73p.c41; }
++    bi->buffer = sb; bi->offset = so; bi->range = n;
++    if (g_m73a_lines < 64) { g_m73a_lines++;
++        VKLOG("[m73a-ubo] pass 71 FS %016llx bank=%#llx+%llu n=%llu: gain c1[2]+%d %g->%g, A c2[2]+%d %g->%g, B c2[3]+%d %g->%g, c4[0/1]+%d %s (c4 usable=%d) — this draw reads a patched copy; VS and every other pass untouched",
++              (unsigned long long)M71A_FOG_FS, (unsigned long long)u->addr, (unsigned long long)u->size, (unsigned long long)n,
++              o1, (double)oldG, (double)g_m73p.gain, o2, (double)oldA, (double)g_m73p.A, o2 + 4, (double)oldB, (double)g_m73p.B,
++              o2 + 24, g_m73p.c40 > 0.f ? (c4ok ? "patched" : "WANTED but pattern off") : "game's", c4ok); }
++    if (g_m73a_lines < 64 && g_m73p.c40 > 0.f && c4ok) { g_m73a_lines++;
++        VKLOG("[m73a-c4] pass 71 FS %016llx: c4[0] %g->%g, c4[1] %g->%g (the hyperbolic inversion is now 1/(1-d*c4[0])*c4[1], then A/B above)",
++              (unsigned long long)M71A_FOG_FS, (double)f[i2 + 6], (double)g_m73p.c40, (double)f[i2 + 7], (double)g_m73p.c41); }
++    return 1;
++}
++
++// ============================ M72A：那张 800×450 D32 到底谁该写（默认关；smo_m72a → DM_VK_M72A）============================
++/* 派活单（2026-11-12 07:05）：雾链 pass 71 采样的那张 800×450 D32 直方图是「无几何」（d≥0.999 45.64% / 0.9–0.999 54.36% /
++   0.5–0.9 0% / <0.5 0%，min 0.98584 / mean 0.995937）——要分出「写错图 / 被 clear 覆盖 / 池别名同段」。本块只取证，不改任何
++   渲染状态（不碰描述符、不碰 loadOp、不碰内存）：
++     bit0(1) = pass 归属表（本窗口内每条 pass 一行）：深度附件的 pool+off / w×h / fmt / loadOp / clearDepth / storeOp，
++               本 pass 的 draw 数、逐 draw 的 depthTest/depthWrite/compare/bias 汇总，depth clear 次数（含没折叠成 loadOp 的
++               vkCmdClearAttachments 与它清成的值），以及颜色附件 #0 的身份；
++     bit1(2) = 深度读回：深度附件是 800×450（雾采样那张所在的尺寸类）的 pass 结束时 vkCmdCopyImageToBuffer 回读 → 四档直方图；
++     bit2(4) = 深度读回：其它 w≥512 的深度图在 pass 结束时同样回读 → 找「承载真实几何」的那一张；
++     bit3(8) = 采样归属：每条 pass 采样的 w≥512 深度图一行（谁采样谁）。
++   窗口按**提交号**（`mtl_last_fence() + 1`，与 M71A 同一个号）而不是 present 计数：本 build 里 `g_tex_frame` 恒 0（源码注释：
++   `g_tex_frame stays 0 for the whole run`），拿它当哨兵会让窗口永远关不上。第 3 轮（2026-11-12 10:10）的修法：
++   `m72a_samp` 认出「pass 71 采到了那张 800×450」时记下 `g_m72a_fog_sub`（= 那个提交号）；`m72a_pass_end` 在该提交的 pass-end
++   **武装一次**（`g_m72a_armed=1`、`g_m72a_arm_sub=` 该提交号），此后不再重复武装（上一轮 11.7 万行 `[m72a-arm]` 噪声就是每次
++   pass-end 重新武装来的）。窗口 = 提交号 `[arm_sub, arm_sub + M72A_WIN)` = 雾链帧剩余 pass + 下一整帧（含「场景 color pass 写
++   深度 → pass 71 采样」的完整顺序）。全 0 = 零日志、零分配、零读回。 */
++#define M72A_FOG_FS 0x4761cab3adf56549ull   // pass 71 的 FS（M70A/M71A 已钉：全帧只有这条 pass 用它）
++enum { M72A_WIN = 2, M72A_PASS_MAX = 1600, M72A_HIST_A = 60, M72A_HIST_B = 22, M72A_HIST_BIG = 10, M72A_SAMP_MAX = 200, M72A_IMG_MAX = 48 };   // M72A_WIN 现在是**提交数**（2 = 雾链帧剩余 + 下一整帧）
++static int g_m72a_passn, g_m72a_sampn, g_m72a_imgn, g_m72a_hist_a, g_m72a_hist_b, g_m72a_hist_big;
++static uint64_t g_m72a_fog_sub;  // 这个提交号里 pass 71 真的采到了那张 800×450（决定性触发）
++static uint64_t g_m72a_arm_sub;  // 窗口的起点提交号；窗口 = [arm_sub, arm_sub + M72A_WIN)
++static int g_m72a_armed, g_m72a_arms;   // 只武装一次（最多两次：第一窗口一行 pass 都没打时再给一次机会）
++static vkimg_t *g_m72a_fogdep;   // pass 71 采样到的那张 800×450 D32（M70A/M71A 的 binding1）
++static int g_m72a_dw1, g_m72a_dt1, g_m72a_bias, g_m72a_clr; static uint32_t g_m72a_cmp; static float g_m72a_clrd;
++static float g_m72a_biasf, g_m72a_biasu;   // the polygon-offset factor/units of the last draw that had one (NVN's depth bias)
++int vk_m72a_mode(void) {
++    static int v = -1; static long last; long now = (long)time(NULL);
++    if (v >= 0 && now == last) return v;
++    last = now; const char *e = getenv("DM_VK_M72A"); v = e ? atoi(e) : 0;
++    { static int said = -1; if (v != said) { said = v;
++        VKLOG("[m72a-seg] knob now DM_VK_M72A=%d, 2 s cache (probe lines after this one belong to this variant)", v);
++        if (v > 0) VKLOG("[m72a] knob on (DM_VK_M72A=%d: pass census %s, read-back 800x450 depth %s, other depths %s, sampler census %s; the window is the submission that samples it + %d)",
++                         v, (v & 1) ? "on" : "off", (v & 2) ? "on" : "off", (v & 4) ? "on" : "off", (v & 8) ? "on" : "off", M72A_WIN - 1); } }
++    return v;
++}
++static int m72a_win(void) { const uint64_t s = mtl_last_fence() + 1; return g_m72a_armed && s >= g_m72a_arm_sub && s < g_m72a_arm_sub + M72A_WIN; }   // M72A r3: 提交号窗口（g_tex_frame 恒 0，不能用）
++void vk_m72a_img_note(const vkimg_t *im) {   // 一张深度图创建时一行：身份 + 重叠者（同 pool 的内存段，别名判定用）
++    if (!im || !(im->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) || im->w < 512 || g_m72a_imgn >= M72A_IMG_MAX) return;
++    g_m72a_imgn++;
++    char ov[256]; int k = 0; ov[0] = 0;
++    for (int i = 0; i < im->novl && k < (int)sizeof ov - 44; i++)
++        k += snprintf(ov + k, sizeof ov - (size_t)k, " +%#llx..%#llx/%ux%u/%d", (unsigned long long)im->ovl[i]->off,
++                      (unsigned long long)(im->ovl[i]->off + im->ovl[i]->size), im->ovl[i]->w, im->ovl[i]->h, (int)im->ovl[i]->fmt);
++    VKLOG("[m72a-img] sub=%llu %ux%u fmt=%d aspect=%#x levels=%u layers=%u pool=%#llx off=+%#llx..+%#llx size=%#llx img=%p mem=%p sub=%p novl=%d overlap:%s",
++          (unsigned long long)(mtl_last_fence() + 1), im->w, im->h, (int)im->fmt, (unsigned)im->aspect, im->levels, im->layers,
++          (unsigned long long)im->pool, (unsigned long long)im->off, (unsigned long long)(im->off + im->size), (unsigned long long)im->size,
++          (void *)im->img, (const void *)im->mem, im->sub, im->novl, ov[0] ? ov : " -");
++}
++enum { M72A_D32 = 0, M72A_D16 = 1, M72A_D24 = 2, M72A_D32S8 = 3 };
++static float m72a_val(int cls, const uint8_t *row, size_t i) {
++    switch (cls) {
++    case M72A_D16: return (float)((const uint16_t *)row)[i] / 65535.f;
++    case M72A_D24: return (float)(((const uint32_t *)row)[i] & 0xffffffu) / 16777215.f;
++    case M72A_D32S8: { float v; memcpy(&v, row + 8 * i, 4); return v; }
++    default: { float v; memcpy(&v, row + 4 * i, 4); return v; }
++    }
++}
++typedef struct { VkBuffer b; VkDeviceMemory m; void *p; uint32_t w, h; int cls; VkFormat f; uint64_t fence, present, draws; int pass; int64_t off; uint64_t pool; char tag[4]; } m72acp_t;
++static m72acp_t g_m72acp[8]; static int g_m72acp_n;
++static void m72a_poll(uint64_t done_fence) {
++    int keep = 0;
++    for (int i = 0; i < g_m72acp_n; i++) {
++        m72acp_t *d = &g_m72acp[i]; if (!d->b) continue;
++        if (done_fence < d->fence) { g_m72acp[keep++] = *d; continue; }
++        const uint64_t np = (uint64_t)d->w * d->h; uint64_t far = 0, a = 0, bb = 0, c = 0; double sum = 0; float lo = 1e9f, hi = -1e9f;
++        for (uint64_t q = 0; q < np; q++) {
++            float v = m72a_val(d->cls, (const uint8_t *)d->p, (size_t)q);
++            if (!(v == v)) v = 0.f;
++            sum += v; if (v < lo) lo = v; if (v > hi) hi = v;
++            if (v >= 0.999f) far++; else if (v >= 0.9f) a++; else if (v >= 0.5f) bb++; else c++;
++        }
++        if (np) VKLOG("[m72a-hist] tag=%s sub=%llu p=%d draws=%llu dep={%#llx+%#llx %ux%u fmt=%d}: d>=0.999 %.2f%% | 0.9-0.999 %.2f%% | 0.5-0.9 %.2f%% | <0.5 %.2f%% (min %.6f max %.6f mean %.6f)",
++                      d->tag, (unsigned long long)d->present, d->pass, (unsigned long long)d->draws, (unsigned long long)d->pool, (unsigned long long)d->off,
++                      d->w, d->h, (int)d->f, 100.0 * (double)far / (double)np, 100.0 * (double)a / (double)np, 100.0 * (double)bb / (double)np, 100.0 * (double)c / (double)np,
++                      (double)lo, (double)hi, sum / (double)np);
++        vkDestroyBuffer(V.dev, d->b, NULL); vkFreeMemory(V.dev, d->m, NULL); memset(d, 0, sizeof *d);
++    }
++    g_m72acp_n = keep;
++}
++static void m72a_copy(vkimg_t *im, const char *tag) {
++    if (!im || !im->img || !im->w || !im->h || g_m72acp_n >= 8) return;
++    int cls = -1;
++    if (im->fmt == VK_FORMAT_D32_SFLOAT) cls = M72A_D32;
++    else if (im->fmt == VK_FORMAT_D16_UNORM) cls = M72A_D16;
++    else if (im->fmt == VK_FORMAT_X8_D24_UNORM_PACK32 || im->fmt == VK_FORMAT_D24_UNORM_S8_UINT) cls = M72A_D24;
++    else if (im->fmt == VK_FORMAT_D32_SFLOAT_S8_UINT) cls = M72A_D32S8;
++    if (cls < 0) { static int said; if (!said++) VKLOG("[m72a-hist] depth format %d cannot be decoded here: not read back", (int)im->fmt); return; }
++    const uint32_t bpp = cls == M72A_D16 ? 2u : cls == M72A_D32S8 ? 8u : 4u;
++    const VkDeviceSize n = (VkDeviceSize)im->w * im->h * bpp;
++    m72acp_t *d = &g_m72acp[g_m72acp_n]; memset(d, 0, sizeof *d);
++    d->w = im->w; d->h = im->h; d->cls = cls; d->f = im->fmt; d->fence = mtl_last_fence() + 1;
++    d->present = mtl_last_fence() + 1; d->draws = g_pass_draws; d->pass = g_sub_pass - 1; d->pool = im->pool; d->off = im->off;   // M72A r3: 记提交号（present 恒 0）
++    snprintf(d->tag, sizeof d->tag, "%s", tag);
++    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, n, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE};
++    if (vkCreateBuffer(V.dev, &bi, NULL, &d->b) != VK_SUCCESS) { d->b = VK_NULL_HANDLE; return; }
++    VkMemoryRequirements rq; vkGetBufferMemoryRequirements(V.dev, d->b, &rq);
++    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, rq.size, vk_mem_type(rq.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, 0)};
++    if (vkAllocateMemory(V.dev, &ai, NULL, &d->m) || vkBindBufferMemory(V.dev, d->b, d->m, 0) || vkMapMemory(V.dev, d->m, 0, VK_WHOLE_SIZE, 0, &d->p)) {
++        if (d->m) vkFreeMemory(V.dev, d->m, NULL); vkDestroyBuffer(V.dev, d->b, NULL); d->b = VK_NULL_HANDLE; d->m = VK_NULL_HANDLE; d->p = NULL; return; }
++    VkCommandBuffer cb = vk_cmd(); vk_img_barrier_all(cb);
++    VkBufferImageCopy c = {0, 0, 0, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {0, 0, 0}, {d->w, d->h, 1}};
++    vkCmdCopyImageToBuffer(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, d->b, 1, &c); vk_img_barrier_all(cb);
++    g_m72acp_n++;
++}
++void m72a_clear_note(float depth, int dmask) { g_m72a_clr++; if (dmask) g_m72a_clrd = depth; }
++void m72a_draw(int m) {
++    (void)m;
++    if (S.ds.dw) g_m72a_dw1++;
++    if (S.ds.dt) g_m72a_dt1++;
++    g_m72a_cmp |= 1u << (S.ds.df & 15u);
++    if (S.poly.offset_en) { g_m72a_bias++; g_m72a_biasf = S.pofs.factor; g_m72a_biasu = S.pofs.units; }
++}
++void m72a_samp(int st, const dmsv_bind *b, vkimg_t *im) {   // bit3：谁采样哪张深度（w≥512）；顺带认出 pass 71 采样的那张 800×450
++    if (!vk_m72a_mode() || !im || !(im->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) || im->w < 512) return;
++    /* M72A r3：认出「pass 71 真的采到了那张 800×450 深度」时记下**这个提交号**（窗口的起点，见 m72a_pass_end 的武装） */
++    if (st == 1 && im->w == 800 && im->h == 450 && S.sh[1] && S.sh[1]->key == M72A_FOG_FS) { g_m72a_fogdep = im; g_m72a_fog_sub = mtl_last_fence() + 1; }
++    if (!m72a_win() || g_m72a_sampn >= M72A_SAMP_MAX) return;
++    static struct { uint64_t s; int p; int64_t off; } seen[96]; static int nseen;   // 去重键用提交号（present 恒 0，两个帧会撞在一起）
++    const uint64_t sub = mtl_last_fence() + 1;
++    for (int i = 0; i < nseen; i++) if (seen[i].s == sub && seen[i].p == g_sub_pass - 1 && seen[i].off == im->off) return;
++    if (nseen < 96) { seen[nseen].s = sub; seen[nseen].p = g_sub_pass - 1; seen[nseen].off = im->off; nseen++; }
++    g_m72a_sampn++;
++    VKLOG("[m72a-samp] sub=%llu p=%d %ux%u stage=%d binding=%d samples dep {%#llx+%#llx..+%#llx %ux%u fmt=%d}%s",
++          (unsigned long long)sub, g_sub_pass - 1, S.pass_w, S.pass_h, st, b ? b->binding : -1,
++          (unsigned long long)im->pool, (unsigned long long)im->off, (unsigned long long)(im->off + im->size), im->w, im->h, (int)im->fmt,
++          im == g_m72a_fogdep ? " (the one pass 71 reads: the fog depth)" : "");
++}
++void m72a_pass_end(int m) {
++    vkimg_t *dep = (S.pass_open == 1 && S.daspect && P_ri.pDepthAttachment) ? P_att[8].im : NULL;
++    vkimg_t *c0 = (S.pass_open == 1 && P_ri.colorAttachmentCount && P_att[0].im) ? P_att[0].im : NULL;
++    const uint64_t sub = mtl_last_fence() + 1;   // 本提交号（M72A r3：窗口按它算，不用恒 0 的 g_tex_frame）
++    /* 窗口武装（M72A r3）：只在「pass 71 真的采到了那张 800×450 深度」的那个提交的 pass-end 武装**一次**，
++       窗口 = [arm_sub, arm_sub + M72A_WIN) 个提交；之后不再重复武装（上一轮每个 pass-end 都重新武装 ⇒ 11.7 万行噪声）。
++       兜底：第一窗口一行 pass 都没打出来（bit0 关着或窗口恰好空）时，等窗口过去再给一次机会，最多两次。 */
++    if (g_m72a_fog_sub && !g_m72a_armed) {
++        g_m72a_armed = 1; g_m72a_arms = 1; g_m72a_arm_sub = g_m72a_fog_sub;
++        g_m72a_passn = g_m72a_sampn = g_m72a_hist_a = g_m72a_hist_b = 0;
++        VKLOG("[m72a-arm] sub %llu: pass 71 sampled an 800x450 depth in this submission; submissions %llu..%llu are logged in full (pass census + depth read-back)",
++              (unsigned long long)g_m72a_arm_sub, (unsigned long long)g_m72a_arm_sub, (unsigned long long)(g_m72a_arm_sub + M72A_WIN - 1));
++    } else if (g_m72a_armed && g_m72a_arms < 2 && sub >= g_m72a_arm_sub + M72A_WIN && g_m72a_passn == 0) {
++        g_m72a_arms = 2; g_m72a_arm_sub = g_m72a_fog_sub;
++        g_m72a_sampn = g_m72a_hist_a = g_m72a_hist_b = 0;
++        VKLOG("[m72a-arm] sub %llu (second chance: the first window logged no pass line); submissions %llu..%llu are logged in full",
++              (unsigned long long)g_m72a_arm_sub, (unsigned long long)g_m72a_arm_sub, (unsigned long long)(g_m72a_arm_sub + M72A_WIN - 1));
++    }
++    const int win = m72a_win();
++    if (win && S.pass_open == 1 && (m & 1) && g_m72a_passn < M72A_PASS_MAX) {
++        static const char LO[] = "LCD";
++        const int lo = dep && P_da.loadOp < 3 ? (int)P_da.loadOp : 2;
++        g_m72a_passn++;
++        if (dep) {
++            VKLOG("[m72a-pass] sub=%llu p=%d %ux%u draws=%llu dw1=%d dt1=%d cmp=%#x bias=%d/%g,%g clears=%d clrd=%g | dep={%#llx+%#llx..+%#llx %ux%u fmt=%d load=%c clear=%g store=%d}%s | c0={%#llx+%#llx %ux%u fmt=%d}",
++                  (unsigned long long)sub, g_sub_pass - 1, S.pass_w, S.pass_h, (unsigned long long)g_pass_draws, g_m72a_dw1, g_m72a_dt1, g_m72a_cmp, g_m72a_bias, (double)g_m72a_biasf, (double)g_m72a_biasu,
++                  g_m72a_clr, (double)g_m72a_clrd, (unsigned long long)dep->pool, (unsigned long long)dep->off, (unsigned long long)(dep->off + dep->size),
++                  dep->w, dep->h, (int)dep->fmt, LO[lo], lo == 1 ? (double)P_da.clearValue.depthStencil.depth : 0.0, (int)P_da.storeOp,
++                  dep == g_m72a_fogdep ? " (the fog depth)" : "",
++                  c0 ? (unsigned long long)c0->pool : 0ull, c0 ? (unsigned long long)c0->off : 0ull, c0 ? c0->w : 0u, c0 ? c0->h : 0u, c0 ? (int)c0->fmt : -1);
++        } else {
++            VKLOG("[m72a-pass] sub=%llu p=%d %ux%u draws=%llu dw1=%d dt1=%d cmp=%#x bias=%d/%g,%g clears=%d clrd=%g | dep={-} | c0={%#llx+%#llx %ux%u fmt=%d}",
++                  (unsigned long long)sub, g_sub_pass - 1, S.pass_w, S.pass_h, (unsigned long long)g_pass_draws, g_m72a_dw1, g_m72a_dt1, g_m72a_cmp, g_m72a_bias, (double)g_m72a_biasf, (double)g_m72a_biasu,
++                  g_m72a_clr, (double)g_m72a_clrd, c0 ? (unsigned long long)c0->pool : 0ull, c0 ? (unsigned long long)c0->off : 0ull, c0 ? c0->w : 0u, c0 ? c0->h : 0u, c0 ? (int)c0->fmt : -1);
++        }
++    }
++    m72a_poll(mtl_last_fence());
++    if (win && dep && dep->img && dep->w >= 512 && dep->h >= 288) {
++        const int isfog = dep == g_m72a_fogdep || (dep->w == 800 && dep->h == 450);
++        if (isfog && (m & 2) && g_m72a_hist_a < M72A_HIST_A) { m72a_copy(dep, "A"); g_m72a_hist_a++; }
++        else if (!isfog && (m & 4)) {   // 其它候选：w≥1200 的大图（合成/scene 级）先吃自己的预算，再轮到 1024² 级联
++            if (dep->w >= 1200 && g_m72a_hist_big < M72A_HIST_BIG) { m72a_copy(dep, "Bbig"); g_m72a_hist_big++; }
++            else if (g_m72a_hist_b < M72A_HIST_B) { m72a_copy(dep, "B"); g_m72a_hist_b++; } }
++    }
++    g_m72a_dw1 = g_m72a_dt1 = g_m72a_bias = g_m72a_clr = 0; g_m72a_cmp = 0; g_m72a_clrd = -1.f; g_m72a_biasf = g_m72a_biasu = 0.f;
++}
++
+ static void draw(const p_draw *d) {
+     VkBuffer mcb = VK_NULL_HANDLE; VkDeviceSize mco = 0; if (mdi_group(d->mdi_cnt, d->ind, d->mdi_i, d->mdi_max, d->mdi_stride, 16, &mcb, &mco)) return;
+     int prim = d->prim;
+     // before prepare_draw, whose driver segment carries it (c0 + 0x644): set after it, each draw's segment had the draw before's. An indirect draw's is in GPU memory: 0
+     g_draw_binst = d->ind ? 0 : (uint32_t)d->base_instance;
+     if (!prepare_draw(prim == 7 ? 4 : prim, prim == 7)) return;
++    { int m72 = vk_m72a_mode(); if (m72) m72a_draw(m72); }   // M72A：逐 draw 的 depth 状态汇总（默认关）
+     if (g_shpass_on) shpass_draw_line(prim, (unsigned)d->count, (unsigned)d->instances);   // M51A: shadow candidate pass, one line per draw
++    if (vk_m69a_mode() & 1) m69a_draw(prim, (uint32_t)d->count, (uint32_t)d->instances, 0, 0, 0, 0, (uint32_t)d->first, d->ind ? 1 : 0);   // M69A: caster pass draw table (+ UBO/vertex dump)
++    if (vk_m70a_mode() & 12) m70a_draw(prim, (uint32_t)d->count, (uint32_t)d->instances, 0, 0, 0, 0, (uint32_t)d->first, d->ind ? 1 : 0);   // M70A: the armed pass's per-draw table
+     VkCommandBuffer cb = vk_cmd();
+     int g_ok = draw_allowed(); if (g_ok == 2 || (g_tracing && g_x_tracepass >= 0)) trace_draw("draw", d->prim, (uint32_t)d->count, (uint32_t)d->instances, -1);
+     if (g_tracing && g_x_tracepass >= 0 && !d->ind && S.vbuf[0].address) {   // the first vertices stream 0 gives the draw (with the deferred updates), every word as a float
+@@ -2456,6 +3527,8 @@
+     g_draw_binst = d->ind ? 0 : (uint32_t)d->base_instance;   // before prepare_draw (see draw)
+     if (!prepare_draw(prim == 7 ? 4 : prim, 1)) return;
+     if (g_shpass_on) shpass_draw_line(prim, (unsigned)d->count, (unsigned)d->instances);   // M51A: indexed draw of a shadow candidate pass
++    if (vk_m69a_mode() & 1) m69a_draw(prim, (uint32_t)d->count, (uint32_t)d->instances, 1, d->ibuf, d->itype, (int)d->base_vertex, 0, d->ind ? 1 : 0);   // M69A
++    if (vk_m70a_mode() & 12) m70a_draw(prim, (uint32_t)d->count, (uint32_t)d->instances, 1, d->ibuf, d->itype, (int)d->base_vertex, 0, d->ind ? 1 : 0);   // M70A
+     VkCommandBuffer cb = vk_cmd();
+     int g_ok = draw_allowed(); if (g_ok == 2 || (g_tracing && g_x_tracepass >= 0)) trace_draw("indexed draw", d->prim, (uint32_t)d->count, (uint32_t)d->instances, d->itype);
+     if (d->ind && g_tracing && g_x_tracepass >= 0) { uint32_t w[5]; vk_ubd_read(d->ind, 20, (uint8_t *)w);   // the arguments as the CPU sees them now (a GPU writer's last merged copy)
+--- nvn_vk2/rec/m48a_probe.c
++++ nvn_vk2/rec/m48a_probe.c
+@@ -57,9 +57,56 @@
+        bit5(32) = **一帧四时刻**探针：(i) A 的 caster pass 结束、(ii)(iii) B 第一次/第二次整目标 clear 之后、(iv) 采样 B 的 pass，
+        每时刻只用 transfer copy 读回（不走 render-pass 读回），打印 far%/geom%/min/max + VkImage/VkDeviceMemory/memoryOffset/slab。
+        基线 = 34（bit1+bit5，只探不修）；修 = 35（bit0+bit1+bit5）。 */
+-    "smo_m59a"
++    "smo_m59a",
++    /* M64A：smo_m64a → DM_VK_M64A。bit0(1) = 池级 slab 别名（一个 pool 一块 VkDeviceMemory，每张图按自己的 pool offset 绑进去）；
++       bit1(2) = 决定性探针（只用 vkCmdCopyImageToBuffer，在「A 的 caster pass 结束之后、B 被采样之前」直读 B + B 采样时绑定的 handle 身份）；
++       bit2(4) = 对被别名的深度图把整目标 CLEAR 改成 LOAD（隐含 slab）；bit3(8) = 偏移相关性（B 对 A 的 row+40 / row+40,col+256，
++       外加 A 在这三个假设下自身的 far/geom 预测）。**必须在 app 创建第一张 image 之前生效**（构造期 constructor(170) 读文件进 env）；
++       默认 0 = 零日志、零行为变化。 */
++    "smo_m64a",
++    /* M66A：smo_m66a → DM_VK_M66A（**纯探针**，默认 0 = 零日志零分配零行为）。800×450 帧型窗口只有 t≈124–128 s，passdump 抓不稳，
++       所以把 KPI 的测量放进帧本身：bit0(1) = 每一条 800×450 pass 结束时 transfer copy 读回它的颜色目标，就地算
++       nearwhite(>=250)/ge240/mean(R,G,B)（与 logs/m59a/passstat.py 同一口径，可直接对照历史 mask 链）；
++       bit1(2) = 采样 B 的那条 pass 结束时读回 B（1024² 深度 pool+0x228600）算 far/geom，caster A 在它自己的 pass 结束时读回，
++       同 present 时做三档偏移相关（as-is / row+40 / row+40,col+256）。改 KPI 判据用，不碰渲染。 */
++    "smo_m66a",
++    /* M67A：smo_m67a → DM_VK_M67A。近白到底由什么决定：在该 800×450 pass 采样 B（1024² 深度 pool+0x228600）的槽位上，把 view 换成常量深度替身
++       （8×8、B 自己的格式、vkCmdClearDepthStencilImage 填值，不走 loadOp）。bit0(1)=0.0（最近）/ bit1(2)=0.5 / bit2(4)=1.0（远＝现状对照）；
++       bit3(8)=E2 只记录（采样对象 + 采样器登记状态）/ bit4(16)=E3 只记录（近白量在哪张图上 + 下游谁采样它）。默认 0 = 不创建、不打印、不改渲染。 */
++    "smo_m67a",
++    /* M69A：smo_m69a → DM_VK_M69A。caster map（1024² D32、pool+0x200200，每帧 24 笔）的几何到底进没进 NDC。**纯探针，只读 CPU 内存**：
++       bit0(1) = 逐 draw 状态表 + 该 draw 的 UBO/SSBO 原样 + 索引解引用后的前 64 个顶点原样（宿主侧做 CPU 的 M·v）；
++       bit1(2) = 每条 1024² 深度 pass 结束时的汇总（确认哪条是 caster）；bit2(4) = 不设 3 帧明细上限。
++       默认 0 = 零日志、零读取、零行为变化。 */
++    "smo_m69a",
++    /* M70A：smo_m70a → DM_VK_M70A。游玩帧画面左右两团超大白色光晕是哪条 pass / 哪一笔 draw 画的、尺寸与亮度来自哪里。**纯探针**：
++       bit0(1) = 每条有颜色目标的 pass 结束时读回它的颜色目标，就地算 nearwhite/ge240/mean(R,G,B)/max + 8×8 近白网格；
++       bit1(2) = 每条 pass 一行元数据（尺寸/格式/ncol/draws/颜色目标与深度的 pool+off）；bit2(4) = 自动武装 nearwhite 最高的那条 pass，
++       下一帧记它的逐 draw 明细（[m70a-draw]/[m70a-tex] + UBO/顶点原样）；bit3(8) = 手动指定（DM_VK_M70A_PASS / DM_VK_M70A_OFF）。
++       默认 0 = 零日志、零分配、零 copy、零行为变化。 */
++    "smo_m70a",
++    /* M70A 手动指定（字符串开关）：smo_m70a_pass = pass 号；smo_m70a_off = 颜色目标 pool offset（十六进制）。
++       两者任一非空即让 smo_m70a 的 bit3 按它挑 pass（配合按 passdump 认出来的那条 pass 记逐 draw 明细）。 */
++    "smo_m70a_pass",
++    "smo_m70a_off",
++    /* M71A：smo_m71a → DM_VK_M71A（雾/泛光链常量 A/B，**本单唯一的行为开关**）。bit0(1) = pass 71 的 c2[2]=33.3317 减半；
++       bit1(2) = c1[2]=0.06 减半；bit2(4) = 两者都减半；bit3(8) = 末级（≤40×24 那一级）每条 pass 输出等比例压缩（系数 DM_VK_M71A_BC，默认 0.55）；
++       bit4(16) = 诊断：pass 71 采样的 800×450 D32 深度四档直方图。全部默认 0 = 零日志、零分配、零行为变化；运行期热切（2 s 重读）立即生效。 */
++    "smo_m71a",
++    /* M72A：smo_m72a → DM_VK_M72A（**纯探针**，默认 0 = 零日志、零分配、零读回）。雾链采样的那张 800×450 D32 到底谁该写：
++       bit0(1) = 本窗口每条 pass 一行（深度附件的 pool+off / w×h / fmt / loadOp / clearDepth / storeOp、draw 数、逐 draw 的
++       depthTest/depthWrite/compare/bias 汇总、本 pass 的 depth clear 次数与清成的值、颜色附件 #0 的身份）；
++       bit1(2) = 深度附件是 800×450 的 pass 结束时 transfer copy 回读四档直方图；bit2(4) = 其它 w≥512 深度图同样回读；
++       bit3(8) = 每条 pass 采样的深度图一行（谁采样谁）。运行期热切（2 s 重读）立即生效。 */
++    "smo_m72a",
++    /* M73A：smo_m73a → DM_VK_M73A（**本单的行为开关**：只改 pass 71 的 z→视距换算式/UBO 常量）。bit0(1) = 双曲反演按投影精确
++       （c4=(1−n/far,1/far)=(0.9999,1e-4)，t 重标到 z≈200..800）；bit1(2) = 远平面项按 far 动态 + 只雾真远（z 700..2500）；
++       bit2(4) = 线性视距插值 clamp((z−50)/750)；bit3(8) = 取消饱和 t=0.30·f；bit4(16) = bit1 + 增益 0.045；bit5(32) = 只压增益 0.045。
++       字符串 smo_m73a_p = "A B gain [c4_0 c4_1]" 覆盖前三/五项（同一 build 里细扫 fog_near/far）。默认 0 = 零日志零行为变化；2 s 热切。 */
++    "smo_m73a",
++    "smo_m73a_p"
+ };
+-enum { K_MASTER, K_RB10, K_FMT10, K_PD, K_SRGB, K_SWZLOG, K_RBPOOL, K_PDSKIP, K_TRACEPASS, K_UBOPASS, K_WATCH, K_SHPASS, K_PDDEPTH, K_M55A, K_M56A, K_M57A, K_M59A, K_N };
++enum { K_MASTER, K_RB10, K_FMT10, K_PD, K_SRGB, K_SWZLOG, K_RBPOOL, K_PDSKIP, K_TRACEPASS, K_UBOPASS, K_WATCH, K_SHPASS, K_PDDEPTH, K_M55A, K_M56A, K_M57A, K_M59A, K_M64A, K_M66A, K_M67A, K_M69A, K_M70A, K_M70AP, K_M70AO, K_M71A, K_M72A, K_M73A, K_M73AP, K_N };
+ 
+ /* 每个开关一份 2 s 缓存：读 B 视图优先，退 A 视图。 */
+ int m48a_knob(int i)
+@@ -205,6 +252,59 @@
+       if (m59 != m59_state) { m59_state = m59; char b[16]; snprintf(b, sizeof b, "%d", m59 > 0 ? m59 : 0); setenv("DM_VK_M59A", b, 1);
+           vk_boot_logf("[m59a] knob %s (DM_VK_M59A=%s: fix-clear %s, alias %s, keep-bytes %s, copy-sync %s, sample-id %s, four-moments %s)", m59 > 0 ? "on" : "off", b,
+                        (m59 & 1) ? "on" : "off", (m59 & 2) ? "on" : "off", (m59 & 4) ? "on" : "off", (m59 & 8) ? "on" : "off", (m59 & 16) ? "on" : "off", (m59 & 32) ? "on" : "off"); } }
++    /* M64A：smo_m64a → DM_VK_M64A（bit0 slab 别名 / bit1 决定性探针 / bit2 CLEAR→LOAD / bit3 偏移相关；默认 0 = 零日志、零行为变化）。
++       运行期热切只对 bit1/bit2/bit3 有意义：bit0 的 slab 在创建 image 时就绑定了，**改它必须重启**（构造期 constructor(170) 已读一次）。 */
++    { static int m64_state = -2; int m64 = m48a_knob(K_M64A);
++      if (m64 != m64_state) { m64_state = m64; char b[16]; snprintf(b, sizeof b, "%d", m64 > 0 ? m64 : 0); setenv("DM_VK_M64A", b, 1);
++          vk_boot_logf("[m64a] knob %s (DM_VK_M64A=%s: slab alias %s [restart to change], probe %s, clear->load %s, offset corr %s)", m64 > 0 ? "on" : "off", b,
++                       (m64 & 1) ? "on" : "off", (m64 & 2) ? "on" : "off", (m64 & 4) ? "on" : "off", (m64 & 8) ? "on" : "off"); } }
++    /* M66A：smo_m66a → DM_VK_M66A（纯探针：bit0 800×450 mask 就地统计 / bit1 采样 pass 的 B 与 caster A 深度读回；默认 0 = 零日志零行为）。 */
++    { static int m66_state = -2; int m66 = m48a_knob(K_M66A);
++      if (m66 != m66_state) { m66_state = m66; char b[16]; snprintf(b, sizeof b, "%d", m66 > 0 ? m66 : 0); setenv("DM_VK_M66A", b, 1);
++          vk_boot_logf("[m66a] knob %s (DM_VK_M66A=%s: 800x450 mask stat %s, B/A depth stat %s)", m66 > 0 ? "on" : "off", b,
++                       (m66 & 1) ? "on" : "off", (m66 & 2) ? "on" : "off"); } }
++    /* M67A：smo_m67a → DM_VK_M67A（E1 常量深度替身 bit0/1/2、E2 记录 bit3、E3 记录 bit4；默认 0 = 什么都不做）。
++       每 2 s 重读；值变了就打一行 segment 标记，便于把 [m66a-nw] 流按变体分段。 */
++    { static int m67_state = -2; int m67 = m48a_knob(K_M67A);
++      if (m67 != m67_state) { m67_state = m67; char b[16]; snprintf(b, sizeof b, "%d", m67 > 0 ? m67 : 0); setenv("DM_VK_M67A", b, 1);
++          vk_boot_logf("[m67a-seg] knob now DM_VK_M67A=%s (const depth %s / 0.5 %s / 1.0 %s, E2 record %s, E3 record %s): every [m66a-nw] line after this one belongs to this variant",
++                       b, (m67 & 1) ? "0.0" : "-", (m67 & 2) ? "on" : "-", (m67 & 4) ? "on" : "-", (m67 & 8) ? "on" : "-", (m67 & 16) ? "on" : "-"); } }
++
++    /* M69A：smo_m69a → DM_VK_M69A（纯探针：bit0 逐 draw 状态表 + UBO/顶点 dump / bit1 1024² 深度 pass 汇总 / bit2 明细帧不设上限；默认 0 = 什么都不做）。 */
++    { static int m69_state = -2; int m69 = m48a_knob(K_M69A);
++      if (m69 != m69_state) { m69_state = m69; char b[16]; snprintf(b, sizeof b, "%d", m69 > 0 ? m69 : 0); setenv("DM_VK_M69A", b, 1);
++          vk_boot_logf("[m69a] knob %s (DM_VK_M69A=%s: draw table + UBO/vertex dump %s, 1024x1024 pass summary %s, frame cap %s)", m69 > 0 ? "on" : "off", b,
++                       (m69 & 1) ? "on" : "off", (m69 & 2) ? "on" : "off", (m69 & 4) ? "none" : "3"); } }
++    /* M70A：smo_m70a → DM_VK_M70A（纯探针：bit0 pass 颜色目标近白 / bit1 pass 表 / bit2 自动武装逐 draw 明细 / bit3 手动指定；
++       默认 0 = 零日志、零分配、零 copy、零行为变化）。 */
++    { static int m70_state = -2; int m70 = m48a_knob(K_M70A);
++      if (m70 != m70_state) { m70_state = m70; char b[16]; snprintf(b, sizeof b, "%d", m70 > 0 ? m70 : 0); setenv("DM_VK_M70A", b, 1);
++          vk_boot_logf("[m70a] knob %s (DM_VK_M70A=%s: pass nearwhite %s, pass table %s, draw detail %s, manual pick %s)", m70 > 0 ? "on" : "off", b,
++                       (m70 & 1) ? "on" : "off", (m70 & 2) ? "on" : "off", (m70 & 4) ? "on" : "off", (m70 & 8) ? "on" : "off"); } }
++    /* M71A：smo_m71a → DM_VK_M71A（雾/泛光链常量 A/B；默认 0 = 零日志、零分配、零行为变化）。热切 2 s 生效，每变一次打一行 [m71a-seg]。 */
++    { static int m71_state = -2; int m71 = m48a_knob(K_M71A);
++      if (m71 != m71_state) { m71_state = m71; char b[16]; snprintf(b, sizeof b, "%d", m71 > 0 ? m71 : 0); setenv("DM_VK_M71A", b, 1);
++          vk_boot_logf("[m71a] knob %s (DM_VK_M71A=%s: c2[2]/2 %s, c1[2]/2 %s, both %s, last-stage compress %s, depth histogram %s)", m71 > 0 ? "on" : "off", b,
++                       (m71 & 1) ? "on" : "off", (m71 & 2) ? "on" : "off", (m71 & 4) ? "on" : "off", (m71 & 8) ? "on" : "off", (m71 & 16) ? "on" : "off"); } }
++    /* M73A：smo_m73a → DM_VK_M73A（pass 71 的 z→视距换算式/UBO 常量；默认 0 = 零日志、零分配、零行为变化）。
++       另有字符串 smo_m73a_p → DM_VK_M73A_P = "A B gain [c4_0 c4_1]"，非空即覆盖预设（同一 build 里细扫 fog_near/far）。 */
++    { static int m73_state = -2; int m73 = m48a_knob(K_M73A);
++      char ps[64]; m48a_knob_str(K_M73AP, ps, sizeof ps); static char ps_raw[64];
++      if (m73 != m73_state || strcmp(ps, ps_raw)) {
++          m73_state = m73; char b[16]; snprintf(b, sizeof b, "%d", m73 > 0 ? m73 : 0); setenv("DM_VK_M73A", b, 1);
++          if (strcmp(ps, ps_raw)) { snprintf(ps_raw, sizeof ps_raw, "%s", ps); setenv("DM_VK_M73A_P", ps, 1); }
++          vk_boot_logf("[m73a] knob DM_VK_M73A=%s override=\"%s\" (hyperbolic inversion %s, far-only %s, linear view distance %s, no-saturation %s, far+gain %s, gain-only %s)",
++                       b, ps, (m73 & 1) ? "on" : "off", (m73 & 2) ? "on" : "off", (m73 & 4) ? "on" : "off", (m73 & 8) ? "on" : "off", (m73 & 16) ? "on" : "off", (m73 & 32) ? "on" : "off"); } }
++    /* M72A：smo_m72a → DM_VK_M72A（**纯探针**：pass 归属表 / 800×450 与其它深度图的回读 / 采样归属；默认 0 = 零日志零分配零读回）。 */
++    { static int m72_state = -2; int m72 = m48a_knob(K_M72A);
++      if (m72 != m72_state) { m72_state = m72; char b[16]; snprintf(b, sizeof b, "%d", m72 > 0 ? m72 : 0); setenv("DM_VK_M72A", b, 1);
++          vk_boot_logf("[m72a] knob %s (DM_VK_M72A=%s: pass census %s, 800x450 depth read-back %s, other depths %s, sampler census %s)", m72 > 0 ? "on" : "off", b,
++                       (m72 & 1) ? "on" : "off", (m72 & 2) ? "on" : "off", (m72 & 4) ? "on" : "off", (m72 & 8) ? "on" : "off"); } }
++    /* M70A：手动指定的 pass 号 / 颜色目标 offset（字符串开关）→ DM_VK_M70A_PASS / DM_VK_M70A_OFF。 */
++    { char ps[32], os[32]; m48a_knob_str(K_M70AP, ps, sizeof ps); m48a_knob_str(K_M70AO, os, sizeof os);
++      static char ps_raw[32], os_raw[32];
++      if (strcmp(ps, ps_raw)) { snprintf(ps_raw, sizeof ps_raw, "%s", ps); setenv("DM_VK_M70A_PASS", ps, 1); vk_boot_logf("[m70a] manual pass = [%s]", ps); }
++      if (strcmp(os, os_raw)) { snprintf(os_raw, sizeof os_raw, "%s", os); setenv("DM_VK_M70A_OFF", os, 1); vk_boot_logf("[m70a] manual colour offset = [%s]", os); } }
+     int v = m48a_knob(K_PD);    if (v <= 0) { if (!armed) { armed = 1; } return; }
+     if (!armed) return;
+     armed = 0;
+@@ -228,3 +328,22 @@
+     }
+ }
+ __attribute__((constructor(160))) static void m48a_seed(void) { m48a_seed_files(); }
++
++/* M64A：smo_m64a 必须在 app 创建任何 image 之前进 env（M59A 事实：A/B 若在关态建成，之后不会重新绑 slab），
++   所以在 constructor(160) 种完文件之后紧跟着读一次文件并 setenv —— 早于任何 vkCreateImage。
++   运行期再由 m48a_poll 的 2 s 重读覆盖（bit1/bit2/bit3 可热切，bit0 的 slab 只能重启生效）。 */
++__attribute__((constructor(170))) static void m64a_apply_at_start(void)
++{
++    char p[256];
++    for (int v = 0; v < 2; v++) {
++        snprintf(p, sizeof p, "%s%s", v ? M48A_A : M48A_B, "smo_m64a");
++        FILE *f = fopen(p, "r");
++        if (!f) continue;
++        char b[32]; size_t n = fread(b, 1, sizeof b - 1, f); fclose(f);
++        b[n] = 0;
++        int val = atoi(b);
++        char vb[16]; snprintf(vb, sizeof vb, "%d", val > 0 ? val : 0);
++        setenv("DM_VK_M64A", vb, 1);
++        return;
++    }
++}

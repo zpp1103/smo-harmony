@@ -1,0 +1,33 @@
+diff --git a/mario-odessy-harmony/entry/src/main/cpp/host/threads.c b/mario-odessy-harmony/entry/src/main/cpp/host/threads.c
+--- a/mario-odessy-harmony/entry/src/main/cpp/host/threads.c
++++ b/mario-odessy-harmony/entry/src/main/cpp/host/threads.c
+@@ -1496,6 +1496,29 @@
+       } else fprintf(stderr, "[totk-dump] obs kickbr 0x8ad228 hits=%llu (gate never hit)\n",
+                      (unsigned long long)smo_obs_hits(11));
+       }
++      /* round19 ①②：al thunk 双门×2（thunk1=0x587ea0 两参 kick 蹦床、thunk2=0x587eb0
++         三参变体蹦床）。入口门装在唯一进入分支（0x587da4/0x587db4 的 b，全镜像扫描
++         唯一落点+门址零落点）计全部进入；NULL 出口门装在 cbz 早退落点（0x587eac/
++         0x587ec4 的 ret，寄存器分支重放）计 [x0]==NULL 早退。联读：thunk1_in−alkick
++         ≈thunk1_null（自洽校验，残差=装门窗口外的进入路径，理论应为 0）；thunk2_in
++         是 KICK3(0x8ad310 族) 路径 thunk 层计数。门 id：thunk1_in=12/null=13，
++         thunk2_in=14/null=15（game_patches.c round19 enum）。 */
++      fprintf(stderr, "[totk-dump] thunk gates: thunk1 in(0x587da4)=%llu null(0x587eac)=%llu | thunk2 in(0x587db4)=%llu null(0x587ec4)=%llu\n",
++              (unsigned long long)smo_obs_hits(12), (unsigned long long)smo_obs_hits(13),
++              (unsigned long long)smo_obs_hits(14), (unsigned long long)smo_obs_hits(15));
++      /* round19 ③：BC310 first-16 唯一 x0 环——45807 hits 的收件对象分布（首 16 个唯一
++         x0 枚举+各计数；x0 是对象指针，非代码地址，不做模块符号化）。 */
++      {
++      extern int smo_obs_bc_x0ring(uint64_t[16], uint64_t[16], uint64_t *, uint64_t *);
++      uint64_t xv[16], xc[16], xover = 0, xzero = 0;
++      if (smo_obs_bc_x0ring(xv, xc, &xover, &xzero)) {
++          fprintf(stderr, "[totk-dump] bc310 first16 x0: zero=%llu over=%llu\n",
++                  (unsigned long long)xzero, (unsigned long long)xover);
++          for (int i = 0; i < 16; i++)
++              if (xv[i]) fprintf(stderr, "[totk-dump] bc310 first16[%d]: x0=%#llx cnt=%llu\n",
++                                 i, (unsigned long long)xv[i], (unsigned long long)xc[i]);
++      } else fprintf(stderr, "[totk-dump] bc310 first16 x0: none (gate never hit)\n");
++      }
+       /* round16b E2b 归属：上轮 E2a this=0x7f76fcdaf8 与 h1020/h1023 arg 同 0x7f76fc 邻域。
+          对 E2 this 做池反查（宿主 NVN 池账本 gfx_bridge nvn_pool_ledger，±0x4000 页距容差）
+          + CreateThread 账本同 64K 邻域 arg 对照，一行打归属推断依据（谁的对象）。

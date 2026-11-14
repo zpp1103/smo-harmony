@@ -1,0 +1,6 @@
+{
+  "name": "libvkprobe.so",
+  "types": "./index.d.ts",
+  "version": "1.0.0",
+  "description": "m41b vulkan format probe"
+}

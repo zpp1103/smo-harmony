@@ -1,0 +1,115 @@
+--- a/mario-odessy-harmony/entry/src/main/cpp/host/gfx_bridge.c
++++ b/mario-odessy-harmony/entry/src/main/cpp/host/gfx_bridge.c
+@@ -360,10 +360,9 @@
+  nvn_texlayout l;nvn_tex_layout(&((const tex_builder_h *)b)->d,&l);
+  {static unsigned n;if(n<8){n++;fprintf(stderr,"[nvn] TextureBuilderGetStorageAlignment tgt=%d fmt=%#x fl=%#x -> %#x (donor nvn_tex_layout: 512 blocklinear / 32|128 pitch / bpb buffer)\n",((const tex_builder_h *)b)->d.target,((const tex_builder_h *)b)->d.format,((const tex_builder_h *)b)->d.flags,l.align);}}
+  return l.align;}
+-static int nvn_texture_builder_get_storage_class(const void *b){   /* round22：donor :372-375 totk_storage_class——NVNstorageClass 是后端不透明兼容标识（nvn.h:44 typedef int，头无枚举值、非 Tegra memory-kind），donor 约 BUFFER(0xA, nvn.h:787)→0、其余（池放置主体 2D）→1，照抄 */
+- int c=((const tex_builder_h *)b)->d.target==0xA?0:1;
+- {static unsigned n;if(n<8){n++;fprintf(stderr,"[nvn] TextureBuilderGetStorageClass tgt=%d -> %d (donor totk_storage_class: BUFFER=0, others=1)\n",((const tex_builder_h *)b)->d.target,c);}}
+- return c;}
++static int nvn_texture_builder_get_storage_class(const void *b){   /* round14b 对齐 donor hle_nvn.c:2165：(void)b; return 0——注释原文 "the host has none, 0 as for the builder"，恒 0。旧注（BUFFER→0 其余→1）出自 d2r_gfx 旧版 totk_storage_class，与当前 donor 不符：SMO 2D 池纹理曾误返 1 */
++ {static unsigned n;if(n<8){n++;fprintf(stderr,"[nvn] TextureBuilderGetStorageClass tgt=%d -> 0 (donor :2165 恒 0)\n",((const tex_builder_h *)b)->d.target);}}
++ return 0;}
+ /* round19-A：纹理池存储链。此前 SetStorage/Initialize/GetTextureAddress 全是返-0 桩（round18.log:189/227/245），
+    纹理 GPU VA=0，池管理器偏移 obj[8]−obj[0x20][0x10]（main+0x97ec90）= 0−1MB 对齐池基址 = -1MB，
+    写循环 str w26,[x9,x8,lsl#2]（main+0x9a3efc）x9=池CPU基址+w21 越界 SIGSEGV。现按 donor hle_nvn.c:358/399-408
+@@ -401,7 +400,7 @@
+ static void *nvn_texture_get_memory_pool(const void *t){return ((const tex_h *)t)->pool;}   /* nvn_protos.h:206 */
+ static int64_t nvn_texture_get_memory_offset(const void *t){return ((const tex_h *)t)->off;}   /* nvn_protos.h:207 */
+ static int nvn_texture_get_storage_size(const void *t){nvn_texlayout l;nvn_tex_layout(&((const tex_h *)t)->d,&l);return (int)l.size;}   /* nvn_protos.h:208：int 返回，布局总量 */
+-static int nvn_texture_get_storage_class(const void *t){return ((const tex_h *)t)->d.target==0xA?0:1;}   /* round22：donor :450 对象级 totk_storage_class 同式（nvn_protos.h:185）——补齐同族只读查询，免再落返-0 桩 */
++static int nvn_texture_get_storage_class(const void *t){(void)t;return 0;}   /* round14b 对齐 donor hle_nvn.c:2171：(void)t; return 0（"storage class (the host has none, 0 as for the builder)"）——与 Builder 同恒 0；旧式 target==0xA?0:1 出自 d2r_gfx 旧版，与当前 donor 不符 */
+ static int nvn_texture_get_raw_storage_class(const void *t){(void)t;return 1;}   /* round22：donor :462 NOPROTO（头无原型）——调用点 main+0x174899c 与 1 比较不等则置状态位 0x100，donor 恒返 1；stub 返 0 会误置位 */
+ static int64_t nvn_texture_get_stride(const void *t){const nvn_texdesc *d=&((const tex_h *)t)->d;return nvn_tex_is_linear(d)?(int64_t)nvn_tex_linear_stride(d):0;}   /* nvn_protos.h:197：pitch 存储才有行距（LINEAR 0x10/LINEAR_RENDER_TARGET 0x40，nvn_tex.h:27-33），块线性无单一 stride 返 0 */
+ static int64_t nvn_texture_get_view_offset(const void *t,const void *view){   /* nvn_protos.h:186：视图级偏移=级偏移+层×每层字节 */
+@@ -604,6 +603,48 @@
+ static void nvn_command_buffer_clear_buffer(void *c,uint64_t buf,uint64_t n,uint32_t value){(void)buf;(void)n;(void)value;cb_account(c,24);}   /* donor :1253 hw_fix 24 */
+ static void nvn_command_buffer_barrier(void *c,int bits){(void)bits;cb_account(c,16);}   /* donor :2015 记录 8+4→16B */
+ static void nvn_command_buffer_set_viewports(void *c,int first,int n,const float *v){(void)first;(void)v;if(n<0)n=0;cb_account(c,24+4*(uint64_t)n);}   /* donor :1515 RECN 4n 浮点 */
++/* —— round14b：GPU 值写入族——donor hle_nvn.c:873-889/:2450-2454 录 OP_SIGNAL_EVENT/OP_REPORT_COUNTER，
++   提交回放完成时写真内存（nvn_mtl.m:10635 → post(:1274) → post_run(:1474)）。本宿主无回放层
++   （QueueSubmitCommands 即退休、EndRecording 返生成句柄无可回放记录），录制即执行——语义等价：
++   游戏读 counter/event 值前必经提交+等待（fence/flush/事件），这些等待在本宿主即时退休，录制时
++   写入的值在游戏读取时已就位。此前全为 CB_REC +24B 纯记账 → counterData 恒读初值/0。
++   · ReportCounter：16B {counter@0, timestamp@8}（NVNcounterData=nvn.h:91-94）memcpy 到 bufferAddress；
++     timestamp = guest_ns()×384/625（donor nvn_mtl.m:1280 gpu_ticks + nvn_timestamp.h:6，614.4MHz tick）；
++     counter 字段 type∈{TIMESTAMP=0, TIMESTAMP_TOP=0x10} 时=timestamp 否则 0（post_run kind=2；donor
++     render_cond profile 项本宿主无）。SAMPLES_PASSED(0x1) donor 走可见性槽求和（kind=3 {sum, ticks}），
++     本宿主无光栅 sum 恒 0 → 落同式。
++   · ReportValue/SignalEvent：event 写（post_run kind=1）WRITE(0x0)覆写 / ADD(0x1)累加（nvn.h:661-662）；
++     ReportValue 写 (volatile uint32_t*)bufferAddress（donor :2450-2454）；SignalEvent 写 ev->val
++     （donor :873-877，ev_t=nvn_obj.h:60 {magic,val}）。与 :536 nvn_event_signal 同式（CPU 侧原语）。
++   · ResetCounter：donor :884-885 记 16B，回放只累计统计不写 guest 内存 → 记账对齐 16B。
++   写前喂 dm_guest_write_prepare（写观察点，donor sbw 同款；:507 buffer_flush_mapped 同用法）。—— */
++static void nvn_cb_event_write(volatile uint32_t *val,uint32_t mode,uint32_t v){
++ if(!val){fprintf(stderr,"[nvn][RED] event 写 NULL dst（mode=%u v=%u）\n",mode,v);return;}
++ dm_guest_write_prepare((void *)val,4);
++ if(mode==1)*val+=v;else *val=v;
++}
++static void nvn_command_buffer_signal_event(void *c,const void *e,int m,int loc,int flags,uint32_t v){
++ (void)loc;(void)flags;cb_account((cmd_h *)c,24);   /* donor :873-877 记 24B */
++ const ev_h *ev=(const ev_h *)e;nvn_cb_event_write(ev?ev->val:0,(uint32_t)m,v);
++ {static unsigned n;if(n++<4)fprintf(stderr,"[nvn] SignalEvent ev=%p mode=%s v=%u\n",e,m==1?"ADD":"WRITE",v);}
++}
++static void nvn_command_buffer_report_value(void *c,uint32_t v,uint64_t a){
++ cb_account((cmd_h *)c,24);   /* donor :2450-2454 记 24B（经 OP_SIGNAL_EVENT WRITE） */
++ nvn_cb_event_write((volatile uint32_t *)(uintptr_t)a,0,v);
++ {static unsigned n;if(n++<4)fprintf(stderr,"[nvn] ReportValue v=%u -> %#llx\n",v,(unsigned long long)a);}
++}
++static void nvn_command_buffer_report_counter(void *c,int t,uint64_t a){
++ cb_account((cmd_h *)c,24);   /* donor :887-889 记 24B（OP_REPORT_COUNTER） */
++ if(a){
++  uint64_t ts=(uint64_t)((__uint128_t)guest_ns()*384/625),rec[2]={(t==0||t==0x10)?ts:0,ts};
++  dm_guest_write_prepare((void *)(uintptr_t)a,16);memcpy((void *)(uintptr_t)a,rec,16);
++  {static unsigned n;if(n++<4)fprintf(stderr,"[nvn] ReportCounter type=%#x -> %#llx {counter=%#llx, ts=%#llx}\n",t,(unsigned long long)a,(unsigned long long)rec[0],(unsigned long long)rec[1]);}
++ }
++}
++static void nvn_command_buffer_reset_counter(void *c,int t){
++ cb_account((cmd_h *)c,16);   /* donor :884-885 记 16B，回放只累计统计不写内存 */
++ {static unsigned n;if(n++<2)fprintf(stderr,"[nvn] ResetCounter type=%#x (stats only, donor :884-885)\n",t);}
++}
+ /* —— 记账录制族：平价件（donor 无 hw_fix，按其记录尺寸 16-40B 的平价 24B 近似；首用一行日志）—— */
+ #define CB_REC(NAME) static void NAME(void *c){cb_account((cmd_h *)c,24);{static unsigned n;if(n++<1)fprintf(stderr,"[nvn] rec %s +24B (flat approx)\n",#NAME);}}
+ CB_REC(nvn_command_buffer_begin_transform_feedback)
+@@ -655,10 +696,7 @@
+ CB_REC(nvn_command_buffer_push_debug_group_static)
+ CB_REC(nvn_command_buffer_pop_debug_group)
+ CB_REC(nvn_command_buffer_pop_debug_group_id)
+-CB_REC(nvn_command_buffer_report_counter)
+-CB_REC(nvn_command_buffer_report_value)
+-CB_REC(nvn_command_buffer_reset_counter)
+-CB_REC(nvn_command_buffer_resolve_depth_buffer)
++CB_REC(nvn_command_buffer_resolve_depth_buffer)   /* report_counter/report_value/reset_counter/signal_event 四件已升真实现（上方 round14b 块），不再走 CB_REC 记账 */
+ CB_REC(nvn_command_buffer_restore_zcull_data)
+ CB_REC(nvn_command_buffer_save_zcull_data)
+ CB_REC(nvn_command_buffer_set_alpha_ref)
+@@ -698,7 +736,6 @@
+ CB_REC(nvn_command_buffer_set_tiled_cache_tile_size)
+ CB_REC(nvn_command_buffer_set_viewport)
+ CB_REC(nvn_command_buffer_set_viewport_swizzles)
+-CB_REC(nvn_command_buffer_signal_event)
+ CB_REC(nvn_command_buffer_wait_event)
+ /* —— P0-3 Compare 三件（donor :456-459：对象描述等价，非像素比较）—— */
+ static uint64_t nvn_texture_compare(const void *a,const void *b){const tex_h *x=a,*y=b;{static unsigned n;if(n++<1)fprintf(stderr,"[nvn] TextureCompare %p vs %p -> %d\n",a,b,!(memcmp(&x->d,&y->d,sizeof x->d)||x->mem!=y->mem));}return !(memcmp(&x->d,&y->d,sizeof x->d)||x->mem!=y->mem);}   /* 描述符逐字节 + 池内存指针相等；此前空桩恒 0=登记去重全走"不等" */
+@@ -789,13 +826,14 @@
+  return 1;
+ }
+ /* round16：描述符池（TexturePool/SamplerPool）全家——donor hle_nvn.c:301-324 简化（无 mtl/life 层）。
+-   GetSize(n) 是计数→字节的静态尺寸查询（管理器建池前问它，round15 mark 证实此类查询在池存在前发生）：
+-   boot 走宽裕超配 n*0x100+0x1000 取整页——真公式未证（donor/官方头均无），后续 Vulkan 接线时校准；
+-   超配只费内存，欠配才会溢出。同名符号只能有一个：对象级 GetSize 不再另设回声版。 */
++   round14b 对齐 GetSize：donor :274/:277 签名 (const NVNtexturePool*) 返回 ((const dpool_t*)tp)->n
++   ——池对象上的查询（返回创建时条目数 int），不是计数→字节静态换算（donor 注释：Unreal Engine 在
++   device setup 时读回池大小）。旧版把入参当条目数返回 (n*0x100+0x1000+0xfff)&~0xfff 字节：游戏传
++   的是池对象指针，指针值被当条目数 → 巨大返回值；GetSize(n) 字节换算公式 donor/官方头均无出处，
++   已删。同名符号只能有一个：对象级 GetSize 不再另设回声版。 */
+ typedef struct{const void *pool;int64_t off;int32_t n;} dpool_h;   /* =nvn_obj.h:27 dpool_t */
+-static uint64_t nvn_dpool_size_bytes(uint64_t n){return (n*0x100+0x1000+0xfff)&~0xfffULL;}
+-static uint64_t nvn_texture_pool_get_size(uint64_t n){fprintf(stderr,"[nvn] TexturePoolGetSize n=%llu -> %#llx (oversize)\n",(unsigned long long)n,(unsigned long long)nvn_dpool_size_bytes(n));return nvn_dpool_size_bytes(n);}
+-static uint64_t nvn_sampler_pool_get_size(uint64_t n){fprintf(stderr,"[nvn] SamplerPoolGetSize n=%llu -> %#llx (oversize)\n",(unsigned long long)n,(unsigned long long)nvn_dpool_size_bytes(n));return nvn_dpool_size_bytes(n);}
++static uint64_t nvn_texture_pool_get_size(const dpool_h *p){int n=p?p->n:0;{static unsigned k;if(k++<4)fprintf(stderr,"[nvn] TexturePoolGetSize pool=%p -> %d (entries, donor :274)\n",(const void *)p,n);}return (uint64_t)(int64_t)n;}
++static uint64_t nvn_sampler_pool_get_size(const dpool_h *p){int n=p?p->n:0;{static unsigned k;if(k++<4)fprintf(stderr,"[nvn] SamplerPoolGetSize pool=%p -> %d (entries, donor :277)\n",(const void *)p,n);}return (uint64_t)(int64_t)n;}
+ static uint64_t nvn_texture_pool_initialize(void *tp,const void *p,int64_t off,int n){dpool_h *o=tp;o->pool=p;o->off=off;o->n=n;fprintf(stderr,"[nvn] TexturePool %p pool=%p off=%#llx n=%d\n",tp,p,(unsigned long long)off,n);return 1;}   /* donor :301-303（无 mtl_set_tex_pool_n） */
+ static void nvn_texture_pool_finalize(void *tp){(void)tp;}   /* donor :304 */
+ static void nvn_texture_pool_register_texture(const void *tp,int id,const void *t,const void *v){(void)tp;(void)t;(void)v;fprintf(stderr,"[nvn] TexturePoolRegister id=%d\n",id);}   /* donor :306-313 记名空操作（无 mtl/life 层） */

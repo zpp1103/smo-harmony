@@ -1,0 +1,264 @@
+diff --git mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c
+index 6767d4a..2df707f 100644
+--- mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c
++++ mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c
+@@ -9440,6 +9440,11 @@ static void m26a_report(unsigned sub)
+    descriptor set 补写。写时机安全前提：draw 批次在 bind_textures 处先 flush（g_rp_bind_tex 调
+    nvn_vk_draw_flush，submit+等栅栏），所以此刻没有任何在飞的 CB 引用这些 set。
+    未绑/解析失败的槽保持 1x1 白占位——不回退到「黑」也不冒充成功。 */
++/* M102B 前置声明（实现在 ~23830 行 draw 钩子旁，见那一段的完整说明）。
++   只读 log-only，缺省关：smo_m102b=0 ⇒ 两个钩子各一个判断即返回。 */
++static int  m102b_on(void);
++static void m102b_ds_note(const R_Key *k, int slot, int unit, int white);
++
+ static void r_ds_tex_sync(R_Key *k)
+ {
+     if (!k || !k->ds) return;
+@@ -9453,6 +9458,7 @@ static void r_ds_tex_sync(R_Key *k)
+     VkDescriptorImageInfo im[NVN_TX_SLOTS];
+     VkWriteDescriptorSet w[NVN_TX_SLOTS];
+     int nw = 0;
++    const int m102b_en = m102b_on();   /* M102B：本函数一次取开关（关态一次判断） */
+     for (int i = 0; i < ntex; i++) {
+         /* M27A：dstBinding 是 shader 侧**稠密**编号 32+i，但"取哪张图/哪个采样器"要按 guest 真实
+            unit。关态或该 key 没有 "units" 时 u==i ⇒ 与旧行为逐字等价。
+@@ -9470,6 +9476,8 @@ static void r_ds_tex_sync(R_Key *k)
+         }
+         if (!v) v = g_r_tex_view;
+         VkSampler   s = r_smp_for_slot(u);
++        /* M102B（只读）：这一格最终写进描述符的是真 view 还是 1x1 白占位（默认白）。 */
++        if (m102b_en) m102b_ds_note(k, i, u, v == g_r_tex_view);
+         if (nvn_vk_view_is_rt(g_r_tx_view[u])) g_r_ds_rt_writes++;   /* M4e：本笔 draw 的槽确实挂的是我们的 RT 图 */
+         im[i] = (VkDescriptorImageInfo){ s, v, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+         memset(&w[nw], 0, sizeof w[nw]);
+@@ -22923,6 +22931,221 @@ static void m99a_draw(const R_Key *kv, const R_Key *kf, unsigned long long ps, i
+     }
+ }
+ 
++/* ================= M102B（2026-11-13，只读 log-only，缺省 0）=================
++   背景：真机 19:06 离线，M102A 被叫停且未动设备。本探针把 M102A 的两个判据**离线备好**，
++   回线即装：① pass→槽 表（判据 1/2）；② 「描述符最终拿到 1x1 白」的丢点计数（判据 3）。
++
++   ① 为什么必须新加仪表（既有仪表盘上这两个空档是实测的）：
++      · draw 时刻取证只有 M7I 的 `[m7i] td`，触发条件是「claim 图的前 3 笔颜色写」且全 boot ≤8 张
++        claim 图 ⇒ 实测 32 行**全落在 app_t<350 s（菜单段）**，3D 段（app_t≥414 s，[perf] fps 从 5.2
++        掉到 0.25 那一刻起）一行都没有；
++      · `[m99a] burn` 只在某槽 writers 过 512/1024/2048/2900 阈值时打一行「该槽 top 程序」，
++        有 ntex/real/up0 但**那是该槽 top 键的口径，且只在阈值那一刻**，没有 per-pass 动态绑定；
++      · `[r] pipeline ok` 的 fs_ntex 是**静态声明**（建管线时一次），不能回答「3D 段里哪笔 draw 的
++        声明贴图真的绑上了」。
++      本表按 (vs 键, fs 键, 目标 RT 槽) 聚合每一笔**颜色** draw：
++        draws / verts(Σnverts) / 末笔 nv+count / topo / dvar / 目标槽 (槽号+texid+RT key+ext) /
++        ntex_decl（片元声明几张）/ ntex_real / up0（本笔 draw 时刻 u=r_unit_of(kf,i) 上挂真 view
++        还是 1x1 白）/ blend。⇒ 直接回答「3D 段有没有 ntex_decl>0 且在真槽里画出来的 pass」。
++
++   ② 丢点计数落点 = `r_ds_tex_sync()` 写描述符的那一刻（那是「纹理变成默认白」的唯一出口）：
++      按 (fs 键, 稠密槽 i, unit u) 记 white（v == g_r_tex_view）/ real，并带出上游既有归因
++      g_r_tx_info[u] 的 kind（PLACEHOLDER/TEX/RT_SELF/RT_OTHER/DEPTH_NR）+ up（是否上送过）
++      + id/fmt/w/h。这一格就是 M102A 判据 3 要的「丢在哪一步」的原始证据。
++
++   开关 smo_m102b（文件开关，2 s 重读，缺省 **0=关**）：0 ⇒ 两个钩子各一个判断即返回，
++   日志与行为逐字不变；文件缺省由 app 自己种成 "0"（不借 p_file_seed —— 它种的是 -1）。
++   预算：表 ≤48 项；报表每 60 s 至多 1 组（组首 1 行 + pass 行 ≤16 + 丢点行 ≤8），全 boot ≤24 组
++   （≈600 行上限），够覆盖一次 10 min 的 3D 段。 */
++#define M102B_SW_A "/data/storage/el2/base/files/smo_m102b"
++#define M102B_SW_B "/data/app/el2/100/base/com.vibecc.smo/files/smo_m102b"
++#define M102B_ENTS 48
++#define M102B_DS   32
++#define M102B_REPORTS 24
++#define M102B_PERIOD_MS 60000.0
++typedef struct {
++    char vs[17], fs[17];
++    int  slot, texid, topo, dvar, blend, nv, cnt;
++    unsigned extw, exth;
++    unsigned long long rtkey, draws, verts;
++    int  ntex, real, up0;                 /* 末笔 draw 时刻口径 */
++} m102b_ent;
++static m102b_ent g_m102b_ent[M102B_ENTS];
++static int g_m102b_n;
++static int g_m102b_sw = -1;
++static unsigned g_m102b_reports;
++static double g_m102b_t0, g_m102b_last;
++static unsigned long long g_m102b_full;   /* 表满丢弃的 (pass,slot) 笔数 */
++typedef struct { char fs[17]; int slot, unit, kind, up, fmt; unsigned w, h, id;
++                 unsigned long long white, real, calls; } m102b_ds;
++static m102b_ds g_m102b_ds[M102B_DS];
++static int g_m102b_dsn;
++static unsigned long long g_m102b_ds_other;
++
++static void m102b_seed(void)
++{
++    static const char *const p[2] = { M102B_SW_A, M102B_SW_B };
++    for (int i = 0; i < 2; i++) {
++        FILE *r = fopen(p[i], "r");
++        if (r) { fclose(r); continue; }
++        FILE *f = fopen(p[i], "w");
++        if (f) { fputs("0\n", f); fclose(f); vk_boot_logf("[m102b] seeded %s = 0 (default off)", p[i]); }
++    }
++}
++
++static int m102b_on(void)
++{
++    static double last;
++    if (g_m102b_sw < 0) {
++        m102b_seed();                          /* 缺省文件 = 0（默认关） */
++        g_m102b_sw = p_file_int(M102B_SW_A, M102B_SW_B, 0);
++        last = r_now_ms();
++        vk_boot_logf("[m102b] sw init on=%d (1=pass table + drop-point counters, 0=off default)", g_m102b_sw != 0);
++        return g_m102b_sw != 0;
++    }
++    if (r_now_ms() - last >= 2000.0) {
++        const int v = p_file_int(M102B_SW_A, M102B_SW_B, 0);
++        last = r_now_ms();
++        if ((v != 0) != (g_m102b_sw != 0)) {
++            vk_boot_logf("[m102b] sw on=%d -> on=%d (runtime switch)", g_m102b_sw != 0, v != 0);
++            g_m102b_sw = v;
++        }
++    }
++    return g_m102b_sw != 0;
++}
++
++/* ② 描述符落点记账：white=1 ⇒ 这一格写进去的是 1x1 白占位（默认白）。 */
++static void m102b_ds_note(const R_Key *k, int slot, int unit, int white)
++{
++    m102b_ds *d = NULL;
++    if (!k) return;
++    for (int i = 0; i < g_m102b_dsn; i++)
++        if (g_m102b_ds[i].unit == unit && g_m102b_ds[i].slot == slot
++            && !memcmp(g_m102b_ds[i].fs, k->key, 16)) { d = &g_m102b_ds[i]; break; }
++    if (!d) {
++        if (g_m102b_dsn >= M102B_DS) { g_m102b_ds_other++; return; }
++        d = &g_m102b_ds[g_m102b_dsn++];
++        memset(d, 0, sizeof *d);
++        memcpy(d->fs, k->key, 16);
++        d->slot = slot; d->unit = unit;
++        d->kind = (unit >= 0 && unit < NVN_TX_SLOTS) ? g_r_tx_info[unit].kind : -1;
++        d->up   = (unit >= 0 && unit < NVN_TX_SLOTS) ? g_r_tx_info[unit].up   : -1;
++        d->id   = (unit >= 0 && unit < NVN_TX_SLOTS) ? (unsigned)g_r_tx_info[unit].id : 0u;
++        d->w    = (unit >= 0 && unit < NVN_TX_SLOTS) ? g_r_tx_info[unit].w    : 0u;
++        d->h    = (unit >= 0 && unit < NVN_TX_SLOTS) ? g_r_tx_info[unit].h    : 0u;
++        d->fmt  = (unit >= 0 && unit < NVN_TX_SLOTS) ? g_r_tx_info[unit].fmt  : -1;
++    }
++    d->calls++;
++    if (white) d->white++; else d->real++;
++}
++
++static void m102b_report(void)
++{
++    double t = (r_now_ms() - g_m102b_t0) / 1000.0;
++    unsigned long long td = 0, tv = 0;
++    int i, k, ntex_ents = 0, real_ents = 0;
++    int used[M102B_ENTS];
++    if (g_m102b_reports >= M102B_REPORTS) return;
++    g_m102b_reports++;
++    for (i = 0; i < g_m102b_n; i++) {
++        td += g_m102b_ent[i].draws; tv += g_m102b_ent[i].verts;
++        if (g_m102b_ent[i].ntex > 0) ntex_ents++;
++        if (g_m102b_ent[i].real > 0) real_ents++;
++    }
++    vk_boot_logf("[m102b] sum rep=%u t=%.1fs ents=%d ntex_ents=%d tex_real_ents=%d draws=%llu verts=%llu "
++                 "ds_slots=%d ds_other=%llu tbl_full=%llu | pick sel=%llu nodim=%llu raw=%llu noview=%llu "
++                 "fallback=%llu bound=%llu ds_rt_w=%llu",
++                 g_m102b_reports, t, g_m102b_n, ntex_ents, real_ents, td, tv,
++                 g_m102b_dsn, g_m102b_ds_other, g_m102b_full,
++                 g_t_view_sel, g_t_view_nodim, g_t_view_raw, g_t_view_noview,
++                 g_t_view_fallback, g_tx_slots_bound, g_r_ds_rt_writes);
++    /* pass 行：先钉死「声明了贴图的」那几项（M102A 判据 1 的正题），再按 verts 补满 16 行 */
++    memset(used, 0, sizeof used);
++    for (k = 0; k < 16; k++) {
++        int bi = -1;
++        const int want_tex = (k < 8);
++        for (i = 0; i < g_m102b_n; i++) {
++            if (used[i]) continue;
++            if (want_tex && g_m102b_ent[i].ntex <= 0) continue;
++            if (bi < 0 || g_m102b_ent[i].verts > g_m102b_ent[bi].verts) bi = i;
++        }
++        if (bi < 0) {                    /* 带贴图的项不足 8 个 ⇒ 余下名额按 verts 填 */
++            for (i = 0; i < g_m102b_n; i++)
++                if (!used[i] && (bi < 0 || g_m102b_ent[i].verts > g_m102b_ent[bi].verts)) bi = i;
++        }
++        if (bi < 0) break;
++        used[bi] = 1;
++        {
++            const m102b_ent *e = &g_m102b_ent[bi];
++            vk_boot_logf("[m102b] pass vs=%s fs=%s slot=%d texid=%d rtkey=%#llx ext=%ux%u draws=%llu verts=%llu "
++                         "nv=%d cnt=%d topo=%d dvar=%d ntex_decl=%d ntex_real=%d up0=%d blend=%d",
++                         e->vs, e->fs, e->slot, e->texid, e->rtkey, e->extw, e->exth, e->draws, e->verts,
++                         e->nv, e->cnt, e->topo, e->dvar, e->ntex, e->real, e->up0, e->blend);
++        }
++    }
++    /* 丢点行：white 多的在前，最多 8 行 */
++    memset(used, 0, sizeof used);
++    for (k = 0; k < 8 && k < g_m102b_dsn; k++) {
++        int bi = -1;
++        for (i = 0; i < g_m102b_dsn; i++)
++            if (!used[i] && (bi < 0 || g_m102b_ds[i].white > g_m102b_ds[bi].white)) bi = i;
++        if (bi < 0) break;
++        used[bi] = 1;
++        {
++            const m102b_ds *d = &g_m102b_ds[bi];
++            vk_boot_logf("[m102b] ds fs=%s i=%d unit=%d kind=%d up=%d id=%u w=%u h=%u fmt=%d "
++                         "white=%llu real=%llu calls=%llu",
++                         d->fs, d->slot, d->unit, d->kind, d->up, d->id, d->w, d->h, d->fmt,
++                         d->white, d->real, d->calls);
++        }
++    }
++}
++
++/* ① draw 钩子（颜色笔收口，与 M99A 同一处）：聚 per-(vs,fs,目标槽)。 */
++static void m102b_draw(const R_Key *kv, const R_Key *kf, int slot, int dvar,
++                       unsigned nverts, int count, int topo)
++{
++    m102b_ent *e = NULL;
++    int i, ntex, real = 0, up0 = 0;
++    if (!kv || !kf || slot < 0 || slot >= (int)(sizeof g_rt_tab / sizeof *g_rt_tab)) return;
++    if (g_m102b_t0 <= 0.0) { g_m102b_t0 = r_now_ms(); g_m102b_last = g_m102b_t0; }
++    for (i = 0; i < g_m102b_n; i++)
++        if (g_m102b_ent[i].slot == slot && !memcmp(g_m102b_ent[i].vs, kv->key, 16)
++            && !memcmp(g_m102b_ent[i].fs, kf->key, 16)) { e = &g_m102b_ent[i]; break; }
++    if (!e) {
++        if (g_m102b_n >= M102B_ENTS) { g_m102b_full++; return; }
++        e = &g_m102b_ent[g_m102b_n++];
++        memset(e, 0, sizeof *e);
++        memcpy(e->vs, kv->key, 16);
++        memcpy(e->fs, kf->key, 16);
++        e->slot  = slot;
++        e->texid = g_rt_tab[slot].tex_id;
++        e->rtkey = (unsigned long long)g_rt_tab[slot].key;
++        e->extw  = g_rt_w; e->exth = g_rt_h;
++        e->blend = (int)(g_m14b_blend_en & 0xFFu);
++        if (g_m102b_n == M102B_ENTS) vk_boot_logf("[m102b] table full (%d) — later (pass,slot) pairs only counted", M102B_ENTS);
++    }
++    /* 动态绑定：本笔 draw 时刻，kf 声明的每个槽 u 上是真 view（real）还是 1x1 白（up0） */
++    ntex = kf->ntex < NVN_TX_SLOTS ? kf->ntex : NVN_TX_SLOTS;
++    for (i = 0; i < ntex; i++) {
++        const int u = r_unit_of(kf, i);
++        if (u >= 0 && u < NVN_TX_SLOTS && g_r_tx_view[u] != VK_NULL_HANDLE) real++; else up0++;
++    }
++    e->draws++;
++    e->verts += (unsigned long long)nverts;
++    e->nv  = (int)nverts;
++    e->cnt = count;
++    e->topo = topo;
++    e->dvar = dvar;
++    e->ntex = ntex;
++    e->real = real;
++    e->up0  = up0;
++    if (r_now_ms() - g_m102b_last >= M102B_PERIOD_MS) {
++        g_m102b_last = r_now_ms();
++        m102b_report();
++    }
++}
++
+ static int m40z_sw(void)
+ {
+     struct timespec ts; unsigned long long t = 0;
+@@ -23824,6 +24047,8 @@ static int draw_elements_body(int mode, int type, int count, uint64_t idx, int b
+             /* M99A（只读）：烧白 / 白影指纹（g_m99a_on=0 时一个判断即返回）。 */
+             m99a_draw(kv, kf, (unsigned long long)(uintptr_t)ps, si, dvar,
+                       (unsigned)nverts, (int)count, (int)topo);
++            /* M102B（只读，默认关）：pass→槽 表 + ntex_real/up0 动态绑定（M102A 判据 1/2）。 */
++            if (m102b_on()) m102b_draw(kv, kf, si, dvar, (unsigned)nverts, (int)count, (int)topo);
+             /* M40AU ①（只读记账，au=0 一个分支都不进）：本帧「最后一笔颜色 draw」落到哪个槽。
+                这是 present 取源的**唯一**来源 —— 记在绘制之后，present 只读不重算（M40AT 已证
+                present 时刻再取源时 RT 已被清屏）。零额外开销：只搬 3 个标量。 */
