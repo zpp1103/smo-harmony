@@ -1,0 +1,156 @@
+--- /Users/zpp/ZCodeProject/switch2mac/switch2hos/mario-odessy-harmony/entry/src/main/cpp/host/threads.c	2026-11-01 08:27:00
++++ /Users/zpp/VibeCoding/ns-mario-odessy-to-harmony/mario-odessy-harmony/entry/src/main/cpp/host/threads.c	2026-11-01 10:31:00
+@@ -563,6 +563,29 @@
+         return;
+     }
+     if (is1d) g_ovf1d++; else g_ovf1c++;
++}
++/* round16b 早 boot 键全录：boot 后前 10 秒的 0x1D 目标键全量专用表（256 槽+溢出计数），
++   与 pkey 三表完全独立（不挤槽、不改其行为——「全录不打扰」）。动机：round8c 实测 boot 期
++   一次性 key（sig=1 族）把 64 槽主表吃光，早窗到底有多少 distinct key、哪些是活锁期空打
++   key 的前身，主表结构里读不出；本表按窗口收录，dump 单独一段。窗口起点=libgame 装载
++   （dump_init 构造器），首个 0x1D 早于构造器打点时兜底以首见时刻为 t0。窗口过期后
++   early1d_closed 置位，热路径零额外开销（一次 flag 读）。持 G 更新，dump 无锁读（同 pkey）。 */
++#define EARLY1D_TOP 256
++static struct { uint64_t key; uint64_t n; uint32_t caller; } g_early1d[EARLY1D_TOP];
++static unsigned g_early1d_n; static uint64_t g_early1d_ovf;
++static uint64_t g_early1d_t0; static int g_early1d_t0_set, g_early1d_closed;
++static void early1d_note(uint64_t key, uint32_t caller) {   // 调用方持 G（svc 0x1D case 内）
++    if (g_early1d_closed) return;
++    uint64_t t = now_ns();
++    if (!g_early1d_t0_set) { g_early1d_t0 = t; g_early1d_t0_set = 1; }   // 兜底（构造器先到则不触发）
++    if (t - g_early1d_t0 >= 10000000000ull) { g_early1d_closed = 1; return; }   // 前 10s 窗口关闭
++    for (unsigned i = 0; i < g_early1d_n; i++) if (g_early1d[i].key == key) { g_early1d[i].n++; return; }
++    if (g_early1d_n < EARLY1D_TOP) {
++        g_early1d[g_early1d_n].key = key; g_early1d[g_early1d_n].n = 1;
++        g_early1d[g_early1d_n].caller = caller; g_early1d_n++;
++        return;
++    }
++    g_early1d_ovf++;   // 10s 内 distinct key 超 256：计数留痕（本身即发现）
+ }
+ /* ---------- round9b CreateThread/StartThread 全量账本（E2 宿主侧排查项）----------
+    修复方案定的宿主侧唯一排查项：核对 CreateThread/StartThread 门的全量账本（每个线程的
+@@ -748,7 +771,8 @@
+     case 0x1D: {  // SignalProcessWideKey(x0 条件键, w1 个数，<=0 全部) | SignalProcessWideKey(x0 condition key, w1 count, <=0 all)
+         uint64_t key = regs[0]; int cnt = (int)regs[1], n = 0;
+         pthread_mutex_lock(&G);
+-        { thr_t *me = me_or_null(); pkey_note(1, key, me ? me->handle : 0); }   // round9 观测：signal per-key 计数+首位调用者（sigaddr 0x35 同范式）
++        { thr_t *me = me_or_null(); pkey_note(1, key, me ? me->handle : 0);   // round9 观测：signal per-key 计数+首位调用者（sigaddr 0x35 同范式）
++          early1d_note(key, me ? me->handle : 0); }   // round16b：boot 前 10s 的 0x1D 目标键全录（独立表；窗口外一次 flag 读即返回）
+         for (thr_t *w; (cnt <= 0 || n < cnt) && (w = pick(2, key)); n++) lock_acquire_for(w, w->waddr, w->wtag);   // 按内核顺序；转为锁等待或被唤醒后不再是 kind 2
+         for (unsigned i = 0; i < g_pkey_n; i++) if (g_pkey[i].key == key) { g_pkey[i].n1dk += (uint64_t)n; break; }   // round8b：per-key 实际转醒数（n1d≫n1dk 且 waiters=0 = 空打；与 g_n1d_woke 总账对照）
+         for (unsigned i = 0; i < g_pkey2_n; i++) if (g_pkey2[i].key == key) { g_pkey2[i].n1dk += (uint64_t)n; break; }   // 次级表同账
+@@ -1315,6 +1339,18 @@
+                   (unsigned long long)g_pkey3[i].key, (unsigned long long)g_pkey3[i].n1c,
+                   (unsigned long long)g_pkey3[i].n1d, (unsigned long long)g_pkey3[i].n1dk, nw, g_pkey3[i].caller);
+       }
++      /* round16b 早 boot 键全录段：boot 后前 10 秒的 0x1D 目标键专用全量表（独立于 pkey 三表，
++         不受其槽位挤压）。n=窗口内该 key 的 signal 次数（boot 一次性 key 预期 n=1），
++         first-caller=窗口内首位发信号线程——与 pkey 主表同 key 行对照即知哪些活锁期 key
++         是 boot 期键的延续。 */
++      fprintf(stderr, "[totk-dump] early-boot 0x1D keys (first 10s, dedicated full table): %u key(s)%s\n",
++              g_early1d_n, g_early1d_ovf ? ", OVERFLOW beyond 256" : "");
++      for (unsigned i = 0; i < g_early1d_n; i++)
++          fprintf(stderr, "[totk-dump] early1d[%u] key=%#llx n=%llu first-caller=h%#x\n",
++                  i, (unsigned long long)g_early1d[i].key, (unsigned long long)g_early1d[i].n, g_early1d[i].caller);
++      if (g_early1d_ovf)
++          fprintf(stderr, "[totk-dump] early1d overflow: %llu signal(s) on keys beyond slot 256\n",
++                  (unsigned long long)g_early1d_ovf);
+     }
+     /* ---------- round9b CreateThread/StartThread 全量账本（E2 宿主侧排查项）----------
+        与上方线程名册（每行已带 entry=… arg=…）diff：账本里没有的 entry=从未创建；
+@@ -1357,6 +1393,48 @@
+          ENTER>0 ∧ kick1=0 → 每次进排空都走空表捷径（完成包从未入队）；ENTER>0 ∧ kick1>0 → kick 已派发。 */
+       fprintf(stderr, "[totk-dump] obs drain-enter 0x8abf70 hits=%llu last_x0=%#llx\n",
+               (unsigned long long)smo_obs_hits(7), (unsigned long long)smo_obs_last_x0(7));
++      /* round16b 排空循环块门（循环头 0x8abf94，bl 0x8ad1f0 所在块入口）：LOOP>0 ⇒ 每次
++         命中必执行 bl（块内无分支）＝kick 直接调用路径实跑；KICK1−ALKICK−LOOP=其它直接调用源。
++         首见快照=kick 三条件值（w1 / [this+0xf9] / [this+0x20]，this=节点 x8-0x1c0——
++         kick 0x8ad200 cmp w1,#1 / 0x8ad208 ldrb [x19,#0xf9] / 0x8ad278 ldr x0,[x19,#0x20]）。 */
++      fprintf(stderr, "[totk-dump] obs drain-loop 0x8abf94 hits=%llu last_x0=%#llx\n",
++              (unsigned long long)smo_obs_hits(8), (unsigned long long)smo_obs_last_x0(8));
++      {
++      extern int smo_obs_dl_snapshot(uint64_t *, uint64_t *, uint64_t *, uint64_t *, uint64_t *, uint64_t *, int *);
++      uint64_t dn, dth, dw1, df9, do20, dts; int draw = 0;
++      if (smo_obs_dl_snapshot(&dn, &dth, &dw1, &df9, &do20, &dts, &draw))
++          fprintf(stderr, "[totk-dump] drain-loop first-hit: node(x8)=%#llx kick-this=%#llx w1=%llu [this+0xf9]=%#llx [this+0x20]=%#llx at %s%llu\n",
++                  (unsigned long long)dn, (unsigned long long)dth, (unsigned long long)dw1,
++                  (unsigned long long)df9, (unsigned long long)do20, draw ? "tick " : "+", (unsigned long long)dts);
++      else fprintf(stderr, "[totk-dump] drain-loop first-hit: none (gate never hit)\n");
++      }
++      /* round16b E2b 归属：上轮 E2a this=0x7f76fcdaf8 与 h1020/h1023 arg 同 0x7f76fc 邻域。
++         对 E2 this 做池反查（宿主 NVN 池账本 gfx_bridge nvn_pool_ledger，±0x4000 页距容差）
++         + CreateThread 账本同 64K 邻域 arg 对照，一行打归属推断依据（谁的对象）。
++         64K 而非 4K：实测两跑 this 与 arg 恒隔一页（0x7f76dc1af8 vs 0x7f76dc27a8 /
++         0x7f76fcdaf8 vs 0x7f76fc2xxx），4K 页匹配会漏掉全部证据。 */
++      {
++      extern int runtime_nvn_pool_hit(uint64_t, uint64_t *, uint64_t *, unsigned *);
++      uint64_t e2a = smo_obs_last_x0(1), e2b = smo_obs_last_x0(2), probe = e2a ? e2a : e2b;
++      if (probe > 0x100000000ULL) {
++          uint64_t lo = 0, hi = 0; unsigned pfl = 0;
++          int hit = runtime_nvn_pool_hit(probe, &lo, &hi, &pfl);
++          fprintf(stderr, "[totk-dump] E2 pool attribution: E2a this=%#llx E2b this=%#llx page=%#llx nvn-pool=%s",
++                  (unsigned long long)e2a, (unsigned long long)e2b, (unsigned long long)(probe & ~0xfffull),
++                  hit ? "HIT" : "miss");
++          if (hit) fprintf(stderr, " [mem=%#llx +%#llx flags=%#x]", (unsigned long long)lo,
++                           (unsigned long long)(hi - lo), pfl);
++          int near = 0;
++          for (unsigned i = 0; i < g_ct_n; i++)
++              if (g_ct[i].arg > 0x100000000ULL && (g_ct[i].arg & ~0xfffffull) == (probe & ~0xfffffull))
++                  fprintf(stderr, "%s h=%#x arg=%#llx Δ=%+lld", near++ ? "" : " | same-64K ct-arg:",
++                          g_ct[i].handle, (unsigned long long)g_ct[i].arg, (long long)(g_ct[i].arg - probe));
++          fprintf(stderr, " -> %s\n",
++                  hit ? "host NVN 池对象（nvn_pool_ledger 命中，flags 见上）"
++                  : near ? "非 NVN 池；同 64K 邻域存在 CreateThread arg → 游戏堆上交给线程的工作/队列对象邻域"
++                  : "非已知池且无同 64K 线程 arg：归属未定（可 TOTK_DUMP_AT 静态取证该页）");
++      } else fprintf(stderr, "[totk-dump] E2 pool attribution: E2a/E2b this 均 0（门未命中），无页可归属\n");
++      }
+       /* round15b 回执写入门（gfx_bridge 回执环）：writes=退休时真实落内存次数（emu14 遗留①验收位：
+          writes>0=回执落地）；recorded 分 kind 对照未退休 pending；unknown_handle=重录后旧句柄再提交。 */
+       {
+@@ -1413,17 +1491,28 @@
+           }
+           fputc('\n', stderr);
+       }
+-      /* round15：E1 count 变迁史（建议②）——快照只存末值，N→2 缩点时刻无从对账。hits 单调，
+-         与两次 dump 的 obs E1 hits 差换算缩点近似时刻；total>64 表示环已覆盖最旧变迁。 */
++      /* round15/16b：E1 count 变迁史（环 32 条 {at-hits,count,arr,ts}）——count 曾否>2 与
++         N→2 缩点时刻：环内逐条 + 单调汇总标量（max_cnt/shrink 不受环覆盖影响）。ts 为自
++         obs 门安装起的 ns（raw=1 时 timer 不可用，退化为裸 CNTVCT tick）。 */
+       {
+-      extern unsigned smo_obs_e1_hist(uint64_t *, uint32_t *, uint64_t *, unsigned, unsigned *);
+-      uint64_t hh[64]; uint32_t hc[64]; uint64_t ha[64]; unsigned total = 0;
+-      unsigned hn = smo_obs_e1_hist(hh, hc, ha, 64, &total);
+-      fprintf(stderr, "[totk-dump] E1 count history: %u transition(s) (total=%u%s)\n",
+-              hn, total, total > 64 ? ", ring wrapped" : "");
++      extern unsigned smo_obs_e1_hist(uint64_t *, uint32_t *, uint64_t *, uint64_t *, unsigned, unsigned *, int *);
++      extern void smo_obs_e1_summary(uint32_t *, uint64_t *, uint32_t *, uint32_t *, uint64_t *, uint32_t *, int *);
++      uint64_t hh[32], ha[32], ht[32]; uint32_t hc[32]; unsigned total = 0; int raw = 0;
++      unsigned hn = smo_obs_e1_hist(hh, hc, ha, ht, 32, &total, &raw);
++      fprintf(stderr, "[totk-dump] E1 count history: %u transition(s) (total=%u%s, ts %s)\n",
++              hn, total, total > 32 ? ", ring wrapped" : "",
++              raw ? "raw ticks" : "ns, CLOCK_MONOTONIC_RAW 刻度（门安装时刻起可比，差值即耗时）");
+       for (unsigned i = 0; i < hn; i++)
+-          fprintf(stderr, "[totk-dump] E1 hist[%u] at-E1-hits=%llu count=%u arr=%#llx\n",
+-                  i, (unsigned long long)hh[i], hc[i], (unsigned long long)ha[i]);
++          fprintf(stderr, "[totk-dump] E1 hist[%u] at-E1-hits=%llu count=%u arr=%#llx ts=%llu\n",
++                  i, (unsigned long long)hh[i], hc[i], (unsigned long long)ha[i], (unsigned long long)ht[i]);
++      uint32_t mc = 0, sf = 0, st = 0, sh = 0; uint64_t mns = 0, sns = 0; int sraw = 0;
++      smo_obs_e1_summary(&mc, &mns, &sf, &st, &sns, &sh, &sraw);
++      fprintf(stderr, "[totk-dump] E1 summary: max-count-ever=%u (at %s%llu)%s",
++              mc, sraw ? "tick " : "+", (unsigned long long)mns,
++              mc > 2 ? "  ⇒ count 曾>2" : "  ⇒ count 从未>2");
++      if (sh) fprintf(stderr, "; shrink %u→%u at %s%llu (count 首次跌回≤2 的变迁=缩点时刻)",
++                      sf, st, sraw ? "tick " : "+", (unsigned long long)sns);
++      fputc('\n', stderr);
+       }
+       /* E4：两族推导表 + 交集判定（worker=key-0x78；池对象=key-0x58；绑定=[el+0x10]==wkey-0x58）。 */
+       int confluence = 0, binding = 0;
+@@ -1599,6 +1688,7 @@
+     if (pthread_create(&th, NULL, spin_sampler, NULL) == 0) pthread_detach(th);
+ }
+ __attribute__((constructor)) static void dump_init(void) {
++    if (!g_early1d_t0_set) { g_early1d_t0 = now_ns(); g_early1d_t0_set = 1; }   // round16b：早 boot 10s 窗口起点=libgame 装载时刻
+     const char *c = getenv("TOTK_LISTCHECK");
+     if (c) { pthread_t th; pthread_create(&th, NULL, list_check, (void *)(uintptr_t)strtoull(c, NULL, 0)); pthread_detach(th); }
+     const char *e = getenv("TOTK_DUMP_AFTER"); if (!e) return;

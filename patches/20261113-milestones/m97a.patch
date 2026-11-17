@@ -1,0 +1,284 @@
+--- mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c
++++ mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c
+@@ -25854,6 +25854,205 @@
+            s->layout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+ }
+ static VkImageLayout p_slot_layout(h_rt_slot *s) { return s == g_rt_cur ? g_h_layout : s->layout; }
++/* ===== M97A（2026-11-13）：present 直选源 + 自动选源 + present 时刻全 RT 普查 =====
++   背景（M96A 已闭死上半段）：shader 语料已全（nokey=0 / cache_keys=14510），场景 RT
++   `slot=15 texid=1949 lay=5 writers_all=215 nz=93.30% colored=93.30%` 有真几何，但 present 送屏的
++   `slot=2 texid=3359`（writers_all=527）回读 `mean=0/0/0 nz=0.00%`，M39A gate 又恒选 `slot=0 texid=282`
++   （黑）⇒ 缺的不是渲染，是「给 present 喂哪张纹理」。本块只解决这一件事，不动 shader/语料/拷贝链。
++   · smo_present_src = 目标 texid（十进制；0 = 关）。present 时若找得到活槽 ⇒ 换成它，仍走下面原来那条
++     barrier → CopyImageToBuffer → win_fill 的拷贝链；找不到 ⇒ 打 miss 并保持原源（不硬指、不猜）。
++   · smo_present_auto = 1 ⇒ 枚举全部活着的、present 源同尺寸的颜色 RT，逐个 16x16 签名（每次最多 8 个），
++     按 nz 高挑第一；全黑/纯色 ⇒ none 并保持原源。
++   · census：present 前 8 次 + 之后每 300 次一行（原源身份/本帧写入笔数/整 boot 笔数/签名）+ 一行全 RT 清单。
++   · 两个 knob 都**活读**（每 40 次 present 重读一次，读失败沿用旧值）、缺省 0 ⇒ 行为与旧链逐字相同；
++     新探针有硬上限 400 行/次运行，超限只打一次 `[m97a] probe limit`。 */
++#define M97A_SRC_A   "/data/storage/el2/base/files/smo_present_src"
++#define M97A_SRC_B   "/data/app/el2/100/base/com.vibecc.smo/files/smo_present_src"
++#define M97A_AUTO_A  "/data/storage/el2/base/files/smo_present_auto"
++#define M97A_AUTO_B  "/data/app/el2/100/base/com.vibecc.smo/files/smo_present_auto"
++#define M97A_MAX_LINES   400u
++#define M97A_AUTO_MAX_SIG 8
++static int          g_m97a_src = -1;    /* 直选源 texid（>0 = 开） */
++static int          g_m97a_auto = -1;   /* 自动选源（1 = 开） */
++static unsigned long long g_m97a_lastread;
++static unsigned     g_m97a_lines, g_m97a_lim_note;
++static unsigned     g_m97a_nlive;       /* 最近一次找源时活槽总数（给 miss 行） */
++static unsigned long long g_m97a_src_swaps, g_m97a_src_miss, g_m97a_auto_pick_n, g_m97a_auto_none_n;
++
++/* hdc 只能覆盖已有文件 ⇒ 由 app 先种子（值 0，不是 -1：缺省必须 = 完全旧行为）。 */
++static void m97a_seed(void)
++{
++    static int done;
++    if (done) return;
++    done = 1;
++    const char *paths[2][2] = { { M97A_SRC_A, M97A_SRC_B }, { M97A_AUTO_A, M97A_AUTO_B } };
++    for (int k = 0; k < 2; k++) {
++        int have = 0;
++        for (int i = 0; i < 2; i++) { FILE *f = fopen(paths[k][i], "r"); if (f) { have = 1; fclose(f); break; } }
++        if (have) continue;
++        for (int i = 0; i < 2; i++) {
++            FILE *f = fopen(paths[k][i], "w");
++            if (f) { fputs("0\n", f); fclose(f); vk_boot_logf("[m97a] seeded %s = 0", paths[k][i]); break; }
++        }
++    }
++}
++
++/* knob 活读：每 40 次 present（≈25 s）重读一次；值变化打一行（A/B 两段就靠它切）。 */
++static void m97a_poll(unsigned long long call)
++{
++    if (g_m97a_src < 0) {
++        m97a_seed();
++        g_m97a_src = p_file_int(M97A_SRC_A, M97A_SRC_B, 0);
++        g_m97a_auto = p_file_int(M97A_AUTO_A, M97A_AUTO_B, 0);
++        g_m97a_lastread = call;
++        vk_boot_logf("[m97a] init src=%d auto=%d file=%s", g_m97a_src, g_m97a_auto, M97A_SRC_B);
++        return;
++    }
++    if (call - g_m97a_lastread < 40) return;
++    g_m97a_lastread = call;
++    { const int os = g_m97a_src, oa = g_m97a_auto;
++      g_m97a_src = p_file_int(M97A_SRC_A, M97A_SRC_B, g_m97a_src);
++      g_m97a_auto = p_file_int(M97A_AUTO_A, M97A_AUTO_B, g_m97a_auto);
++      if (os != g_m97a_src || oa != g_m97a_auto)
++          vk_boot_logf("[m97a] knob src=%d->%d auto=%d->%d call=%llu", os, g_m97a_src, oa, g_m97a_auto, call); }
++}
++
++/* 1 = 还能打一行（硬上限 400 行/次运行；超限只提示一次）。 */
++static int m97a_budget(void)
++{
++    if (g_m97a_lines < M97A_MAX_LINES) { g_m97a_lines++; return 1; }
++    if (!g_m97a_lim_note) {
++        g_m97a_lim_note = 1;
++        vk_boot_logf("[m97a] probe limit (%u lines) reached — 后续探针静默", M97A_MAX_LINES);
++    }
++    return 0;
++}
++
++/* 槽是否「活着且可拷」（与 p_src_copyable 同口径）。 */
++static int m97a_usable(h_rt_slot *s) { return s && p_src_copyable(s); }
++
++/* 直选：按 texid 找活槽；先要精确尺寸 rw x rh，退而求其次「≥ 拷贝下限」。返回 -1 = 找不到。 */
++static int m97a_find_texid(int tid, unsigned rw, unsigned rh)
++{
++    int hit = -1, soft = -1;
++    const int ns = (int)(sizeof g_rt_tab / sizeof *g_rt_tab);
++    g_m97a_nlive = 0;
++    for (int i = 0; i < ns; i++) {
++        h_rt_slot *s = &g_rt_tab[i];
++        if (!s->img) continue;
++        g_m97a_nlive++;
++        if (s->tex_id != tid || !m97a_usable(s)) continue;
++        if (s->w == rw && s->h == rh) { hit = i; break; }
++        if (soft < 0) soft = i;
++    }
++    return hit >= 0 ? hit : soft;
++}
++
++/* 自动选源：枚举全部活着的、尺寸 == rw x rh 的颜色 RT，按「本帧写入笔数 → 整 boot 笔数」降序，
++   最多签 8 个，取 nz 最高且非纯色（nt>1、nz>1%）的一个。返回槽号，-1 = 没有可用内容。 */
++static int m97a_auto_pick(unsigned rw, unsigned rh, double *nz_o, unsigned *mr_o, unsigned *mg_o,
++                          unsigned *mb_o, int *nsig_o)
++{
++    const int ns = (int)(sizeof g_rt_tab / sizeof *g_rt_tab);
++    int idx[64]; int n = 0;
++    for (int i = 0; i < ns && n < 64; i++) {
++        h_rt_slot *s = &g_rt_tab[i];
++        if (!m97a_usable(s) || s->w != rw || s->h != rh) continue;
++        const VkImageLayout lay = p_slot_layout(s);
++        if (lay != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL &&
++            lay != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) continue;   /* 签名只认这两态 */
++        idx[n++] = i;
++    }
++    for (int a = 0; a < n; a++)
++        for (int b = a + 1; b < n; b++) {
++            const unsigned da = g_slot_dw_prev[idx[a]], db = g_slot_dw_prev[idx[b]];
++            const unsigned long long aa = g_slot_dw_all[idx[a]], ab = g_slot_dw_all[idx[b]];
++            if (db > da || (db == da && ab > aa)) { int t = idx[a]; idx[a] = idx[b]; idx[b] = t; }
++        }
++    int best = -1, nsig = 0; double bnz = -1.0; unsigned bmr = 0, bmg = 0, bmb = 0;
++    char list[240]; int lo = 0; list[0] = 0;
++    for (int a = 0; a < n && nsig < M97A_AUTO_MAX_SIG; a++) {
++        h_rt_slot *s = &g_rt_tab[idx[a]];
++        r_sig_t sg; memset(&sg, 0, sizeof sg);
++        if (!r_tex_signature(s->img, p_slot_layout(s), s->w, s->h, 4, &sg)) continue;
++        nsig++;
++        const double np = (double)(sg.npx ? sg.npx : 1);
++        const double nzp = 100.0 * (double)sg.nz / (4.0 * np);
++        if (lo < (int)sizeof list - 40)
++            lo += snprintf(list + lo, sizeof list - (size_t)lo, " %d:%d:%.0f%%:%u",
++                           idx[a], (int)s->tex_id, nzp, g_slot_dw_prev[idx[a]]);
++        if (sg.nt > 1 && nzp > 1.0 && nzp > bnz) {
++            bnz = nzp; best = idx[a];
++            bmr = (unsigned)(sg.sum[0] / np); bmg = (unsigned)(sg.sum[1] / np); bmb = (unsigned)(sg.sum[2] / np);
++        }
++    }
++    if (m97a_budget())
++        vk_boot_logf("[m97a] auto cands n=%d sig=%d%s", n, nsig, lo ? list : " <none>");
++    if (nz_o) *nz_o = bnz < 0 ? 0.0 : bnz;
++    if (mr_o) *mr_o = bmr;
++    if (mg_o) *mg_o = bmg;
++    if (mb_o) *mb_o = bmb;
++    if (nsig_o) *nsig_o = nsig;
++    return best;
++}
++
++/* present 时刻普查：原源身份 + 本帧/整 boot 写入笔数 + 签名；再一行全 800x450 活 RT 精简清单。 */
++static void m97a_census(unsigned long long call, const char *srcname, int slot,
++                        VkImage simg, VkImageLayout slay, unsigned sw, unsigned sh)
++{
++    if (!(call <= 8 || (call % 300) == 0)) return;
++    const int ns = (int)(sizeof g_rt_tab / sizeof *g_rt_tab);
++    h_rt_slot *s = (slot >= 0 && slot < ns) ? &g_rt_tab[slot] : NULL;
++    r_sig_t sg; memset(&sg, 0, sizeof sg);
++    const int ok = (simg && sw && sh) ? r_tex_signature(simg, slay, sw, sh, 4, &sg) : 0;
++    const double np = (double)((ok && sg.npx) ? sg.npx : 1);
++    int dom = 0;
++    for (int i = 1; i < sg.nt; i++) if (sg.tn[i] > sg.tn[dom]) dom = i;
++    const double colored = 100.0 * (np - (ok && sg.nt ? (double)sg.tn[dom] : 0.0)) / np;
++    const double nzp = 100.0 * (double)(ok ? sg.nz : 0) / (4.0 * np);
++    const unsigned dwf = (slot >= 0 && slot < (int)(sizeof g_slot_dw_prev / sizeof *g_slot_dw_prev))
++                       ? g_slot_dw_prev[slot] : 0u;
++    const unsigned long long dwa = s ? g_slot_dw_all[slot] : 0ull;
++    if (!m97a_budget()) return;
++    vk_boot_logf("[m97a] census call=%llu c=%llu src=%s slot=%d texid=%d ext=%ux%u fmt=%u lay=%d ok=%d "
++                 "dwf=%u dwall=%llu nz=%.1f%% mean=%llu/%llu/%llu colored=%.1f%% nt=%d",
++                 call, g_p_calls, srcname, slot, s ? (int)s->tex_id : -1, sw, sh, s ? (unsigned)s->fmt : 0u,
++                 (int)slay, ok, dwf, dwa, nzp,
++                 ok ? (unsigned long long)(sg.sum[0] / np) : 0ull,
++                 ok ? (unsigned long long)(sg.sum[1] / np) : 0ull,
++                 ok ? (unsigned long long)(sg.sum[2] / np) : 0ull, colored, ok ? sg.nt : 0);
++    /* 全 800x450 活 RT 清单（最多 12 条：slot:texid:w x h:dwf:nz） */
++    int order[64]; int n = 0;
++    for (int i = 0; i < ns && n < 64; i++) {
++        h_rt_slot *t = &g_rt_tab[i];
++        if (!t->img || !t->w || !t->h || t->w != sw || t->h != sh) continue;
++        const VkImageLayout lay = p_slot_layout(t);
++        if (lay != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL &&
++            lay != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) continue;
++        order[n++] = i;
++    }
++    for (int a = 0; a < n; a++)
++        for (int b = a + 1; b < n; b++) {
++            const unsigned da = g_slot_dw_prev[order[a]], db = g_slot_dw_prev[order[b]];
++            const unsigned long long aa = g_slot_dw_all[order[a]], ab = g_slot_dw_all[order[b]];
++            if (db > da || (db == da && ab > aa)) { int t = order[a]; order[a] = order[b]; order[b] = t; }
++        }
++    char list[320]; int o = 0, lc = 0;
++    list[0] = 0;
++    for (int a = 0; a < n && a < 12; a++) {
++        h_rt_slot *t = &g_rt_tab[order[a]];
++        r_sig_t s2; memset(&s2, 0, sizeof s2);
++        const int ok2 = r_tex_signature(t->img, p_slot_layout(t), t->w, t->h, 4, &s2);
++        const double np2 = (double)((ok2 && s2.npx) ? s2.npx : 1);
++        const double nz2 = 100.0 * (double)(ok2 ? s2.nz : 0) / (4.0 * np2);
++        if (o < (int)sizeof list - 40)
++            o += snprintf(list + o, sizeof list - (size_t)o, " %d:%d:%ux%u:%u:%.0f",
++                          order[a], (int)t->tex_id, (unsigned)t->w, (unsigned)t->h,
++                          g_slot_dw_prev[order[a]], nz2);
++        lc++;
++    }
++    if (m97a_budget()) vk_boot_logf("[m97a] census rt n=%d%s", lc, o ? list : " <none>");
++}
+ /* ===== M39E（2026-11-09）：submit 时刻 vs present 时刻的同槽签名对照（取证用，默认关）=====
+    问题：present 时刻活 RT 常已被 guest 清成常量/近黑 ⇒ 直送只能送死内容。
+    若 submit 边界上该槽还有内容（nt>1 / nz 高），则内容是在 submit 之后被清的 ⇒ 正确修法是
+@@ -29081,6 +29280,62 @@
+         }
+         if ((m80a_bits() & 4) && call >= 20) m80a_dump_slots(call);
+     }
++    /* ===== M97A（2026-11-13）：present 直选源 / 自动选源 + present 时刻全 RT 普查 =====
++       位置：所有选源分支（tex/ours/snap/worldRT/gpres/M38H/M39A/M40AT/M42F/M80A）之后、台账与拷贝之前
++       ⇒ 只替换「最终送屏的那张图」，下面的 barrier → CopyImageToBuffer → win_fill 拷贝链一行不改；
++       两个 knob 都缺省 0 ⇒ 除新增探针行外行为与旧链逐字相同（M97A 不允许绕开拷贝链）。 */
++    int m97a_sel = -1;
++    {
++        /* 「present 原源」= 关掉本块时本来会送屏的那张（tex 路径记它的槽号，非 tex 路径记 -1）。 */
++        const int org_slot = (m80a_sel >= 0) ? m80a_sel
++                           : (m38h_sel >= 0) ? m38h_sel
++                           : (pslot && !snap_used) ? pslot_i : -1;
++        const char *m97a_osrc = srcname;
++        const unsigned m97a_osw = sw, m97a_osh = sh;
++        m97a_poll(call);
++        m97a_census(call, m97a_osrc, org_slot, simg, slay, sw, sh);
++        if (g_m97a_auto == 1) {
++            double nzp = 0.0; unsigned mr = 0, mg = 0, mb = 0; int nsig = 0;
++            const int ai = m97a_auto_pick(sw, sh, &nzp, &mr, &mg, &mb, &nsig);
++            if (ai >= 0) {
++                h_rt_slot *as = &g_rt_tab[ai];
++                simg = as->img; sw = as->w; sh = as->h; slay = p_slot_layout(as);
++                srcname = "m97a-auto"; snap_used = 0; m97a_sel = ai;
++                g_m97a_auto_pick_n++;
++                if (m97a_budget())
++                    vk_boot_logf("[m97a] auto pick=texid=%d/slot=%d nz=%.1f%% mean=%u/%u/%u sig=%d "
++                                 "dwf=%u dwall=%llu was=%s/%ux%u n=%llu call=%llu",
++                                 (int)as->tex_id, ai, nzp, mr, mg, mb, nsig,
++                                 g_slot_dw_prev[ai], g_slot_dw_all[ai],
++                                 m97a_osrc, m97a_osw, m97a_osh, g_m97a_auto_pick_n, call);
++            } else {
++                g_m97a_auto_none_n++;
++                if (m97a_budget())
++                    vk_boot_logf("[m97a] auto none sig=%d was=%s/%ux%u n=%llu call=%llu "
++                                 "(候选全黑/纯色 ⇒ 保持原源)", nsig, m97a_osrc, m97a_osw, m97a_osh,
++                                 g_m97a_auto_none_n, call);
++            }
++        } else if (g_m97a_src > 0) {
++            const int si = m97a_find_texid(g_m97a_src, sw, sh);
++            if (si >= 0) {
++                h_rt_slot *ss = &g_rt_tab[si];
++                simg = ss->img; sw = ss->w; sh = ss->h; slay = p_slot_layout(ss);
++                srcname = "m97a-src"; snap_used = 0; m97a_sel = si;
++                g_m97a_src_swaps++;
++                if (m97a_budget())
++                    vk_boot_logf("[m97a] src want=%d slot=%d texid=%d ext=%ux%u lay=%d dwf=%u dwall=%llu "
++                                 "fmt=%u was=%s/%ux%u n=%llu call=%llu",
++                                 g_m97a_src, si, (int)ss->tex_id, (unsigned)ss->w, (unsigned)ss->h,
++                                 (int)slay, g_slot_dw_prev[si], g_slot_dw_all[si], (unsigned)ss->fmt,
++                                 m97a_osrc, m97a_osw, m97a_osh, g_m97a_src_swaps, call);
++            } else {
++                g_m97a_src_miss++;
++                if ((g_m97a_src_miss <= 6 || (g_m97a_src_miss % 100) == 0) && m97a_budget())
++                    vk_boot_logf("[m97a] src miss want=%d live=%u ext=%ux%u (保持原源 %s) n=%llu call=%llu",
++                                 g_m97a_src, g_m97a_nlive, sw, sh, m97a_osrc, g_m97a_src_miss, call);
++            }
++        }
++    }
+     /* M4al P2：台账按**最终**选中的源记（快照会覆盖上面 pslot 已写下的 tex 选择）。 */
+     g_p_last_src = srcname; g_p_last_slot = snap_used ? -1 : pslot_i;
+     /* M4cc P2 (log-only, optional second change; M4cb P4-bug#1): when the source is the 282 RT the
+@@ -29094,10 +29349,11 @@
+     if (!strcmp(srcname, "au-pick")) g_p_last_slot = g_au_pres_slot;   /* M40AU：台账记 post-draw 记账的那个槽 */
+     if (!strcmp(srcname, "comp")) g_p_last_slot = g_m42f_slot;   /* M42F：台账记真正供帧的那个槽 */
+     if (m80a_sel >= 0) g_p_last_slot = m80a_sel;   /* M80A：同上（否则 [p] 行 slot/ext 对不上） */
++    if (m97a_sel >= 0) g_p_last_slot = m97a_sel;   /* M97A：直选/自动选源的槽（否则台账 slot/ext 对不上） */
+     g_p_last_w = sw; g_p_last_h = sh;
+     /* M4ak P3：本帧选源身份（[p] sig 行会带出去配对）。快照不是槽 ⇒ sel_slot=-1（修掉 M4ak 记的标注 bug）。 */
+     g_p_sel_call = call;
+-    g_p_sel_slot = (m80a_sel >= 0) ? m80a_sel : (m38h_sel >= 0) ? m38h_sel : (m39a_sel >= 0) ? m39a_sel
++    g_p_sel_slot = (m97a_sel >= 0) ? m97a_sel : (m80a_sel >= 0) ? m80a_sel : (m38h_sel >= 0) ? m38h_sel : (m39a_sel >= 0) ? m39a_sel
+                  : (snap_used ? -1 : (!strcmp(srcname, "au-pick") ? g_au_pres_slot : pslot_i));
+     g_p_sel_why = srcname;
+     /* M39N（2026-11-09）：把「真正要拷去上屏的那张图」在指定 draws 门槛上 dump 一次。

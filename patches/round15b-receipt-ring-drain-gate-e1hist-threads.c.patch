@@ -1,0 +1,42 @@
+--- /Users/zpp/ZCodeProject/switch2mac/switch2hos/mario-odessy-harmony/entry/src/main/cpp/host/threads.c	2026-11-01 08:27:46
++++ /Users/zpp/VibeCoding/ns-mario-odessy-to-harmony/mario-odessy-harmony/entry/src/main/cpp/host/threads.c	2026-11-01 09:43:30
+@@ -1353,6 +1353,20 @@
+               (unsigned long long)smo_obs_hits(5), (unsigned long long)smo_obs_last_x0(5));
+       fprintf(stderr, "[totk-dump] obs kick3 0x8ad318 hits=%llu last_x0=%#llx\n",
+               (unsigned long long)smo_obs_hits(6), (unsigned long long)smo_obs_last_x0(6));
++      /* round15 排空路径门：ENTER=0 → 排空函数从未被调（两调用源均未到达）；
++         ENTER>0 ∧ kick1=0 → 每次进排空都走空表捷径（完成包从未入队）；ENTER>0 ∧ kick1>0 → kick 已派发。 */
++      fprintf(stderr, "[totk-dump] obs drain-enter 0x8abf70 hits=%llu last_x0=%#llx\n",
++              (unsigned long long)smo_obs_hits(7), (unsigned long long)smo_obs_last_x0(7));
++      /* round15b 回执写入门（gfx_bridge 回执环）：writes=退休时真实落内存次数（emu14 遗留①验收位：
++         writes>0=回执落地）；recorded 分 kind 对照未退休 pending；unknown_handle=重录后旧句柄再提交。 */
++      {
++      extern uint64_t dm_nvn_receipt_stat(int);
++      fprintf(stderr, "[totk-dump] receipt ring: writes=%llu pending=%llu recorded(counter=%llu value=%llu signal=%llu) dropped=%llu unknown_handle=%llu submits=%llu\n",
++              (unsigned long long)dm_nvn_receipt_stat(0), (unsigned long long)dm_nvn_receipt_stat(1),
++              (unsigned long long)dm_nvn_receipt_stat(2), (unsigned long long)dm_nvn_receipt_stat(3),
++              (unsigned long long)dm_nvn_receipt_stat(4), (unsigned long long)dm_nvn_receipt_stat(5),
++              (unsigned long long)dm_nvn_receipt_stat(6), (unsigned long long)dm_nvn_receipt_stat(7));
++      }
+       /* round12e 定名：GetLoadProgress f() 的两条双间接 cell 链（0x1363dc8 已知=Map 作验证位，0x136deb8 待定名） */
+       {
+       extern int smo_obs_cell2_snapshot(uint64_t[6]);
+@@ -1399,6 +1413,18 @@
+           }
+           fputc('\n', stderr);
+       }
++      /* round15：E1 count 变迁史（建议②）——快照只存末值，N→2 缩点时刻无从对账。hits 单调，
++         与两次 dump 的 obs E1 hits 差换算缩点近似时刻；total>64 表示环已覆盖最旧变迁。 */
++      {
++      extern unsigned smo_obs_e1_hist(uint64_t *, uint32_t *, uint64_t *, unsigned, unsigned *);
++      uint64_t hh[64]; uint32_t hc[64]; uint64_t ha[64]; unsigned total = 0;
++      unsigned hn = smo_obs_e1_hist(hh, hc, ha, 64, &total);
++      fprintf(stderr, "[totk-dump] E1 count history: %u transition(s) (total=%u%s)\n",
++              hn, total, total > 64 ? ", ring wrapped" : "");
++      for (unsigned i = 0; i < hn; i++)
++          fprintf(stderr, "[totk-dump] E1 hist[%u] at-E1-hits=%llu count=%u arr=%#llx\n",
++                  i, (unsigned long long)hh[i], hc[i], (unsigned long long)ha[i]);
++      }
+       /* E4：两族推导表 + 交集判定（worker=key-0x78；池对象=key-0x58；绑定=[el+0x10]==wkey-0x58）。 */
+       int confluence = 0, binding = 0;
+       for (thr_t *w = g_wait; w; w = w->next) if (w->wkind == 2) {

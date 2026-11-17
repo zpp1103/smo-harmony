@@ -1,0 +1,136 @@
+--- mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c
++++ mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c
+@@ -1378,7 +1378,80 @@
+     if (*ps != VK_NULL_HANDLE) m130a_guard_log(site, "*ps!=null (stale)", cnt, ps);   /* 出参脏值：只记不拦 */
+     return 1;
+ }
++
++/* ============ M135A（2026-11-14）：`ci->layout == VK_NULL_HANDLE` 根因修复（knob `smo_pso_layout`，缺省 1 = 开）============
++   根因（m135a 报告 Q1，两级证据）：m119b.patch 重写主表建管线的 gi 字段块时**删掉了** `gi.layout = layout;`
++   —— `logs/m119b/m119b.patch` 第 520 行是 `-    gi.layout = layout; …`，而 521–527 行的 `+` 侧只有
++   renderPass/subpass，没有 layout。`gi` 是 `VkGraphicsPipelineCreateInfo gi = { VK_STRUCTURE_TYPE_… }`
++   零初始化 ⇒ 主表（444 条）每次 create 的 `layout` 恒为 VK_NULL_HANDLE（真机 build #9 的
++   `smo_pso_guard=1` 实测 214/214 条全是 `field=layout`）。m119b 之前的树（build #5）该行在
++   ⇒ 泛型路径 layout 非空，这也是 #5 能出 590 帧采样的原因。
++   修法 A（本单）两层，同一个 knob 管：
++     ① **调用点回填**：主表把上面已经建好/复用的 `layout` 填回 `gi.layout`。`layout` 由主表那段
++        vkCreatePipelineLayout 建（2 setLayouts = {kv->dsl, kf->dsl}）并在成功后回填 `e->lay`；
++        draw 侧 `r_pipe_layout()` 返回的正是同一个 `e->lay`，`vkCmdBindDescriptorSets` 绑的就是它
++        ⇒ 管线 layout 与 bind 时 layout 必须是同一个句柄，这是唯一能保证 descriptor 兼容的连法
++        （所以**不能**只在入口拿一个 0 setLayouts 的空 layout 顶上，那会让 bind 变成不兼容用法）。
++     ② **入口兜底**：唯一入口 m40ac_create_pipe 若仍见到空 layout，就懒建一个最简 layout
++        （0 setLayouts，只用一次）并用**局部副本**回填后交给驱动 —— 空句柄从此永不进驱动，
++        调用方栈对象与 m40ac 的 cache 逻辑都不动。本移植当前 ②不应被触发（①已覆盖全部 4 个 create 点）。
++   关态（smo_pso_layout=0）纪律：`g_m135a_layout` 是启动期一次读好的 static int，运行期只多一次 int 读、
++   一次比较；`gi.layout` 保持零值、②的整段不执行 ⇒ **逐字节等于 build #9**（零日志、零 syscall、
++   Vulkan 调用序列不变）。smo_pso_guard 的语义一字未动（它仍是「先拦后记」的取证开关）。 */
++#define M135A_SW_A   "/data/storage/el2/base/files/smo_pso_layout"
++#define M135A_SW_B   "/data/app/el2/100/base/com.vibecc.smo/files/smo_pso_layout"
++static int g_m135a_layout = 1;              /* 缺省 1 = 修法生效；constructor 里按文件覆盖 */
++static VkPipelineLayout g_m135a_fb_pl;      /* ②的兜底 layout（0 setLayouts），只建一次 */
++static int g_m135a_fb_tried;
++static unsigned long long g_m135a_hits;     /* ②命中次数（当前应为 0；>0 说明还有调用点没回填） */
+ 
++/* 照抄 m130a_seed：种 "1\n" + chmod 0666（hdc 是 uid=2000，只能覆盖**已存在**的 666 文件）。 */
++__attribute__((constructor)) static void m135a_seed(void)
++{
++    static const char *const p[2] = { M135A_SW_A, M135A_SW_B };
++    for (int i = 0; i < 2; i++) {
++        if (access(p[i], F_OK) == 0) { chmod(p[i], 0666); continue; }
++        int fd = open(p[i], O_CREAT | O_WRONLY | O_TRUNC, 0666);
++        if (fd >= 0) { ssize_t wr = write(fd, "1\n", 2); (void)wr; close(fd); chmod(p[i], 0666); }
++    }
++    /* 读一次（A→B 兜底）。只在 constructor 里做 ⇒ 建管线路径上永远只有一次 int 读。 */
++    for (int i = 0; i < 2; i++) {
++        int fd = open(p[i], O_RDONLY);
++        if (fd < 0) continue;
++        char b[16]; ssize_t n = read(fd, b, sizeof b - 1); close(fd);
++        if (n <= 0) break;
++        b[n] = 0; g_m135a_layout = atoi(b) != 0; break;
++    }
++}
++static int m135a_layout_on(void)
++{
++    /* 开态只在**首次**使用时打一行（证明 knob 真的生效）；关态连这个判断都不进 ⇒ 零日志。 */
++    static int logged;
++    if (g_m135a_layout && !logged) {
++        logged = 1;
++        vk_boot_logf("[m135a] layout fix on=1 file=%s (gi.layout backfill at call sites + lazy minimal layout at m40ac_create_pipe)",
++                     M135A_SW_B);
++    }
++    return g_m135a_layout;
++}
++
++/* ②的懒建：0 setLayouts 的最简 layout。失败一次就不再试（失败时返回 NULL ⇒ 调用方把空 layout 拦下不送驱动）。 */
++static VkPipelineLayout m135a_fb_layout(VkDevice dev)
++{
++    if (g_m135a_fb_pl) return g_m135a_fb_pl;
++    if (g_m135a_fb_tried) return VK_NULL_HANDLE;
++    g_m135a_fb_tried = 1;
++    VkPipelineLayoutCreateInfo pl = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
++    VkResult rv = vkCreatePipelineLayout(dev, &pl, NULL, &g_m135a_fb_pl);
++    if (rv != VK_SUCCESS) {
++        g_m135a_fb_pl = VK_NULL_HANDLE;
++        vk_boot_logf("[m135a] fallback layout rv=%d (%s) -> 空 layout 仍不送驱动", (int)rv, vr(rv));
++        return VK_NULL_HANDLE;
++    }
++    vk_boot_logf("[m135a] fallback layout ok pl=%#llx sets=0 (lazy, once)", (unsigned long long)(uintptr_t)g_m135a_fb_pl);
++    return g_m135a_fb_pl;
++}
++
+ /* 4 处创建的唯一入口：开态才加锁+带 cache；关态走原样调用（逐字节旧行为）。
+    M40AI：全程计时（关态只多两次 clock_gettime）；smo_m40ai_lock=1 时整段再用 g_m40ai_mtx 串行，
+    把「并发 JIT」降为「串行 JIT」——用于判定冻结/崩点是 JIT 竞态还是可执行内存耗尽。 */
+@@ -1386,9 +1459,26 @@
+ static VkResult m40ac_create_pipe(VkDevice dev, uint32_t cnt, const VkGraphicsPipelineCreateInfo *ci,
+                                  const VkAllocationCallbacks *ac, VkPipeline *ps)
+ {
++    /* M135A（2026-11-14）②：入口兜底 —— 空 layout 懒建 + 回填。**放在 M130A 守卫之前**：
++       这样开态下 `[m130a] guard field=layout` 的计数应当归零，真机可直接拿它当「根因已修」的判据。
++       关态（smo_pso_layout=0）整段不执行（只多一次 int 读 + 一次比较）⇒ 与 build #9 逐字节相同。
++       用**局部副本**改 layout：不动调用方栈上的 gi、也不动 m40ac 的 cache 语义。 */
++    const VkGraphicsPipelineCreateInfo *m135a_ci = ci;
++    VkGraphicsPipelineCreateInfo m135a_one;
++    if (m135a_layout_on() && m135a_ci && cnt == 1 && !m135a_ci[0].layout) {
++        VkPipelineLayout fbl = m135a_fb_layout(dev);
++        if (!fbl) return VK_ERROR_INITIALIZATION_FAILED;
++        g_m135a_hits++;
++        if (g_m135a_hits <= 4 || g_m135a_hits % 1000 == 0)
++            vk_boot_logf("[m135a] create pipe layout was NULL -> fallback pl=%#llx hits=%llu tid=%d",
++                         (unsigned long long)(uintptr_t)fbl, g_m135a_hits, m130a_tid());
++        m135a_one = m135a_ci[0];
++        m135a_one.layout = fbl;
++        m135a_ci = &m135a_one;
++    }
+     /* M130A（2026-11-14）：入口统一判空。关态（smo_pso_guard=0）⇒ 短路，不进 precheck、不碰任何 Vulkan 调用；
+        开态发现空句柄 ⇒ 一律不送驱动，直接返回失败，让既有 fallback 接住（链 1：renderPass 等）。 */
+-    if (m130a_guard_on() && !m130a_pipe_precheck("m40ac_create_pipe", dev, cnt, ci, ps))
++    if (m130a_guard_on() && !m130a_pipe_precheck("m40ac_create_pipe", dev, cnt, m135a_ci, ps))
+         return VK_ERROR_INITIALIZATION_FAILED;
+     VkPipelineCache c = m40ac_cache_get();
+     int ser = smo_m40ai_lock();
+@@ -1396,10 +1486,10 @@
+     { int _pp = m44b_pipe_pace_us(); if (_pp > 0) usleep((useconds_t)_pp); }   /* M44B：建管线节奏错开（缺省 0 = 无） */
+     if (ser) pthread_mutex_lock(&g_m40ai_mtx);
+     VkResult rv;
+-    if (!c) rv = vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, cnt, ci, ac, ps);
++    if (!c) rv = vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, cnt, m135a_ci, ac, ps);
+     else {
+         pthread_mutex_lock(&g_m40ac_mtx);
+-        rv = vkCreateGraphicsPipelines(dev, c, cnt, ci, ac, ps);
++        rv = vkCreateGraphicsPipelines(dev, c, cnt, m135a_ci, ac, ps);
+         pthread_mutex_unlock(&g_m40ac_mtx);
+     }
+     if (ser) pthread_mutex_unlock(&g_m40ai_mtx);
+@@ -11518,6 +11608,11 @@
+     gi.pViewportState = &vs;      gi.pRasterizationState = &rs;
+     gi.pMultisampleState = &ms;   gi.pDepthStencilState = &dss;
+     gi.pColorBlendState = &cb;    gi.pDynamicState = &ds;
++    /* M135A（2026-11-14）①：把上面建好/复用的 layout 填回 gi。
++       m119b.patch 重写这个字段块时把原来的 `gi.layout = layout;` 删掉了（该 hunk 只剩 renderPass/subpass），
++       而 gi 是零初始化 ⇒ 主表每次 create 的 layout 都是 VK_NULL_HANDLE（真机 build #9 实测 214/214）。
++       关态（smo_pso_layout=0）不赋值 ⇒ 与 build #9 逐字节相同。 */
++    if (m135a_layout_on()) gi.layout = layout;
+     /* M119B：N 附件通道用 g_r_rp_n[N] / g_r_rp_dn[var][N]
+        （渲染通道兼容性要求颜色引用数一致，不能借 1 附件的 g_r_rp / g_r_rp_d）。 */
+     { int mr = mrt_n ? ((var == 1 || var == 2) ? h_mrt_rp_d(var, mrt_n) : h_mrt_rp(mrt_n)) : 0;

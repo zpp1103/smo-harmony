@@ -1,0 +1,30 @@
+{
+  "module": {
+    "name": "entry",
+    "type": "entry",
+    "deliveryWithInstall": true,
+    "pages": "$profile:main_pages",
+    "installationFree": false,
+    "description": "$string:module_desc",
+    "mainElement": "EntryAbility",
+    "deviceTypes": ["phone", "tablet"],
+    "requestPermissions": [
+      { "name": "ohos.permission.ACCELEROMETER" },
+      { "name": "ohos.permission.INTERNET" }
+    ],
+    "abilities": [
+      {
+        "name": "EntryAbility",
+        "srcEntry": "./ets/entryability/EntryAbility.ets",
+        "description": "$string:ability_desc",
+        "icon": "$media:icon",
+        "label": "$string:ability_label",
+        "startWindowIcon": "$media:icon",
+        "startWindowBackground": "$color:start_window_background",
+        "orientation": "landscape",
+        "exported": true,
+        "skills": [{ "entities": ["entity.system.home"], "actions": ["action.system.home"] }]
+      }
+    ]
+  }
+}

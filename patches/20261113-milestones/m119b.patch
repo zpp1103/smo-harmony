@@ -1,0 +1,915 @@
+--- platform/nvn_vk/nvn_vk.h
++++ platform/nvn_vk/nvn_vk.h
+@@ -101,6 +101,20 @@
+ int nvn_vk_rt_bind(int n, unsigned long long key, unsigned rw, unsigned rh, int tex_id, unsigned fmt,
+                    unsigned long long dkey,
+                    unsigned long long *out_img, unsigned *out_w, unsigned *out_h);
++/* ---- M119B（2026-11-14）：MRT 颜色附件声明 ----
++   背景（真机事实，logs/m121a/declhist.txt）：`decl_gt1=1472…1544`（≈9% of 16,183 次绑定）声明了
++   4~8 个颜色目标，而回放层此前恒只绑 1 个（cmd_trace.c 只读 RtRec.tex[0]）。
++   本入口把 SET_RENDER_TARGETS 的 colors[0..n-1] 逐个交下来：每项 = 该颜色目标的**存储身份**
++   （池数据地址，与 tex0 同一套解析口径）+ 光栅前尺寸 + 游戏纹理 id + NVN 格式。
++   回放层的纪律：**按「身份 + 宽高」找/建槽，绝不按附件序号认槽**（序号在不同 pass 之间没有稳定含义）。
++   atts[0] 是主附件（与 rt_bind 的 key 同源，回放层以 rt_bind 的参数为准），1..n-1 才是本次新增的附件。
++   必须在对应的 nvn_vk_rt_bind **之前**调用（同线程、按序）；n<=1 或 knob 关时是空调用。 */
++typedef struct { unsigned long long key; unsigned w, h; int tex_id; unsigned fmt; } nvn_rt_att;
++void nvn_vk_rt_attachments(int n, const nvn_rt_att *atts);
++/* M119B：两个 knob 的回读（2 s 缓存，缺省 0 = 关）。给 gfx_bridge 在入口做零代价旁路用：
++   `nvn_vk_mrt_on()==0` ⇒ 不解析颜色目标、不打印、不改任何状态（关态逐字节等于 build #6）。 */
++int nvn_vk_mrt_on(void);
++int nvn_vk_rb_chk_on(void);
+ /* M4q P1：深度目标留证槽。SET_RENDER_TARGETS 的 depth（NVNtexture*）此前完全没交给回放层，
+    于是 n=0 的纯深度 pass 在宿主侧等于「没有目标」，1024×1024 深度图在日志里根本没有身份。
+    本入口只按游戏声明的尺寸/格式建一张深度 VkImage 并打一行 [h] rt depth slot（本轮**不**接进
+--- platform/nvn_vk/nvn_vk.c
++++ platform/nvn_vk/nvn_vk.c
+@@ -5489,6 +5489,335 @@
+     return v;
+ }
+ 
++/* ================= M119B（2026-11-14）：MRT 多颜色附件（knob `smo_rt_mrt`，缺省 0）=================
++   事实（真机 build #5 实测，logs/m121a/declhist.txt，口径 = SET_RENDER_TARGETS 的 n）：
++     `decl_gt1=1472…1544`（≈9% of 16,183 次绑定），400×225 桶 `ngt3` 从 774 涨到 881、`n2` 最多 367
++     ⇒ **游戏确实在声明 4~8 个颜色目标**，而本层此前恒只绑 1 个附件（cmd_trace.c 只读 RtRec.tex[0]
++     → gfx_bridge.c:2788 只传 tex0），其余附件被**静默折叠**。本块把这条链补齐：
++       ① 声明入口 nvn_vk_rt_attachments()：gfx_bridge 逐项解析 colors[0..n-1]（身份/宽高/texid/fmt）后交下来；
++       ② 槽解析 m119b_mrt_resolve()：**按「存储身份 + 宽高」**找/建槽（绝不按附件序号认槽），
++          任何一项对不上就 g_mrt_n=0 并**显式**记 why（`[m119b] mrt skip why=…`，不静默）；
++       ③ 渲染 h_mrt_rp()/h_fb_mrt()：懒建 N 附件 render pass（N=2..8，模板 = h_rp_depth 的 var 机制）
++          与按「视图元组」缓存的 framebuffer；draw 前 h_mrt_barriers() 把 N 个附件都转
++          COLOR_ATTACHMENT_OPTIMAL，pass 结束 h_mrt_layout_back() 逐槽写回 layout 记账。
++   管线：N 附件的 render pass 与 g_r_rp（1 附件）**不兼容**（Vulkan 渲染通道兼容性要求颜色引用数相同），
++   所以 r_pipe_var_i 里多了「按 (var,N) 的管线变体」（小表 g_mrt_pv，见 m119b_pv_slot 的注释）。
++   边界（诚实清单）：本单只接通**颜色-only** 通道（dvar==0）。带深度的 pass 显式记
++   `skip why=depth_pass`（g_r_rp_d 的 N 附件变体留后续单）；同一图既作附件又被采样（反馈环）尚未防。
++   knob（文件通道，沿用 M113A/M119A/M122A 的约定）：
++     `smo_rt_mrt` 0 = 关（缺省：不解析、不建图、不打日志、逐字节等于 build #6）  1 = 开
++     `smo_rb_chk` 0 = 关（缺省）  1 = 开（两路回读校验，见文件后部 m119b_rb_check）
++   ========================================================================================== */
++#define M119B_DIR_A "/data/storage/el2/base/files"
++#define M119B_DIR_B "/data/app/el2/100/base/com.vibecc.smo/files"
++#define M119B_MRT_A M119B_DIR_A "/smo_rt_mrt"
++#define M119B_MRT_B M119B_DIR_B "/smo_rt_mrt"
++#define M119B_RB_A  M119B_DIR_A "/smo_rb_chk"
++#define M119B_RB_B  M119B_DIR_B "/smo_rb_chk"
++#define M119B_MAX_ATT 8
++static int p_file_int(const char *a, const char *b, int def);   /* 定义在 :22687 附近，此处前置声明 */
++/* 缺省 0；2 s 重读；只在「值变化」时打一行 ⇒ 关态 0 行日志。 */
++static int m119b_sw(const char *pa, const char *pb, int slot)
++{
++    static int v[2] = { -1, -1 };
++    static double kt[2];
++    const double t = (double)pf_now_us() / 1e6;
++    const char *nm = slot ? "smo_rb_chk" : "smo_rt_mrt";
++    if (v[slot] < 0) {
++        v[slot] = p_file_int(pa, pb, 0);
++        kt[slot] = t;
++        if (v[slot] > 0) vk_boot_logf("[m119b] sw %s=%d (seed)", nm, v[slot]);
++        return v[slot] ? 1 : 0;
++    }
++    if (t - kt[slot] >= 2.0) {
++        kt[slot] = t;
++        { const int nv = p_file_int(pa, pb, 0);
++          if (nv != v[slot]) { v[slot] = nv; vk_boot_logf("[m119b] sw %s=%d", nm, nv); } }
++    }
++    return v[slot] ? 1 : 0;
++}
++int nvn_vk_mrt_on(void)    { return m119b_sw(M119B_MRT_A, M119B_MRT_B, 0); }
++int nvn_vk_rb_chk_on(void) { return m119b_sw(M119B_RB_A,  M119B_RB_B,  1); }
++__attribute__((constructor)) static void m119b_seed(void)
++{
++    static const char *const p[2][2] = { { M119B_MRT_A, M119B_MRT_B }, { M119B_RB_A, M119B_RB_B } };
++    for (int k = 0; k < 2; k++)
++        for (int i = 0; i < 2; i++) {
++            FILE *r = fopen(p[k][i], "r");
++            if (r) { fclose(r); continue; }
++            { FILE *f = fopen(p[k][i], "w"); if (f) { fputs("0\n", f); fclose(f); } }
++        }
++}
++/* --- 声明缓存（gfx_bridge → 回放层，一次绑定的生命周期内有效） --- */
++static nvn_rt_att g_m119b_att[M119B_MAX_ATT];
++static int        g_m119b_att_n;                 /* 最近一次声明的颜色目标数（0 = 没有声明） */
++void nvn_vk_rt_attachments(int n, const nvn_rt_att *atts)
++{
++    if (!nvn_vk_mrt_on()) return;                /* 关态：不写状态、不打印（逐字节旧行为） */
++    if (!atts || n <= 0) { g_m119b_att_n = 0; return; }
++    if (n > M119B_MAX_ATT) n = M119B_MAX_ATT;
++    memcpy(g_m119b_att, atts, (size_t)n * sizeof *atts);
++    g_m119b_att_n = n;
++}
++/* --- 本次绑定的附件槽（[0] = 主附件 = g_rt_cur） --- */
++static h_rt_slot *g_mrt_slot[M119B_MAX_ATT];
++static int         g_mrt_n;                      /* >=2 ⇒ 本笔绑定走 N 附件通道；0/1 ⇒ 单附件（旧路径） */
++static int         g_mrt_pass_on;                /* 本笔 draw 真的用了 N 附件 renderPass（管线变体的键） */
++static VkFramebuffer g_mrt_fb_last;
++static unsigned long long g_mrt_lines, g_mrt_passes, g_mrt_fb_full, g_mrt_fb_fail;
++static unsigned g_mrt_fb_lines;
++static unsigned long long g_mrt_rp_ok, g_mrt_pipe_ok, g_mrt_pipe_fail;
++/* skip 原因（**每个都有名字**，绝不静默丢附件） */
++enum { M119B_SK_NONE = 0, M119B_SK_DEPTH, M119B_SK_DECL, M119B_SK_PRIMARY, M119B_SK_UNRESOLVED,
++       M119B_SK_EXT, M119B_SK_SLOT, M119B_SK_DUP, M119B_SK_RP };
++static unsigned long long g_mrt_sk[16];
++static unsigned g_mrt_sk_log;
++static const char *m119b_why(int w)
++{
++    switch (w) {
++    case M119B_SK_DEPTH:      return "depth_pass";
++    case M119B_SK_DECL:       return "decl_mismatch";
++    case M119B_SK_PRIMARY:    return "primary_denied";
++    case M119B_SK_UNRESOLVED: return "unresolved";
++    case M119B_SK_EXT:        return "ext_mismatch";
++    case M119B_SK_SLOT:       return "slot_fail";
++    case M119B_SK_DUP:        return "alias_dup";
++    case M119B_SK_RP:         return "rp_fb_fail";
++    default:                  return "none";
++    }
++}
++static void m119b_mrt_skip(int why)
++{
++    if (why > 0 && why < 16) g_mrt_sk[why]++;
++    if (g_mrt_sk_log < 12) {
++        g_mrt_sk_log++;
++        vk_boot_logf("[m119b] mrt skip why=%s decl=%d slot=%d ext=%ux%u rp_ok=%llu",
++                     m119b_why(why), g_m119b_att_n,
++                     g_rt_cur ? (int)(g_rt_cur - g_rt_tab) : -1,
++                     (unsigned)g_rt_w, (unsigned)g_rt_h, g_mrt_rp_ok);
++    }
++}
++/* 取证行：`[m119b] mrt n=… slots=[…] via=…`（前 8 次 + 之后每 30 s 一行；关态 0 行）。 */
++static void m119b_mrt_line(int n)
++{
++    static double last;
++    static unsigned early;
++    const double t = (double)pf_now_us() / 1e6;
++    if (early >= 8 && t - last < 30.0) return;
++    if (early < 8) early++;
++    last = t;
++    g_mrt_lines++;
++    { char sl[160]; int o = 0;
++      for (int i = 0; i < n && o < (int)sizeof sl - 24; i++)
++          o += snprintf(sl + o, sizeof sl - (size_t)o, "%s%d", i ? "," : "",
++                        g_mrt_slot[i] ? (int)(g_mrt_slot[i] - g_rt_tab) : -1);
++      vk_boot_logf("[m119b] mrt n=%d slots=[%s] via=texid/wh ext=%ux%u fb=%#llx lines=%llu "
++                   "passes=%llu pipe_ok=%llu pipe_fail=%llu fb_full=%llu fb_fail=%llu "
++                   "sk_depth=%llu sk_ext=%llu sk_unres=%llu sk_dup=%llu sk_decl=%llu sk_fb=%llu",
++                   n, sl, (unsigned)g_rt_w, (unsigned)g_rt_h,
++                   (unsigned long long)(uintptr_t)g_mrt_fb_last, g_mrt_lines, g_mrt_passes,
++                   g_mrt_pipe_ok, g_mrt_pipe_fail, g_mrt_fb_full, g_mrt_fb_fail,
++                   g_mrt_sk[M119B_SK_DEPTH], g_mrt_sk[M119B_SK_EXT],
++                   g_mrt_sk[M119B_SK_UNRESOLVED], g_mrt_sk[M119B_SK_DUP], g_mrt_sk[M119B_SK_DECL],
++                   g_mrt_sk[M119B_SK_RP]); }
++}
++/* --- 懒建 N 附件 render pass（N = 2..8）。与 g_r_rp 同参：loadOp=LOAD / storeOp=STORE / CAO→CAO。
++       var=0（颜色-only）⇒ g_r_rp_n[N]；var=1/2（颜色+深度）⇒ g_r_rp_dn[var][N]，深度仍挂 at[N]
++       （与 h_rp_depth 同构；var=3/4 是「仅深度」，没有颜色附件，不需要 N 附件变体）。 --- */
++static VkRenderPass g_r_rp_n[M119B_MAX_ATT + 1];      /* 索引 = 颜色附件数 N */
++static VkRenderPass g_r_rp_dn[5][M119B_MAX_ATT + 1];  /* [var][N]，var = 1/2 */
++static int h_mrt_rp_d(int var, int N)
++{
++    if (N < 2 || N > M119B_MAX_ATT) return 0;
++    if (var < 0 || var > 2) return 0;
++    if (g_r_rp_dn[var][N]) return 1;
++    if (!g_dev) return 0;
++    VkAttachmentDescription at[M119B_MAX_ATT + 1];
++    VkAttachmentReference ar[M119B_MAX_ATT];
++    memset(at, 0, sizeof at); memset(ar, 0, sizeof ar);
++    for (int i = 0; i < N; i++) {
++        at[i].format = VK_FORMAT_R8G8B8A8_UNORM;
++        at[i].samples = VK_SAMPLE_COUNT_1_BIT;
++        at[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
++        at[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++        at[i].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
++        at[i].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
++        at[i].initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++        at[i].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++        ar[i].attachment = (uint32_t)i;
++        ar[i].layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++    }
++    uint32_t na = (uint32_t)N;
++    VkAttachmentReference dr = { 0, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
++    if (var) {
++        at[N].format = (var == 1) ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_X8_D24_UNORM_PACK32;
++        at[N].samples = VK_SAMPLE_COUNT_1_BIT;
++        at[N].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;      /* 与 h_rp_depth 同口径：清零由 h_depth_clear_frame 显式做 */
++        at[N].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++        at[N].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
++        at[N].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
++        at[N].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
++        at[N].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
++        dr.attachment = (uint32_t)N;
++        na = (uint32_t)N + 1;
++    }
++    VkSubpassDescription sp = {0};
++    sp.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
++    sp.colorAttachmentCount = (uint32_t)N;
++    sp.pColorAttachments = ar;
++    sp.pDepthStencilAttachment = var ? &dr : NULL;
++    VkSubpassDependency dep = {0};
++    dep.srcSubpass = VK_SUBPASS_EXTERNAL; dep.dstSubpass = 0;
++    dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
++    dep.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
++    dep.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
++    dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
++                        VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
++    VkRenderPassCreateInfo rpi = { VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO };
++    rpi.attachmentCount = na; rpi.pAttachments = at;
++    rpi.subpassCount = 1; rpi.pSubpasses = &sp;
++    rpi.dependencyCount = 1; rpi.pDependencies = &dep;
++    VkResult rv = vkCreateRenderPass(g_dev, &rpi, NULL, &g_r_rp_dn[var][N]);
++    if (rv != VK_SUCCESS) {
++        g_r_rp_dn[var][N] = VK_NULL_HANDLE;
++        vk_boot_logf("[m119b] mrt rp n=%d var=%d rv=%d (%s) -> 单附件回退", N, var, (int)rv, vr(rv));
++        return 0;
++    }
++    g_mrt_rp_ok++;
++    vk_boot_logf("[m119b] mrt rp n=%d var=%d rp=%#llx attachments=%u color=%d dfmt=%d load=LOAD store=STORE",
++                 N, var, (unsigned long long)(uintptr_t)g_r_rp_dn[var][N], na, N,
++                 (int)((var == 1) ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_X8_D24_UNORM_PACK32));
++    return 1;
++}
++static int h_mrt_rp(int N) { return h_mrt_rp_d(0, N); }
++/* --- framebuffer：按「(颜色视图元组, 深度视图)」缓存（会话内不销毁，与 g_fbd/h_rt 的既有纪律一致） --- */
++#define M119B_FB_MAX 48
++static struct { VkImageView v[M119B_MAX_ATT]; VkImageView dv; int n; VkFramebuffer fb; } g_mrt_fbd[M119B_FB_MAX];
++static int g_mrt_fbd_n;
++static VkFramebuffer h_fb_mrt_d(int var, int n, h_d_slot *ds)
++{
++    if (n < 2 || n > M119B_MAX_ATT) return VK_NULL_HANDLE;
++    if (var < 0 || var > 2) return VK_NULL_HANDLE;
++    VkImageView views[M119B_MAX_ATT + 1];
++    VkImageView dv = VK_NULL_HANDLE;
++    for (int i = 0; i < n; i++) {
++        if (!g_mrt_slot[i] || !g_mrt_slot[i]->view) return VK_NULL_HANDLE;
++        views[i] = g_mrt_slot[i]->view;
++    }
++    if (var) {
++        if (!ds || !ds->view) return VK_NULL_HANDLE;
++        if (ds->w != g_mrt_slot[0]->w || ds->h != g_mrt_slot[0]->h) { g_mrt_fb_fail++; return VK_NULL_HANDLE; }
++        dv = ds->view;
++        views[n] = dv;
++    }
++    if (!h_mrt_rp_d(var, n)) return VK_NULL_HANDLE;
++    for (int i = 0; i < g_mrt_fbd_n; i++) {
++        if (g_mrt_fbd[i].n != n || g_mrt_fbd[i].dv != dv) continue;
++        int same = 1;
++        for (int k = 0; k < n; k++) if (g_mrt_fbd[i].v[k] != views[k]) { same = 0; break; }
++        if (same) return g_mrt_fbd[i].fb;
++    }
++    if (g_mrt_fbd_n >= M119B_FB_MAX) { g_mrt_fb_full++; return VK_NULL_HANDLE; }
++    { const h_rt_slot *p0 = g_mrt_slot[0];
++      VkFramebufferCreateInfo fbi = { VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
++      fbi.renderPass = var ? g_r_rp_dn[var][n] : g_r_rp_n[n];
++      fbi.attachmentCount = (uint32_t)(n + (var ? 1 : 0)); fbi.pAttachments = views;
++      fbi.width = p0->w; fbi.height = p0->h; fbi.layers = 1;
++      VkFramebuffer fb = VK_NULL_HANDLE;
++      if (vkCreateFramebuffer(g_dev, &fbi, NULL, &fb) != VK_SUCCESS) {
++          g_mrt_fb_fail++;
++          vk_boot_logf("[m119b] mrt fb n=%d var=%d ext=%ux%u failed", n, var,
++                       (unsigned)p0->w, (unsigned)p0->h);
++          return VK_NULL_HANDLE;
++      }
++      g_mrt_fbd[g_mrt_fbd_n].n = n; g_mrt_fbd[g_mrt_fbd_n].dv = dv;
++      for (int k = 0; k < n; k++) g_mrt_fbd[g_mrt_fbd_n].v[k] = views[k];
++      g_mrt_fbd[g_mrt_fbd_n].fb = fb;
++      g_mrt_fbd_n++;
++      if (g_mrt_fb_lines++ < 12)
++          vk_boot_logf("[m119b] mrt fb n=%d var=%d fb=%#llx ext=%ux%u slot0=%d fbs=%d",
++                       n, var, (unsigned long long)(uintptr_t)fb, (unsigned)p0->w, (unsigned)p0->h,
++                       (int)(p0 - g_rt_tab), g_mrt_fbd_n);
++      return fb; }
++}
++static VkFramebuffer h_fb_mrt(int n) { return h_fb_mrt_d(0, n, NULL); }
++static int h_mrt_target(int var, h_d_slot *ds, VkRenderPass *rp, VkFramebuffer *fb)
++{
++    if (g_mrt_n < 2) return 0;
++    if (!g_mrt_slot[0] || g_mrt_slot[0] != g_rt_cur) return 0;
++    { VkFramebuffer f = h_fb_mrt_d(var, g_mrt_n, ds);
++      if (!f) return 0;
++      *rp = var ? g_r_rp_dn[var][g_mrt_n] : g_r_rp_n[g_mrt_n];
++      *fb = f;
++      return 1; }
++}
++/* draw 前：把 N 个附件都转到 COLOR_ATTACHMENT_OPTIMAL（只对真的不在该布局的附件下屏障）。 */
++static void h_mrt_barriers(VkCommandBuffer cb)
++{
++    if (g_mrt_n < 2 || !cb) return;
++    for (int i = 0; i < g_mrt_n; i++) {
++        h_rt_slot *s = g_mrt_slot[i];
++        if (!s || !s->img) continue;
++        const VkImageLayout from = (s == g_rt_cur) ? g_h_layout : s->layout;
++        if (from == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) continue;
++        const int from_xfer = (from == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++        VkImageMemoryBarrier b = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
++        b.srcAccessMask = from_xfer ? VK_ACCESS_TRANSFER_WRITE_BIT : 0;
++        b.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
++        b.oldLayout = from;
++        b.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++        b.image = s->img;
++        b.subresourceRange = (VkImageSubresourceRange){ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
++        beat_cmd();
++        vkCmdPipelineBarrier(cb,
++                             from_xfer ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL, 1, &b);
++        if (s == g_rt_cur) g_h_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++        else s->layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++    }
++}
++/* pass 结束：逐槽写回 layout 记账（finalLayout=CAO ⇒ 记账值就是 CAO）。 */
++static void h_mrt_layout_back(void)
++{
++    if (g_mrt_n < 2) return;
++    for (int i = 0; i < g_mrt_n; i++) {
++        h_rt_slot *s = g_mrt_slot[i];
++        if (!s) continue;
++        if (s == g_rt_cur) g_h_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++        else s->layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++    }
++}
++/* 一次绑定内解析附件槽：**按存储身份 + 宽高**（h_rt_ensure 的既有身份机制），绝不按附件序号。
++   任何一项失败 ⇒ g_mrt_n=0（整笔回落单附件）+ 显式 skip 原因；全部成功才置 g_mrt_n=n。 */
++static void m119b_mrt_resolve(int n, h_rt_slot *s, unsigned rw, unsigned rh)
++{
++    g_mrt_n = 0; g_mrt_pass_on = 0; g_mrt_fb_last = VK_NULL_HANDLE;
++    if (n < 2) return;
++    if (g_m119b_att_n != n)       { m119b_mrt_skip(M119B_SK_DECL); return; }
++    if (!s || !s->img || !s->view) { m119b_mrt_skip(M119B_SK_PRIMARY); return; }
++    if (g_r_donly)                 { m119b_mrt_skip(M119B_SK_DEPTH); return; }
++    g_mrt_slot[0] = s;
++    for (int i = 1; i < n; i++) {
++        const nvn_rt_att *a = &g_m119b_att[i];
++        unsigned aw = a->w, ah = a->h;
++        if (!a->key || !aw || !ah) { m119b_mrt_skip(M119B_SK_UNRESOLVED); return; }
++        if (h_rt_div() > 1) { aw = h_rs_dim(aw); ah = h_rs_dim(ah); }   /* 与 rt_bind 同一光栅口径 */
++        if (aw != rw || ah != rh) { m119b_mrt_skip(M119B_SK_EXT); return; }
++        { h_rt_slot *as = h_rt_ensure(a->key, aw, ah);
++          if (!as || !as->img || !as->view) { m119b_mrt_skip(M119B_SK_SLOT); return; }
++          if (as == s) { m119b_mrt_skip(M119B_SK_DUP); return; }
++          for (int k = 1; k < i; k++) if (g_mrt_slot[k] == as) { m119b_mrt_skip(M119B_SK_DUP); return; }
++          if (a->tex_id >= 0 && as->tex_id != a->tex_id) as->tex_id = a->tex_id;
++          if (a->fmt) as->fmt = a->fmt;
++          as->last_use = ++g_rt_use_seq;
++          g_mrt_slot[i] = as; }
++    }
++    g_mrt_n = n;
++    m119b_mrt_line(n);
++}
++
+ static int h_off_ensure(void)
+ {
+     if (g_host_img) return 1;              /* M4c：宿主兜底图只建一次（不被游戏 RT 复用） */
+@@ -9470,6 +9799,21 @@
+ static int h_draw_target(int var, h_d_slot *ds, VkRenderPass *rp, VkFramebuffer *fb)
+ {
+     if (var == 0) {
++        /* M119B：MRT 通道（N>=2）。开关 + 槽 + rp/fb 三者都就绪才走；拿不到就回落单附件（并显式记 why）。
++           关态（knob=0）⇒ g_mrt_n 恒 0 ⇒ 这段是两次整数比较，行为与 build #6 逐字节相同。 */
++        g_mrt_pass_on = 0;
++        if (g_mrt_n >= 2) {
++            VkRenderPass mrp = VK_NULL_HANDLE;
++            VkFramebuffer mfb = VK_NULL_HANDLE;
++            if (h_mrt_target(0, NULL, &mrp, &mfb)) {
++                g_mrt_pass_on = 1;
++                g_mrt_passes++;
++                g_mrt_fb_last = mfb;
++                *rp = mrp; *fb = mfb;
++                return 1;
++            }
++            m119b_mrt_skip(M119B_SK_RP);
++        }
+         /* M4s 检测器（只取证不改行为）：期望的 framebuffer = 当前目标自己的 fb_load。
+            不相等 ⇒ g_r_fb 还是**上一个目标**的（槽首次使用时 fb_load 仍为 NULL 的那一支）。
+            这种「跨目标复用」会让本笔 draw 落进别的图，同时 renderArea 是新目标尺寸 ⇒ 越界/裁剪。 */
+@@ -9492,6 +9836,21 @@
+         return 1;
+     }
+     if (var <= 2) {
++        /* M119B：颜色+深度通道也支持 N 附件（g_r_rp_dn[var][N]，深度挂 at[N]）。拿不到就回落
++           单附件 g_r_rp_d[var] 并显式记 why（不静默丢件）。关态 g_mrt_n 恒 0 ⇒ 两次整数比较。 */
++        g_mrt_pass_on = 0;
++        if (g_mrt_n >= 2) {
++            VkRenderPass mrp = VK_NULL_HANDLE;
++            VkFramebuffer mfb = VK_NULL_HANDLE;
++            if (h_mrt_target(var, ds, &mrp, &mfb)) {
++                g_mrt_pass_on = 1;
++                g_mrt_passes++;
++                g_mrt_fb_last = mfb;
++                *rp = mrp; *fb = mfb;
++                return 1;
++            }
++            m119b_mrt_skip(M119B_SK_RP);
++        }
+         if (!g_rt_cur) return 0;
+         VkFramebuffer f = h_fb_color_depth(g_rt_cur, ds);
+         if (!f) return 0;
+@@ -9499,6 +9858,7 @@
+         return 1;
+     }
+     { VkFramebuffer f = h_fb_depth_only(ds);
++      g_mrt_pass_on = 0;   /* M119B：仅深度通道 = 单附件 */
+       if (!f) return 0;
+       *rp = g_r_rp_d[var]; *fb = f;
+       return 1; }
+@@ -10729,11 +11089,37 @@
+ }
+ 
+ /* M4ap P1：divs[] 按 attr location 索引，给 INSTANCE 率绑定取 divisor（0 ⇒ VERTEX 率）。 */
++/* --- M119B：N 附件管线变体表（键 = 基础条目 + var + N） ---
++   为什么必须有变体：Vulkan 的**渲染通道兼容性**要求「每个 subpass 的颜色附件引用数相同」，
++   1 附件的 g_r_rp / g_r_rp_d[var] 与 N 附件的 g_r_rp_n[N] / g_r_rp_dn[var][N] 不兼容
++   ⇒ 同一 (vs,fs,topo,inst_mask) 必须按 (var,N) 各建一份管线。
++   **不塞进 R_Pipe**：R_Pipe 有 16384 条，每条再加 9 个句柄 = +1.2 MB BSS；这里用一张小表（只收
++   真的走过 N>=2 通道的组合）。st: 0=未建 / 1=已建 / -1=建失败（不再反复撞）。
++   全部惰性 + knob 门控 ⇒ 关态这张表恒空、零分配、零日志。 */
++#define M119B_PV_MAX 2048
++typedef struct { const R_Pipe *e; signed char var, n, st; VkPipeline ps; } m119b_pv_t;
++static m119b_pv_t g_mrt_pv[M119B_PV_MAX];
++static int g_mrt_pv_n;
++static unsigned long long g_mrt_pv_full;
++static m119b_pv_t *m119b_pv_slot(const R_Pipe *e, int var, int n)
++{
++    for (int i = 0; i < g_mrt_pv_n; i++)
++        if (g_mrt_pv[i].e == e && g_mrt_pv[i].var == var && g_mrt_pv[i].n == n) return &g_mrt_pv[i];
++    if (g_mrt_pv_n >= M119B_PV_MAX) { g_mrt_pv_full++; return NULL; }
++    { m119b_pv_t *p = &g_mrt_pv[g_mrt_pv_n++];
++      p->e = e; p->var = (signed char)var; p->n = (signed char)n; p->st = 0; p->ps = VK_NULL_HANDLE;
++      return p; }
++}
+ static VkPipeline r_pipe_var_i(R_Key *kv, R_Key *kf, int topo, int var, uint32_t inst_mask, const uint8_t *divs)
+ {
+     /* M14B：管线的动态状态列表取决于「EDS3 是否可用」，所以建管线之前必须已经判定完。
+        （EDS3 判定只查一次，之后是布尔读；smo_m14b=0 时这里立刻返回。） */
+     if (m14b_sw()) m14b_eds3_init();
++    /* M119B：本笔是否走 N 附件通道（键 = 颜色附件数 N）。g_mrt_pass_on 由 h_draw_target 在本笔
++       draw 之前刚刚置好，所以这条锁存与本笔的 renderPass 一定一致。关态恒 0 ⇒ 下面都是整数比较。 */
++    static int m119b_base_rec;   /* 递归建基础条目时屏蔽 MRT（否则会自递归） */
++    const int mrt_n = (!m119b_base_rec && var <= 2 && g_mrt_pass_on && g_mrt_n >= 2) ? g_mrt_n : 0;
++    m119b_pv_t *mrt_pv = NULL;   /* M119B：N 附件管线变体槽（建好/命中后填入） */
+     runtime_thread_note_op(21);   /* M5b：进了管线路径（21 module / 22 已过 module / 24 正在 create / 25 create 已返回） */
+     /* M5c：护栏安全点①（管线入口）。已触发 ⇒ 直接走既有 fail 路径，不 abort。 */
+     if (runtime_rss_guard()) { g_r_pipe_fail++; return VK_NULL_HANDLE; }
+@@ -10749,6 +11135,19 @@
+             !strcmp(g_rpipe[i].vs, kv->key) && !strcmp(g_rpipe[i].fs, kf->key)) {
+             e = &g_rpipe[i]; break;
+         }
++    /* M119B：MRT 变体依赖基础条目（共享 e->lay）⇒ 先建基础条目再回来（递归里屏蔽 MRT）。 */
++    if (!e && var == 0 && mrt_n) {
++        m119b_base_rec = 1;
++        (void)r_pipe_var_i(kv, kf, topo, 0, inst_mask, divs);
++        m119b_base_rec = 0;
++        g_j_on = 0;
++        for (int i = 0; i < g_rpipe_n; i++)
++            if (g_rpipe[i].topo == topo && g_rpipe[i].inst_mask == inst_mask &&
++                !strcmp(g_rpipe[i].vs, kv->key) && !strcmp(g_rpipe[i].fs, kf->key)) {
++                e = &g_rpipe[i]; break;
++            }
++        if (!e) return VK_NULL_HANDLE;
++    }
+     /* M5c：只对「新建条目」这条路径开细分打点（命中缓存立刻返回，不打，避免刷屏）。
+        jid 口径与下方 `[r] pipe try #N` 相同。 */
+     /* M40AB：key 指纹 + 未命中归因。只在 var==0 记（变体不是独立的 key）。
+@@ -10773,13 +11172,28 @@
+         /* M6t B: every request served from the table is a compile that did NOT happen. Count it so
+            "[sh] pipe_hit grows, new_prog flat" can rule out "we rebuild the same pipeline per frame". */
+         atomic_fetch_add_explicit(&g_sh_pipe_hit, 1ull, memory_order_relaxed);
+-        if (var == 0) { if (!e->ps) atomic_fetch_add_explicit(&g_sh_pipe_dup, 1ull, memory_order_relaxed); j_mark(8, "return cached ps"); return e->ps; }
++        if (mrt_n) {
++            /* M119B：N 附件变体（含 var 1/2 的颜色+深度）。已建 ⇒ 直接返回；建失败过 ⇒ 不再反复撞。
++               未建 ⇒ 落到下面的统一创建（layout 共享，缺就现建）。 */
++            m119b_pv_t *pv = m119b_pv_slot(e, var, mrt_n);
++            if (!pv) return VK_NULL_HANDLE;
++            if (pv->st > 0) { j_mark(8, "return cached ps_mrt"); return pv->ps; }
++            if (pv->st < 0) return VK_NULL_HANDLE;
++            if (!e->ps && var == 0) {   /* 颜色-only 变体要基础管线先建（layout 来源） */
++                m119b_base_rec = 1;
++                (void)r_pipe_var_i(kv, kf, topo, 0, inst_mask, divs);
++                m119b_base_rec = 0;
++                g_j_on = 0;
++            }
++        } else if (var == 0) { if (!e->ps) atomic_fetch_add_explicit(&g_sh_pipe_dup, 1ull, memory_order_relaxed); j_mark(8, "return cached ps"); return e->ps; }
++        else {
+         if (var < 0 || var > 4 || !g_r_rp_d[var]) return VK_NULL_HANDLE;
+         if (e->dstate[var] > 0) return e->ps_d[var];
+         if (e->dstate[var] < 0 || !e->lay) return VK_NULL_HANDLE;   /* 建失败过：不再反复撞 */
+         /* M4r P1 修（boot#1 实测）：第一笔 draw 常是新程序的**首笔**，此时基础管线还没建
+            ⇒ 旧逻辑直接返回 NULL 让调用方回落 var 0，白丢一笔深度。现在先把基础管线建出来。 */
+         if (!e->ps) { r_pipe_var_i(kv, kf, topo, 0, inst_mask, divs); g_j_on = 0; if (!e->ps) return VK_NULL_HANDLE; }
++        }
+     }
+     if (!e) {
+         if (var != 0) return VK_NULL_HANDLE;   /* 变体只在基础条目存在后建（上一段已兜住） */
+@@ -10970,13 +11384,27 @@
+       { static int m40c_l2 = -1;
+         if (m40c_l2 != msw) { m40c_l2 = msw;
+           vk_boot_logf("[m40c] pso#2 sw=%d cull=%s depth=%d ds_att=%d var=%d", msw, msw ? "BACK" : "NONE", (msw && mds), mds, var); } } }
++    /* M119B：N 附件通道的 colorBlendState 必须给 N 份（同一份状态复制 N 次）。放在**这里**是因为
++       上面 var>=3 的 attachmentCount=0 规则先执行；关态 mrt_n=0 ⇒ 这一段一行不执行。 */
++    VkPipelineColorBlendAttachmentState cba_m[M119B_MAX_ATT];
++    if (mrt_n) {
++        for (int k2 = 0; k2 < mrt_n; k2++) cba_m[k2] = cba;
++        cb.attachmentCount = (uint32_t)mrt_n;
++        cb.pAttachments = cba_m;
++    }
+     VkGraphicsPipelineCreateInfo gi = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
+     gi.stageCount = 2;            gi.pStages = st;
+     gi.pVertexInputState = &vin;  gi.pInputAssemblyState = &ia;
+     gi.pViewportState = &vs;      gi.pRasterizationState = &rs;
+     gi.pMultisampleState = &ms;   gi.pDepthStencilState = &dss;
+     gi.pColorBlendState = &cb;    gi.pDynamicState = &ds;
+-    gi.layout = layout;           gi.renderPass = (var ? g_r_rp_d[var] : g_r_rp); gi.subpass = 0;
++    /* M119B：N 附件通道用 g_r_rp_n[N] / g_r_rp_dn[var][N]
++       （渲染通道兼容性要求颜色引用数一致，不能借 1 附件的 g_r_rp / g_r_rp_d）。 */
++    { int mr = mrt_n ? ((var == 1 || var == 2) ? h_mrt_rp_d(var, mrt_n) : h_mrt_rp(mrt_n)) : 0;
++      if (mrt_n && !mr) { if (mrt_pv) mrt_pv->st = -1; g_mrt_pipe_fail++; return VK_NULL_HANDLE; }
++      gi.renderPass = mrt_n ? (var ? g_r_rp_dn[var][mrt_n] : g_r_rp_n[mrt_n])
++                            : (var ? g_r_rp_d[var] : g_r_rp); }
++    gi.subpass = 0;
+     /* M5b：每一次新建管线的入口/出口都留一行（命中缓存的不打，故总量=不同 (vs,fs,topo,attrs,var) 数）。
+        若某笔 create 永不返回，日志最后一行就是它的 try 而缺它的 ret ⇒ 连「卡的是哪个着色器对」都能点名。 */
+     vk_boot_logf("[r] pipe try #%llu vs=%s fs=%s topo=%d attrs=%u var=%d inst=%#x ntex=%d",
+@@ -10992,7 +11420,9 @@
+                  kf->cfg_cost, kf->cfg_cost_hit ? "+" : "");
+     runtime_thread_note_op(24);   /* M5b：正进 vkCreateGraphicsPipelines */
+     j_mark(6, "vkCreateGraphicsPipelines");
+-    VkPipeline *slot = (var ? &e->ps_d[var] : &e->ps);
++    /* M119B：N 附件变体走小表；单附件/带深度变体仍是 R_Pipe 的字段（关态完全不变）。 */
++    if (mrt_n) { mrt_pv = m119b_pv_slot(e, var, mrt_n); if (!mrt_pv) return VK_NULL_HANDLE; }
++    VkPipeline *slot = mrt_pv ? &mrt_pv->ps : (var ? &e->ps_d[var] : &e->ps);
+     {   /* M6t B: the one place SwiftShader translates SPIR-V and JITs a routine for this pipeline. */
+         unsigned long long t0 = pf_now_us();
+         atomic_fetch_add_explicit(&g_sh_pipe_new, 1ull, memory_order_relaxed);
+@@ -11004,6 +11434,14 @@
+     vk_boot_logf("[r] pipe ret rv=%d #%llu vs=%s fs=%s", (int)rv, g_r_pipe_ok + g_r_pipe_fail + 1, kv->key, kf->key);
+     if (rv != VK_SUCCESS) {
+         *slot = VK_NULL_HANDLE;
++        if (mrt_n) {   /* M119B：N 附件变体建失败 ⇒ 记 -1（不再反复撞）+ 回落单附件画（不整笔丢） */
++            mrt_pv->st = -1;
++            g_mrt_pipe_fail++;
++            if (g_mrt_pipe_fail <= 4)
++                vk_boot_logf("[m119b] mrt pipe fail n=%d vs=%s fs=%s rv=%d (%s) -> 单附件回退",
++                             mrt_n, kv->key, kf->key, (int)rv, vr(rv));
++            return VK_NULL_HANDLE;
++        }
+         if (var) { e->dstate[var] = -1; g_r_pipe_dvar_fail++;
+                    if (g_r_pipe_dvar_fail <= 4)
+                        vk_boot_logf("[r-red] pipeline depth variant var=%d vs=%s fs=%s rv=%d (%s) -> fallback color-only",
+@@ -11016,6 +11454,17 @@
+         return VK_NULL_HANDLE;
+     }
+     g_r_pipe_ok++;
++    if (mrt_n) {   /* M119B：N 附件管线变体建成（共享基础条目的 layout） */
++        e->lay = layout;
++        mrt_pv->st = 1;
++        g_mrt_pipe_ok++;
++        if (g_mrt_pipe_ok <= 8)
++            vk_boot_logf("[m119b] mrt pipe ok n=%d var=%d vs=%s fs=%s ps=%#llx rp=%#llx att=%d",
++                         mrt_n, var, kv->key, kf->key, (unsigned long long)(uintptr_t)*slot,
++                         (unsigned long long)(uintptr_t)(var ? g_r_rp_dn[var][mrt_n] : g_r_rp_n[mrt_n]),
++                         mrt_n);
++        return *slot;
++    }
+     if (var) { e->lay = layout; e->dstate[var] = 1;
+                if (g_r_pipe_dvar_ok++ < 8)
+                    vk_boot_logf("[r] pipeline depth variant ok var=%d vs=%s fs=%s ps=%#llx (test=LEQUAL write=1)",
+@@ -13726,7 +14175,10 @@
+ #define R_SIG_TOP 8
+ typedef struct { unsigned long long sum[4], mn[4], mx[4], hash, npx;
+                  unsigned long long nz;   /* M4ak P1：采样点里 RGB 任一非零的个数（present 选源对照用） */
+-                 uint32_t tk[R_SIG_TOP]; unsigned tn[R_SIG_TOP]; int nt; } r_sig_t;
++                 uint32_t tk[R_SIG_TOP]; unsigned tn[R_SIG_TOP]; int nt;
++                 /* M119B：抽样点上的 12-bit 量化不同色数（与 m107a_sig 的 dcol 同口径，但只覆盖
++                    本路真正的 256 个取样点）——两路回读校验靠它把「抽样密度」与「读路径」分开。 */
++                 unsigned dcol; } r_sig_t;
+ 
+ static void r_sig_top_add(r_sig_t *o, uint32_t key)
+ {
+@@ -13812,6 +14264,7 @@
+                 memset(o, 0, sizeof *o);
+                 for (int c = 0; c < 4; c++) { o->mn[c] = 255ull; }
+                 o->hash = 1469598103934665603ull;   /* FNV-1a 64 偏移基数 */
++                { unsigned char seen512[512]; memset(seen512, 0, sizeof seen512);
+                 for (unsigned k = 0; k < rows; k++) {
+                     const uint8_t *row = (const uint8_t *)map + rowb * k;
+                     for (unsigned j = 0; j < 16; j++) {
+@@ -13826,11 +14279,17 @@
+                             o->hash = (o->hash ^ v) * 1099511628211ull;
+                         }
+                         r_sig_top_add(o, (uint32_t)px[0] | ((uint32_t)px[1] << 8) |
+-                                         ((uint32_t)px[2] << 16) | ((uint32_t)px[3] << 24));
++                                 ((uint32_t)px[2] << 16) | ((uint32_t)px[3] << 24));
++                        /* M119B：抽样点上的 12-bit 量化不同色数（与 m107a_sig 同口径，但只覆盖这 256 点）
++                           —— 两路回读校验靠它把「抽样密度差异」与「读路径差异」分开。 */
++                        { const unsigned kq = ((unsigned)(px[0] >> 4) << 8) | ((unsigned)(px[1] >> 4) << 4) |
++                                              (unsigned)(px[2] >> 4);
++                          if (!(seen512[kq >> 3] & (1u << (kq & 7u)))) {
++                              seen512[kq >> 3] |= (unsigned char)(1u << (kq & 7u)); o->dcol++; } }
+                         if (px[0] | px[1] | px[2]) o->nz++;
+                         o->npx++;
+                     }
+-                }
++                } }
+                 vkUnmapMemory(g_dev, mem);
+             } else ok = 0;
+         }
+@@ -26240,6 +26699,10 @@
+             vk_boot_logf("[r] depth pass skip var=%d ext=%ux%u -> color-only", dvar, (unsigned)g_rt_w, (unsigned)g_rt_h);
+         dvar = 0;
+     }
++    /* M119B：本笔绑定声明了 N>=2 个颜色目标、但本笔是**仅深度**通道（var 3/4，没有颜色附件）
++    ⇒ 显式记 why=depth_pass 后按单通道画（不静默丢件）。颜色+深度（var 1/2）已由 g_r_rp_dn 支持。
++    关态（knob=0）⇒ g_mrt_n 恒 0 ⇒ 一次整数比较。 */
++    if (dvar >= 3 && g_mrt_n >= 2) m119b_mrt_skip(M119B_SK_DEPTH);
+     VkPipeline ps = dvar ? r_pipe_var_i(kv, kf, (int)topo, dvar, inst_mask, divs) : VK_NULL_HANDLE;
+     if (!ps && dvar) {
+         static unsigned long long pskip;
+@@ -26673,7 +27136,7 @@
+     if (!g_r_inpass || g_r_pass_rp != trp || g_r_pass_fb != tfb) {
+         /* M4r P1：同一批次里可能在「颜色 pass」与「纯深度 pass」之间来回切，renderPass 不兼容
+            ⇒ 先 EndRenderPass 再按新通道重开（旧行为：整批次只开一次 pass）。 */
+-        if (g_r_inpass) { vkCmdEndRenderPass(g_r_cb); g_r_inpass = 0; }
++        if (g_r_inpass) { vkCmdEndRenderPass(g_r_cb); g_r_inpass = 0; h_mrt_layout_back(); }   /* M119B：离开 N 附件 pass ⇒ 逐槽写回 layout */
+         /* M4br P1：取样点已挪到批末之后的自建 CB（w_scan_tick，栅栏等到后轮转扫描全表）。 */
+         if (dvar) h_depth_clear_frame(g_r_cb, ds, 0);   /* M4t P3：深度 → 附件态 + 每帧一次显式清零 */
+         /* M4bl P1（只读）：带深度 pass 的逐笔口径。`lastclear_after_draw=1` 表示**本帧的 clear
+@@ -26703,6 +27166,9 @@
+         if (dvar >= 1 && dvar <= 2) { rb.clearValueCount = 2; rb.pClearValues = cvs; }
+         else if (dvar >= 3)         { rb.clearValueCount = 1; rb.pClearValues = &cvs[1]; }
+         else                        { rb.clearValueCount = 0; rb.pClearValues = NULL; }   /* loadOp=LOAD：游戏清屏色保留 */
++        /* M119B：N 附件 pass 的布局前置——把 N 个附件都转到 COLOR_ATTACHMENT_OPTIMAL（含从未转过、
++           或被 clear/拷贝通道用过的）。单附件通道一行不执行（关态零改动）。 */
++        if (g_mrt_pass_on) h_mrt_barriers(g_r_cb);
+         beat_cmd();
+         vkCmdBeginRenderPass(g_r_cb, &rb, VK_SUBPASS_CONTENTS_INLINE);
+         VkViewport vp = { 0.0f, 0.0f, (float)raw, (float)rah, 0.0f, 1.0f };
+@@ -26723,7 +27189,7 @@
+     /* M14B：把 guest 最近一次 bind 的 NVN blend/color 状态下发成本笔的 Vulkan 动态混合状态。
+        纯深度 pass（dvar>=3，pipeline 的 attachmentCount=0）不下发——attachmentCount 与管线不符
+        是无效用法。smo_m14b=0 时 g_m14b_fix=0，这一行是空操作。 */
+-    m14b_apply(g_r_cb, dvar >= 3 ? 0 : 1);
++    m14b_apply(g_r_cb, g_mrt_pass_on ? g_mrt_n : (dvar >= 3 ? 0 : 1));   /* M119B：N 附件通道的 blend 要作用到全部 N 个附件 */
+     /* M4bm P1（只读）：本帧真实 draw 的提交点（color/depth 按 dvar 区分；post 标记洋红满屏 quad 的 FS）。 */
+     { char t[76];
+       snprintf(t, sizeof t, "D %s key=%#llx v=%d nv=%d dk=%#llx fs=%.8s",
+@@ -28364,7 +28830,7 @@
+     g_r_batch_draws = 0;
+     hb_freeze(g_cen_sub, bd);   /* M5w P0：冻结本批成分（栅栏等待期间 [hang] 可读，栅栏后写实测 us） */
+     g_r_flush_n++;
+-    if (g_r_inpass) { vkCmdEndRenderPass(g_r_cb); g_r_inpass = 0; }
++    if (g_r_inpass) { vkCmdEndRenderPass(g_r_cb); g_r_inpass = 0; h_mrt_layout_back(); }   /* M119B：批末收口也逐槽写回 layout */
+     /* M4br P1：**不再在批次 CB 里录拷贝**（M4bq 的批末取样点绑死在「本批写过某张图」上，
+        一轮 boot 只产出 3 个样本）。现在取样完全挪到栅栏之后的自建 CB（w_scan_tick）。 */
+     g_r_pass_img = VK_NULL_HANDLE;
+@@ -32855,6 +33321,116 @@
+                  sg.nz10 / 10u, sg.nz10 % 10u, sg.npx);
+ }
+ 
++/* ================= M119B（2026-11-14）：两路回读校验（knob `smo_rb_chk`，缺省 0）=================
++   要回答的问题（M121A 的测量矛盾，logs/m121a/clear_test.txt §D + sig.txt）：
++     同一帧、同一个 400×225 的游戏 RT（img=0x5b63ae8a18），`[m119a] sig`（= M113A 的**整幅 staging
++     拷贝**，全像素统计）读到 mean=238…255（近白），而 `[rt]`（= M99A/`r_tex_signature` 的
++     **16 条横带 × 16 列抽样**，256 点）读到 mean=171→78→81（暗，max=255 有内容）。
++     屏幕是白的 ⇒ 两条读数差了 ~200 个灰阶，必须先证**哪一路可信**，否则后面所有白/暗判断都无根。
++   做法：在**同一时刻**（present 安全点、同一帧、同一槽、同一 mip0/layer0）把三条读数并排打出来：
++     ① sig  = c_raw_copy 整幅拷贝 + m107a_sig 全像素统计（与 M113A 的 sig 完全同一条代码路径）
++     ② rt   = m99a_sig_locked → r_tex_signature（与 `[rt]` 行完全同一条代码路径，256 点）
++     ③ grid = 用①拿到的那份**整幅像素**，按②的取样网格（y=h*k/16、x=w*(2j+1)/32）重算
++     ⇒ 三者的差值把「读路径差异」与「抽样密度差异」分开：
++        · 若 ①≈② ⇒ 当初那 200 灰阶的差**不是**读路径造成的（只能是**读取时刻**不同 / 不同槽）；
++        · 若 ③≈② 而 ①≠② ⇒ 差异来自**抽样网格**（图里内容沿 y 条带化），与 layout/mip 无关；
++        · 若 ③≈① 而 ②≠① ⇒ 差异来自**读路径本身**（layout/rowPitch/视图/图不是同一张）。
++   两侧的 extent/format/layout/mip/layer/rowPitch 一律**打印实际用的值**（不按 w/h 反推）：
++     c_raw_copy 走 bufferRowLength=0（紧排 rowPitch=w*4）、子资源 {mip0, layer0, 1 层}；
++     r_tex_signature 每带 bufferOffset=rowb*k（同样紧排 w*4）、子资源 {mip0, layer0, 1 层}。
++   预算：30 s 一行（与 M119A/M113A 的采样同量级），关态首行返回（0 行日志、0 次 GPU 拷贝）。
++   ========================================================================================== */
++static void m119b_rb_check(unsigned long long call)
++{
++    if (!nvn_vk_rb_chk_on()) return;                    /* 关态：一行不执行、一次拷贝都不做 */
++    { static double last;
++      const double t = (double)pf_now_us() / 1e6;
++      if (last && t - last < 30.0) return;
++      last = t; }
++    { const int slot = (g_m113a_sel >= 0) ? g_m113a_sel
++                                        : (g_rt_cur ? (int)(g_rt_cur - g_rt_tab) : -1);
++      if (slot < 0 || slot >= H_RT_SLOTS) {
++          vk_boot_logf("[m119b] rb call=%llu rb=0 why=noslot", call);
++          return;
++      }
++      h_rt_slot *s = &g_rt_tab[slot];
++      if (!s->key || !s->img || !s->w || !s->h) {
++          vk_boot_logf("[m119b] rb call=%llu slot=%d rb=0 why=noslot_img", call, slot);
++          return;
++      }
++      const VkImageLayout lay = p_slot_layout(s);
++      const unsigned w = s->w, h = s->h;
++      const int is_cur = (s == g_rt_cur);
++      const unsigned long long rowpitch = (unsigned long long)w * 4ull;   /* 两路都是紧排（bufferRowLength=0） */
++      /* ① 整幅 staging 拷贝（与 M113A 的 sig 同一条实现） */
++      { VkDeviceSize sz = (VkDeviceSize)w * (VkDeviceSize)h * 4ull;
++        uint8_t *px = NULL;
++        if ((unsigned long long)w * (unsigned long long)h <= M113A_PX_MAX) {
++            pthread_mutex_lock(&g_vkq_lock);
++            px = (uint8_t *)c_raw_copy(s->img, lay, w, h, sz);
++            pthread_mutex_unlock(&g_vkq_lock);
++        }
++        if (!px) { vk_boot_logf("[m119b] rb call=%llu slot=%d img=%#llx rb=0 why=sig_copy_fail lay=%d",
++                                call, slot, (unsigned long long)(uintptr_t)s->img, (int)lay);
++                   return; }
++        m107a_sig_t a; memset(&a, 0, sizeof a);
++        m107a_sig(px, w, h, &a);
++        /* ③ 同一份整幅像素，按 [rt] 的 16×16 取样网格重算 */
++        { unsigned long long gs[3] = {0,0,0}, gn = 0; unsigned gdcol = 0; unsigned gmx = 0;
++          unsigned char gseen[512]; memset(gseen, 0, sizeof gseen);
++          for (unsigned ky = 0; ky < 16u; ky++) {
++              const unsigned yy = (unsigned)((unsigned long long)h * ky / 16u);
++              if (yy >= h) continue;
++              const uint8_t *row = px + (size_t)yy * (size_t)w * 4u;
++              for (unsigned j = 0; j < 16u; j++) {
++                  unsigned x = (unsigned)((unsigned long long)w * (2u * j + 1u) / 32u);
++                  if (x >= w) x = w - 1u;
++                  { const uint8_t *q = row + (size_t)x * 4u;
++                    const unsigned kq = ((unsigned)(q[0] >> 4) << 8) | ((unsigned)(q[1] >> 4) << 4) |
++                                        (unsigned)(q[2] >> 4);
++                    gs[0] += q[0]; gs[1] += q[1]; gs[2] += q[2]; gn++;
++                    if (q[0] > gmx) gmx = q[0]; if (q[1] > gmx) gmx = q[1]; if (q[2] > gmx) gmx = q[2];
++                    if (!(gseen[kq >> 3] & (1u << (kq & 7u)))) { gseen[kq >> 3] |= (unsigned char)(1u << (kq & 7u)); gdcol++; } }
++              }
++          }
++          free(px);
++          /* ② `[rt]` 那一路（同一张图、同一 extent/layout、同一 mip/layer；自己的 16 带拷贝） */
++          { r_sig_t b2; int ok2;
++            memset(&b2, 0, sizeof b2);
++            ok2 = m99a_sig_locked(s->img, lay, w, h, 4, &b2);
++            { const unsigned gm = gn ? (unsigned)((gs[0] + gs[1] + gs[2]) / (3ull * gn)) : 0ull;
++              const unsigned rt_m = (ok2 && b2.npx) ? (unsigned)((b2.sum[0] + b2.sum[1] + b2.sum[2]) /
++                                                               (3ull * b2.npx)) : 0ull;
++              const int dm = (int)a.mr - (int)rt_m;
++              const int dg = (int)gm - (int)rt_m;
++              const char *verdict;
++              if (!ok2) verdict = "rt_path_failed";
++              else if (is_cur && dm <= 2 && dm >= -2) verdict = "agree(same_content)";
++              else if (dg <= 2 && dg >= -2 && (dm > 2 || dm < -2))
++                  verdict = "sampling_grid(full_vs_grid: image is y-banded)";
++              else if (is_cur) verdict = "path_mismatch(layout/mip/rowpitch/view)";
++              else verdict = "different_target(sig slot != cur target)";
++              vk_boot_logf("[m119b] rb call=%llu slot=%d img=%#llx cur=%d same_img=%d wh=%ux%u "
++                           "sig[mean=%u/%u/%u dcol=%u nz10=%u extent=%ux%u fmt=rgba8(nvn=0x%x) "
++                           "lay=%d mip=0 layer=0 rowPitch=%llu] "
++                           "rt[mean=%u/%u/%u dcol=%u nz10=%u extent=%ux%u fmt=rgba8(nvn=0x%x) "
++                           "lay=%d mip=0 layer=0 rowPitch=%llu ok=%d] "
++                           "grid[mean=%u dcol=%u] d(sig-rt)=%d d(grid-rt)=%d verdict=%s",
++                           call, slot, (unsigned long long)(uintptr_t)s->img, is_cur ? 1 : 0,
++                           is_cur ? 1 : 0, w, h,
++                           a.mr, a.mg, a.mb, a.dcol, a.nz10, w, h, (unsigned)s->fmt,
++                           (int)lay, rowpitch,
++                           (unsigned)(ok2 && b2.npx ? b2.sum[0] / b2.npx : 0ull),
++                           (unsigned)(ok2 && b2.npx ? b2.sum[1] / b2.npx : 0ull),
++                           (unsigned)(ok2 && b2.npx ? b2.sum[2] / b2.npx : 0ull),
++                           b2.dcol,
++                           (unsigned)(ok2 && b2.npx ? b2.nz * 1000ull / b2.npx : 0ull),
++                           w, h, (unsigned)s->fmt, (int)lay, rowpitch, ok2 ? 1 : 0,
++                           gm, gdcol, dm, dg, verdict); }
++          } }
++      } }
++}
++
+ /* 返 1 = 本帧屏幕内容归我们管（已上屏，或按降采样主动跳过——两种情况都不要再走纯色兜底）；
+    0 = 本帧没接（后端没起/还没画过/无窗口/拷贝失败），调用方自行回落。 */
+ int nvn_vk_present_offscreen(void)
+@@ -34256,6 +34832,7 @@
+         m109a_frame(call);   /* M109A：映射表 / 白链（t2 + 逐笔 + 采样递归 ≤2 跳） */
+         m113a_frame(call);   /* M113A：top 报告(30s)/d-t-g 抓取/每帧 f 行；knob=0 ⇒ 零输出 */
+         m119a_frame(call);   /* M119A：附件签名(=2)/直方图兜底；knob=0 ⇒ 零输出 */
++        m119b_rb_check(call);   /* M119B：两路回读校验（sig 整幅 vs [rt] 16×16 抽样）；knob=0 ⇒ 零输出 */
+         if (psig_want)
+             p_sig_line(call, srcname, simg, sw, sh, crox, croy, ok, psig_verbose || g_p_m4ak_sig_pair);
+         g_p_m4ak_sig_pair = 0;
+@@ -34566,6 +35143,9 @@
+     if (!g_on || !g_dev || !g_q) return -1;
+     if (!h_off_ensure()) return -2;
+     if (!h_rt_objects_ensure()) return -2;
++    /* M119B：每次绑定都先把「N 附件通道」清零——包括下面几条早退路径（n=0 纯深度 / M101A 保目标），
++       否则上一笔的 MRT 声明会残留到这一笔的 draw 上（那是最坏的一种静默错配）。 */
++    if (nvn_vk_mrt_on()) { g_mrt_n = 0; g_mrt_pass_on = 0; g_mrt_fb_last = VK_NULL_HANDLE; }
+     /* M7c P1：开关回读（编译期默认值的唯一证据；只在第一次 rt_bind 打一行）。 */
+     if (SMO_M7C_UB && !g_m7c_cfg_logged) {
+         g_m7c_cfg_logged = 1;
+@@ -34813,6 +35393,9 @@
+     if (out_img) *out_img = (unsigned long long)(uintptr_t)g_h_img;
+     if (out_w) *out_w = g_rt_w;
+     if (out_h) *out_h = g_rt_h;
++    /* M119B：MRT 附件槽解析。knob 关 ⇒ 一次缓存整数比较后整段不执行（关态零状态、零日志）。
++       位置在 h_rt_switch(s) 之后：此刻 g_rt_cur/g_h_img/g_rt_w/g_rt_h 都是本次绑定的口径。 */
++    if (nvn_vk_mrt_on()) m119b_mrt_resolve(n, s, rw, rh);
+     if (!g_h_rt_open) {
+         VkCommandBufferAllocateInfo ca = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+         ca.commandPool = g_h_cp;
+--- platform/gfx_bridge.c
++++ platform/gfx_bridge.c
+@@ -2663,6 +2663,43 @@
+     unsigned i = g_rt_neg_i++ % RT_NEGC;
+     g_rt_neg[i].key = k; g_rt_neg[i].until = g_h_rt_seq + 512;
+ }
++static unsigned g_h_rt_colors_log;
++static unsigned g_h_mrt_decl_n;
++/* ---- M119B（2026-11-14）：SET_RENDER_TARGETS 的**全部**颜色目标 → 回放层 ----
++   病根：cmd_trace.c 此前只把 RtRec.tex[0] 交出来，n>1 的 pass 被**静默折叠**成单附件
++   （M121A 真机实测 decl_gt1=1472…1544 ≈9%：4~8 个颜色目标的 pass 大量存在）。
++   本回调把 colors[0..n-1] 逐个按**与 tex0 完全同一套**身份解析（h_rt_lookup → h_rt_chain → 存储地址）
++   算成 nvn_rt_att（身份 + guest 尺寸 + texid + NVN 格式）交给回放层；回放层再按「身份 + 宽高」找槽。
++   纪律：**解不出就不猜** —— 该附件 key=0，回放层按 `skip why=unresolved` 显式记（不静默丢件）。
++   knob `smo_rt_mrt` = 0（缺省）时第一行返回 ⇒ 零解析、零打印、零状态（关态逐字节等于 build #6）。
++   调用顺序由 cmd_trace.c 保证：本回调**先于** rt_bind。 */
++static int g_h_rt_colors_bridge(int n,const uint64_t *colors,const uint8_t *has_view,
++                                const void *views,uint64_t depth,void *user){
++ (void)has_view;(void)views;(void)depth;(void)user;
++ if(!nvn_vk_mrt_on())return 0;
++ if(!colors||n<=0)return 0;
++ if(n>8)n=8;
++ {nvn_rt_att at[8];int nres=0,i;
++  memset(at,0,sizeof at);
++  for(i=0;i<n;i++){
++   rt_ident ci2;int ok2=0,lev2=0;const uint64_t t=colors[i];
++   at[i].tex_id=-1;
++   if(!t)continue;
++   ok2=h_rt_lookup(t,&ci2,1);
++   if(!ok2)ok2=h_rt_chain(t,n,&ci2,&lev2);
++   if(!ok2)continue;                        /* 解不出 ⇒ key=0（回放层显式记 why=unresolved） */
++   at[i].key=(unsigned long long)(uintptr_t)(ci2.mem?ci2.mem:(const void *)(uintptr_t)t);
++   at[i].w=ci2.w;at[i].h=ci2.h;at[i].tex_id=ci2.id;at[i].fmt=(unsigned)ci2.fmt;
++   nres++;}
++  g_h_mrt_decl_n++;
++  if(g_h_rt_colors_log<8){
++   g_h_rt_colors_log++;
++   vk_boot_logf("[m119b] mrt decl#%u n=%d resolved=%d tex=[%#llx %#llx %#llx %#llx]",
++                g_h_mrt_decl_n,n,nres,(unsigned long long)colors[0],(unsigned long long)(n>1?colors[1]:0ull),
++                (unsigned long long)(n>2?colors[2]:0ull),(unsigned long long)(n>3?colors[3]:0ull));}
++  nvn_vk_rt_attachments(n,at);}
++ return 0;
++}
+ static int g_h_rt_bridge(int n,uint64_t tex0,uint64_t depth,void *user){
+  (void)user;unsigned long long img=0;unsigned w=0,h=0;
+  g_h_rt_seq++;
+@@ -5340,6 +5377,8 @@
+  nvn_vk_cen_set_submit(sub);   /* M4ad P1：一帧清单/普查的标签 */
+  nvn_cmd_sink sink;memset(&sink,0,sizeof sink);
+  sink.clear=g_h_clear_bridge;sink.rt_bind=g_h_rt_bridge;
++ /* M119B：完整颜色目标数组（先于 rt_bind 调用）。回调自己按 knob 短路 ⇒ 关态零解析零日志。 */
++ sink.rt_colors=g_h_rt_colors_bridge;
+  sink.bind_program=g_rp_bind_program;sink.bind_vertex_attrib=g_rp_bind_attrib;
+  sink.bind_vertex_stream=g_rp_bind_stream;sink.bind_vertex_buffers=g_rp_bind_vbuf;
+  sink.bind_uniform_buffers=g_rp_bind_ubuf;sink.bind_textures=g_rp_bind_tex;
+--- platform/nvn_replay/cmd_trace.h
++++ platform/nvn_replay/cmd_trace.h
+@@ -155,8 +155,25 @@
+        bytes = NULL 表示记录体不够长（旧记录），调用方按「未绑定」处理。 */
+     int (*bind_blend_state)(uint64_t guest_ptr, const void *bytes, uint32_t nbytes, void *user);
+     int (*bind_color_state)(uint64_t guest_ptr, const void *bytes, uint32_t nbytes, void *user);
++    /* ---- M119B（2026-11-14）：SET_RENDER_TARGETS 的**完整**颜色目标数组 ----
++       病根：回放侧此前只读记录体前 8 字节（NVN_CMD_RT_FIRST_TEX_OFF = RtRec.tex[0]），
++       于是 n>1 的 pass 被**静默折叠**成单附件（M121A 真机实测 decl_gt1=1472…1544，≈9% 的绑定
++       声明了 4~8 个颜色目标 —— 这些附件此前全部被丢掉）。
++       本回调把 n 与 colors[0..n-1] **原样**交下去（不做任何解释：值就是录制时刻的 NVNtexture*）；
++       has_view/views 一并给出（views 每项 16B，只有 has_view[i]=1 时有效；两者可为 NULL）。
++       调用顺序：**先 rt_colors、后 rt_bind**（与 nvn_vk_dk_note 同一约定），所以回放层可以在
++       同一次绑定里按「声明数组」解析每个附件的槽。为 NULL 时（旧调用方 / 关态）行为逐字节相同。 */
++    int (*rt_colors)(int n, const uint64_t *colors, const uint8_t *has_view, const void *views,
++                     uint64_t depth, void *user);
+ } nvn_cmd_sink;
+ 
++/* M119B（2026-11-14）：RtRec 里 colors[1..n-1] 与视图数组的偏移（与 cmdbuf.c 的 RtRec 布局对账）。
++   布局 = { u64 tex[8]; NvnTextureView views[8]; u8 has_view[8]; u64 depth; … }（nvn对象视图 16B）。
++   ⇒ views 在 +64、has_view 在 +192（64 + 8×16）。两者只在记录体真的够长时才可以读（调用方先验长度）。 */
++#define NVN_CMD_RT_VIEWS_OFF   64
++#define NVN_CMD_RT_HASVIEW_OFF 192
++#define NVN_CMD_RT_MAX_COLORS  8
++
+ /* 与 nvn_cmd_exec 同一条走流语义（同一 rec_bad/边界/跳转/守卫），按 sink 分派各 opcode。 */
+ int nvn_cmd_exec_sink(const void *start, nvn_cmd_readable_fn readable,
+                       const nvn_cmd_sink *sink, CmdExecStat *out);
+--- platform/nvn_replay/cmd_trace.c
++++ platform/nvn_replay/cmd_trace.c
+@@ -274,6 +274,22 @@
+                连它写的是哪张 1024×1024 深度图都无从得知（m4p_b1 的 1024×1024 全 0 就此而来）。 */
+             if (r->size >= sizeof(CmdRec) + NVN_CMD_RT_DEPTH_OFF + 8)
+                 memcpy(&depth, r->extra + NVN_CMD_RT_DEPTH_OFF, 8);
++            /* M119B（2026-11-14）：把**全部** colors[0..n-1] 交下去（此前只交 tex0 ⇒ n>1 被静默折叠）。
++               三段长度各自先按 payload 验，任何一段不够就只交能交的那部分（NUL/NULL），绝不越界读；
++               n 本身也夹到录制端的上限（cmdbuf.c 录制时已把 n 夹到 8）。 */
++            if (sink->rt_colors) {
++                const uint64_t *cols = NULL;
++                const uint8_t *hv = NULL;
++                const void *vs = NULL;
++                const uint32_t p = payload;
++                if (n > 0 && n <= NVN_CMD_RT_MAX_COLORS && p >= (uint32_t)NVN_CMD_RT_VIEWS_OFF)
++                    cols = (const uint64_t *)(const void *)r->extra;
++                if (cols && p >= (uint32_t)NVN_CMD_RT_VIEWS_OFF + 128u)
++                    vs = (const void *)(r->extra + NVN_CMD_RT_VIEWS_OFF);
++                if (cols && p >= (uint32_t)NVN_CMD_RT_HASVIEW_OFF + 8u)
++                    hv = (const uint8_t *)(r->extra + NVN_CMD_RT_HASVIEW_OFF);
++                sink->rt_colors(n, cols, hv, vs, depth, user);
++            }
+             int rv = sink->rt_bind(n, tex0, depth, user);
+             if (rv == 0) out->rt_binds++; else out->rt_fail++;
+         }

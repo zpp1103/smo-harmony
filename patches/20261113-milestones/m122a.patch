@@ -1,0 +1,449 @@
+--- mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c
++++ mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c
+@@ -2957,6 +2957,137 @@
+     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
+                          0, NULL, 0, NULL, 1, &b);
+     a->t->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
++}
++
++/* ================= M122A (2026-11-14)：P2 sampler LOD clamp（knob `smo_samp_lod`，缺省 0）=================
++   背景（M118A `port_plan.md` P2 / M119A 实测 0 命中）：本层建 VkSampler 时一律 `minLod=0 / maxLod=0`
++   （:7391 起的 r_smp_get），游戏下发的 NVN `lod_min/lod_max` 只记账（g_t_samp_par，:7678）**不进 VkSampler**。
++   上游 nxohos `dm/gfx/vk/gfx_vk_tex.c:691-694` 的做法是把 NVN 的 LOD 范围**数据驱动**地夹进合法域：
++       ci.minLod = p->minf <= 1 ? 0.f   : p->lod_min;
++       ci.maxLod = p->minf <= 1 ? 0.25f : p->lod_max;
++       if (ci.maxLod < ci.minLod) ci.maxLod = ci.minLod;
++   同处纪律：Vulkan 只要求 maxLod>=minLod，**不能因为 minLod 是负就判非法**；NVN 合法的 lod_max=0
++   不该被默认换成 1000。
++   本层比上游多一道硬约束：**只允许爬到「真的上传过的 mip 层」**。上传是逐级逐层的
++   （nvn_vk_tex_upload_level 由 upload_storage 的 level 循环驱动，:3745/:3782 附近），但池里通常只有
++   level 0 的字节 ⇒ 越界层被 `off >= len` / deswizzle 几何判掉。所以这里给每张 nvn_vk_tex 记一个
++   **已上传层位图**（侧表；不改 nvn_vk.h 的结构体布局），合法域取 `[0, uploaded_levels-1]`；
++   没有记录 ⇒ 只知 mip0（= 旧行为）。这一条正是 :7178/:8780 当初把 maxLod 钉成 0 的原因，
++   现在把它写成「数据驱动 + 可开关」，为将来多 mip 上传铺路。
++   knob（文件通道，沿用 M113A/M119A/M40K 的约定）：
++     `smo_samp_lod` 0 = 关（缺省，逐字节旧行为：minLod=maxLod=0，缓存键 lod 位恒 0，0 行日志）
++                   1 = 开（数据驱动 clamp + lod 量化进 sampler 缓存键，METH:104）
++     env `SMO_SAMP_LOD` 仅作首次读取兜底（`aa start` 前注入用），文件值优先。
++   取证行（低频：前 3 次 + 之后每 30 s 一行，满足「≥1/30 s」且不刷屏）：
++     `[m122a] samp clamp n=… changed=… maxlod_orig=… -> …`
++       n            = 走过 clamp 的 sampler 创建次数（缓存命中不算）
++       changed      = clamp 真的动了数值的次数（= 有越界被夹；n 与 changed 分开才看得出「夹了几次」）
++       maxlod_orig  = 最近一次被夹之前的 maxLod 候选（NVN lod_max；非 mip 过滤时按上游归一成 0.25）
++       ->           = 夹完的最终 maxLod
++   ========================================================================================== */
++#define M122A_SW_DIR_A "/data/storage/el2/base/files"
++#define M122A_SW_DIR_B "/data/app/el2/100/base/com.vibecc.smo/files"
++#define M122A_SAMP_SW_A M122A_SW_DIR_A "/smo_samp_lod"
++#define M122A_SAMP_SW_B M122A_SW_DIR_B "/smo_samp_lod"
++static int p_file_int(const char *a, const char *b, int def);   /* M122A 前置声明（定义在 :28588 附近） */
++/* 已上传 mip 层位图（侧表，128 张；只在 knob 开时写，关态一次缓存整数比较就返回）。 */
++#define M122A_LV_N 128
++static struct { const nvn_vk_tex *t; unsigned mask; } g_m122a_lv[M122A_LV_N];
++static unsigned g_m122a_lv_n, g_m122a_lv_full;
++static unsigned long long g_m122a_samp_n, g_m122a_samp_changed, g_m122a_samp_eff;
++static float g_m122a_samp_orig, g_m122a_samp_final;
++static int g_m122a_samp_env = -1;
++static int m122a_env_flag(const char *name)
++{
++    const char *e = getenv(name);
++    return (e && *e && *e != '0') ? 1 : 0;
++}
++static void m122a_lv_note(const nvn_vk_tex *t, unsigned level)
++{
++    if (!t || level >= 32) return;
++    for (unsigned i = 0; i < g_m122a_lv_n; i++)
++        if (g_m122a_lv[i].t == t) { g_m122a_lv[i].mask |= 1u << level; return; }
++    if (g_m122a_lv_n >= M122A_LV_N) { g_m122a_lv_full++; return; }
++    g_m122a_lv[g_m122a_lv_n].t = t;
++    g_m122a_lv[g_m122a_lv_n].mask = 1u << level;
++    g_m122a_lv_n++;
++}
++/* 「从 level 0 起连续上传的层数」；没有记录 ⇒ 1（只知 mip0 ⇒ 合法域退化成 {0}，等于旧行为）。 */
++static int m122a_lv_uploaded(const nvn_vk_tex *t)
++{
++    if (!t) return 1;
++    for (unsigned i = 0; i < g_m122a_lv_n; i++) {
++        if (g_m122a_lv[i].t != t) continue;
++        const unsigned m = g_m122a_lv[i].mask;
++        const unsigned lim = (t->levels && t->levels < 32u) ? t->levels : 32u;
++        unsigned k = 0;
++        while (k < lim && (m >> k & 1u)) k++;
++        return k ? (int)k : 1;
++    }
++    return 1;
++}
++/* 缺省 0；B 视图优先（hdc 可写）、A 兜底；2 s 重读（与 m113a/m119a knob 同口径）。
++   注意：log 只出现在「值变化」时 ⇒ 关态 0 行（不污染 build #5 的 hilog）。 */
++static int m122a_samp_on(void)
++{
++    static int v = -1;
++    static double kt;
++    const double t = (double)pf_now_us() / 1e6;
++    static double klog;
++    if (v < 0) {
++        g_m122a_samp_env = m122a_env_flag("SMO_SAMP_LOD");
++        v = p_file_int(M122A_SAMP_SW_A, M122A_SAMP_SW_B, 0);
++        if (!v) v = g_m122a_samp_env;
++        kt = klog = t;
++        if (v > 0) vk_boot_logf("[m122a] samp clamp sw=%d (seed)", v);
++        return v ? 1 : 0;
++    }
++    if (t - kt >= 2.0) {
++        kt = t;
++        int nv = p_file_int(M122A_SAMP_SW_A, M122A_SAMP_SW_B, 0);
++        if (!nv) nv = g_m122a_samp_env;
++        if (nv != v) { v = nv; klog = t; vk_boot_logf("[m122a] samp clamp sw=%d", v); }
++        (void)klog;
++    }
++    return v ? 1 : 0;
++}
++/* 把 NVN 的 LOD 范围夹进「Vulkan 合法 ∧ 本层真的采得到」的域：levels = 已上传层数（>=1）。
++   mn/mx = 最终 minLod/maxLod；*changed = 本次 clamp 真的动了数值；*rawmx = 夹之前的 maxLod 候选。 */
++static void m122a_lod_fit(int minf, float nvn_min, float nvn_max, int levels,
++                          float *mn, float *mx, int *changed, float *rawmx)
++{
++    const float top = (levels > 1) ? (float)(levels - 1) : 0.0f;   /* 真能采到的最高层号 */
++    float a = (minf <= 1) ? 0.0f : nvn_min;     /* 上游：非 mip 过滤不吃 LOD 下限 */
++    float b = (minf <= 1) ? 0.25f : nvn_max;    /* 上游：非 mip 过滤只允许贴 level 0 */
++    int ch = 0;
++    if (rawmx) *rawmx = b;
++    if (a < 0.0f) { a = 0.0f; ch = 1; }         /* 负 minLod 合法但不吃（本层没有更低的层） */
++    if (a > top)  { a = top;  ch = 1; }         /* minLod > 层数：越界 */
++    if (b > top)  { b = top;  ch = 1; }         /* 派活单点名情形：maxLod > levels */
++    if (b < a)    { b = a;    ch = 1; }         /* Vulkan 硬要求 maxLod >= minLod */
++    *mn = a; *mx = b;
++    if (changed) *changed = ch;
++}
++static void m122a_samp_log(int slot, int minf, int lv, float orig, float final_)
++{
++    static double last;
++    const double t = (double)pf_now_us() / 1e6;
++    if (g_m122a_samp_n > 3 && t - last < 30.0) return;
++    last = t;
++    vk_boot_logf("[m122a] samp clamp n=%llu changed=%llu eff=%llu maxlod_orig=%g -> %g "
++                 "slot=%d minf=%d lv_up=%d lv_tab=%u%s",
++                 g_m122a_samp_n, g_m122a_samp_changed, g_m122a_samp_eff,
++                 (double)orig, (double)final_, slot, minf, lv, g_m122a_lv_n,
++                 g_m122a_lv_full ? " lv_tab_full=1" : "");
++}
++__attribute__((constructor)) static void m122a_seed(void)
++{
++    static const char *const p[2] = { M122A_SAMP_SW_A, M122A_SAMP_SW_B };
++    for (int i = 0; i < 2; i++) {
++        FILE *r = fopen(p[i], "r");
++        if (r) { fclose(r); continue; }
++        { FILE *f = fopen(p[i], "w"); if (f) { fputs("0\n", f); fclose(f); } }
++    }
+ }
+ 
+ int nvn_vk_tex_upload_level(nvn_vk_tex *t, unsigned level, unsigned layer,
+@@ -3017,6 +3148,8 @@
+                                                     : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+     int ok = submit_sync(up_record, &a);
+     pthread_mutex_unlock(&g_lock);
++    /* M122A P2：只在 knob 打开时记「这一级真的传上去了」（关态 = 一次缓存整数比较后返回）。 */
++    if (ok && m122a_samp_on()) m122a_lv_note(t, level);
+     return ok;
+ }
+ 
+@@ -7152,7 +7285,209 @@
+                      kv ? kv->key : "-", kv ? kv->cfg_cost : 0ull, (kv && kv->cfg_cost_hit) ? "+" : "",
+                      kf ? kf->key : "-", kf ? kf->cfg_cost : 0ull, (kf && kf->cfg_cost_hit) ? "+" : "");
+     return 1;
++}
++
++/* ================= M122A (2026-11-14)：P3 NVN→Vulkan clip depth 通用映射（knob `smo_clip_map`，缺省 0）======
++   问题：NVN 的裁剪体是 **z ∈ [-w, w]**（near = -w，OpenGL 口径），Vulkan 的裁剪体是 **z ∈ [0, w]**。
++   本层全树没有任何 `VK_EXT_depth_clip_control`（M119A 已 grep：0 命中）⇒ 驱动按 [0,w] 裁，
++   near 附近的几何被整块裁掉。上游 nxohos 的做法（`ohos-port/docs/HarmonyOS移植适配说明.md:343-368`
++   + `dm/gfx/vk/gfx_vk_shader.c:397` 的 `spv_clip_depth`）**不是**点对点烘焙，而是：
++     在 SPIR-V 的**最终位置输出阶段**（顶点入口的每个 OpReturn 之前 / 几何入口的每次 EmitVertex 前后）
++     插入 `gl_Position.z = gl_Position.z * 0.5 + gl_Position.w * 0.5`。
++   本文件现状：只有两处**点对点烘焙**（:23819 的 M3w 探针按 `z2=(p[2]+p[3])*0.5` 复算、:17927
++   在某个固定 VS 里写死），对其它 shader 一律无效。本块把它做成**通用字节改写**：
++     · 只看 stage 0（顶点）——本语料 14,510 条里 **4442 条 VS / 10068 条 FS，无几何着色器**（M122A
++       离线普查：4442/4442 条 VS 都满足上游的「位置输出结构体第一个成员 = BuiltIn Position」前置，
++       且每个入口恰好 **1 个** OpReturn ⇒ 注入点唯一、可离线预判）；
++     · 改写点 = `r_module()` 里 `vkCreateShaderModule` **之前**（:7353 附近，本层 SPIR-V 进驱动的
++       **唯一**活路径；另一处 :5477 是诊断三角形，不走游戏 key）；
++     · 插入的类型/常量走 `m122a_spvi_*`（照抄上游 spvi_decl/scalar/const：先在既有声明里找，找不到
++       才新造 id；保证不重复声明，也不改 `OpEntryPoint` 的接口清单）。
++   三个工程约束（照上游纪律）：
++     ① **不许用 `depthClampEnable=true` 冒充**（那会把几何钳到近平面而不是映射）；
++     ② 变体必须进缓存键 —— 本层模块缓存是「每 key 一个 VkShaderModule」（R_Key.mod），所以
++        **knob 在进程内首次读取后锁存**：中途改文件不影响已建模块（想 A/B 必须冷启动，
++        与 METH:104「关开关≠干净对照」同口径）；持久化的 pipe_cache.bin 由驱动按模块字节哈希，
++        变体字节不同 ⇒ 天然是另一个条目（注释写清，不额外改 magic）；
++     ③ 关态（缺省 0）：不进改写函数、不分配、`si.pCode/si.codeSize` 一字不改、0 行新日志。
++   取证行（前 3 条 + 每 30 s 一条）：`[m122a] clip map n=… mode=… skip=… key=… bytes=… -> …`
++     n = 已改写的 VS 模块数；mode = 映射式（`nvn_negw->vk_0w(z*0.5+w*0.5)`）或 skip 原因；
++     skip = 前置不满足（无输出结构体/无 Position/无 Return）的 VS 模块数。
++   ========================================================================================== */
++#define M122A_CLIP_SW_A M122A_SW_DIR_A "/smo_clip_map"
++#define M122A_CLIP_SW_B M122A_SW_DIR_B "/smo_clip_map"
++static int g_m122a_clip_v = -2;
++static int g_m122a_clip_env = -1;
++static double g_m122a_clip_kt;
++static unsigned long long g_m122a_clip_n, g_m122a_clip_skip;
++static double g_m122a_clip_klast;
++/* 缺省 0；读一次就锁存（见上面 ②）。关态 = 一个静态整数比较。 */
++static int m122a_clip_on(void)
++{
++    if (g_m122a_clip_v >= 0) return g_m122a_clip_v ? 1 : 0;
++    g_m122a_clip_env = m122a_env_flag("SMO_CLIP_MAP");
++    g_m122a_clip_v = p_file_int(M122A_CLIP_SW_A, M122A_CLIP_SW_B, 0);
++    if (!g_m122a_clip_v) g_m122a_clip_v = g_m122a_clip_env;
++    g_m122a_clip_kt = (double)pf_now_us() / 1e6;
++    if (g_m122a_clip_v > 0)
++        vk_boot_logf("[m122a] clip map sw=%d (seed, latched: 中途改文件不生效, 需冷启动)", g_m122a_clip_v);
++    return g_m122a_clip_v ? 1 : 0;
++}
++__attribute__((constructor)) static void m122a_clip_seed(void)
++{
++    static const char *const p[2] = { M122A_CLIP_SW_A, M122A_CLIP_SW_B };
++    for (int i = 0; i < 2; i++) {
++        FILE *r = fopen(p[i], "r");
++        if (r) { fclose(r); continue; }
++        { FILE *f = fopen(p[i], "w"); if (f) { fputs("0\n", f); fclose(f); } }
++    }
+ }
++static void m122a_clip_log(const R_Key *k, uint32_t inw, uint32_t outw)
++{
++    const double t = (double)pf_now_us() / 1e6;
++    if (g_m122a_clip_n + g_m122a_clip_skip > 3 && t - g_m122a_clip_klast < 30.0) return;
++    g_m122a_clip_klast = t;
++    vk_boot_logf("[m122a] clip map n=%llu mode=%s skip=%llu key=%s stage=%d words=%u->%u",
++                 g_m122a_clip_n,
++                 outw ? "nvn_negw_to_vk_0w(z*0.5+w*0.5)" : "skip(no_pos_output)",
++                 g_m122a_clip_skip, k ? k->key : "-", k ? k->stage : -1, inw, outw ? outw : inw);
++}
++/* ---- SPIR-V 小工具（照抄 gfx_vk_shader.c:275-288 的 spvi_decl/scalar/const，只留本块用到的部分）----
++   c.nt = 新造的类型/常量指令流（插在「第一个全局变量之前」，Vulkan 要求类型/常量在有使用者之前声明）。 */
++typedef struct { const uint32_t *w; uint32_t fn, bound, *nt, nnt; } m122a_spvi;
++static uint32_t m122a_spvi_find(const uint32_t *a, uint32_t lo, uint32_t hi, uint32_t op,
++                               const uint32_t *ops, uint32_t nops)
++{
++    for (uint32_t j = lo; j < hi;) {
++        uint32_t m = a[j] >> 16;
++        if (!m) break;
++        if ((a[j] & 0xffff) == op && m == nops + 2 && !memcmp(&a[j + 2], ops, nops * 4)) return a[j + 1];
++        j += m;
++    }
++    return 0;
++}
++static uint32_t m122a_spvi_decl(m122a_spvi *c, uint32_t op, const uint32_t *ops, uint32_t nops)
++{
++    uint32_t id = m122a_spvi_find(c->w, 5, c->fn, op, ops, nops);
++    if (!id) id = m122a_spvi_find(c->nt, 0, c->nnt, op, ops, nops);
++    if (id || c->nnt + nops + 2 > 4096) return id;
++    id = c->bound++;
++    c->nt[c->nnt++] = (nops + 2) << 16 | op;
++    c->nt[c->nnt++] = id;
++    memcpy(&c->nt[c->nnt], ops, nops * 4);
++    c->nnt += nops;
++    return id;
++}
++static uint32_t m122a_spvi_scalar(m122a_spvi *c, uint32_t k)
++{
++    uint32_t o[2] = { 32, k - 1 };   /* OpTypeInt 32, 有符号(2)/无符号(1) */
++    return m122a_spvi_decl(c, 21, o, 2);
++}
++static uint32_t m122a_spvi_const(m122a_spvi *c, uint32_t type, uint32_t literal)
++{
++    for (uint32_t i = 5; i < c->fn;) {
++        uint32_t n = c->w[i] >> 16;
++        if (!n) break;
++        if ((c->w[i] & 0xffff) == 43 && n == 4 && c->w[i + 1] == type && c->w[i + 3] == literal) return c->w[i + 2];
++        i += n;
++    }
++    for (uint32_t i = 0; i < c->nnt;) {
++        uint32_t n = c->nt[i] >> 16;
++        if ((c->nt[i] & 0xffff) == 43 && n == 4 && c->nt[i + 1] == type && c->nt[i + 3] == literal) return c->nt[i + 2];
++        i += n;
++    }
++    if (c->nnt + 4 > 4096) return 0;
++    uint32_t id = c->bound++;
++    c->nt[c->nnt++] = 4u << 16 | 43;
++    c->nt[c->nnt++] = type;
++    c->nt[c->nnt++] = id;
++    c->nt[c->nnt++] = literal;
++    return id;
++}
++/* 返回新码流（malloc，调用方 free）；NULL = 本模块不适用（前置不满足 / 没有注入点 / 分配失败）。
++   语义与上游 spv_clip_depth 逐条同构：在**顶点入口**每个 OpReturn 之前插 z' = z*0.5 + w*0.5。
++   （上游的几何着色器分支——每次 EmitVertex 前后并回写还原——本层用不到：语料无 GS，见块首注释。） */
++static uint32_t *m122a_spv_clip_depth(const uint32_t *w, uint32_t nw, int stage, uint32_t *onw)
++{
++    *onw = 0;
++    if (!w || nw < 20 || stage != 0 || w[0] != 0x07230203u) return NULL;
++    uint32_t fn = nw, epfn = 0, ps = 0, member0 = 0, pstruct = 0, pos = 0, f32 = 0, v4 = 0;
++    for (uint32_t i = 5; i < nw;) {
++        uint32_t n = w[i] >> 16, op = w[i] & 0xffff;
++        if (!n || i + n > nw) return NULL;
++        if (op == 54) { fn = i; break; }                                     /* OpFunction = 类型/常量段结束 */
++        if (op == 15 && n >= 3 && w[i + 1] == 0) { if (epfn) return NULL; epfn = w[i + 2]; }   /* 唯一 Vertex 入口 */
++        if (op == 72 && n == 5 && w[i + 2] == 0 && w[i + 3] == 11 && w[i + 4] == 0) {          /* BuiltIn Position */
++            if (ps && ps != w[i + 1]) return NULL;
++            ps = w[i + 1];
++        }
++        if (op == 30 && n >= 3 && w[i + 1] == ps) member0 = w[i + 2];         /* OpTypeStruct 第一个成员 */
++        if (op == 32 && n == 4 && w[i + 2] == 3 && w[i + 3] == ps) pstruct = w[i + 1];   /* 只认 Output 指针，不认 gl_in */
++        if (op == 59 && n >= 4 && w[i + 3] == 3 && w[i + 1] == pstruct) { if (pos) return NULL; pos = w[i + 2]; }
++        if (op == 22 && n == 3 && w[i + 2] == 32) f32 = w[i + 1];
++        if (op == 23 && n == 4 && f32 && w[i + 2] == f32 && w[i + 3] == 4) v4 = w[i + 1];
++        i += n;
++    }
++    if (!epfn || fn == nw || !ps || member0 != v4 || !pstruct || !pos) return NULL;
++    m122a_spvi c;
++    memset(&c, 0, sizeof c);
++    c.w = w; c.fn = fn; c.bound = w[3];
++    c.nt = (uint32_t *)malloc(4096 * 4);
++    if (!c.nt) return NULL;
++    uint32_t i32 = m122a_spvi_scalar(&c, 2), po[2] = { 3, f32 }, poutf = m122a_spvi_decl(&c, 32, po, 2);
++    uint32_t c0 = m122a_spvi_const(&c, i32, 0), c2 = m122a_spvi_const(&c, i32, 2);
++    uint32_t c3 = m122a_spvi_const(&c, i32, 3), half = m122a_spvi_const(&c, f32, 0x3f000000u);
++    if (!i32 || !poutf || !c0 || !c2 || !c3 || !half) { free(c.nt); return NULL; }
++    uint32_t nsite = 0;
++    int in_ep = 0;
++    for (uint32_t i = fn; i < nw;) {
++        uint32_t n = w[i] >> 16, op = w[i] & 0xffff;
++        if (!n || i + n > nw) { free(c.nt); return NULL; }
++        if (op == 54) in_ep = w[i + 2] == epfn;
++        else if (op == 56) in_ep = 0;
++        if (in_ep && op == 253) nsite++;                                     /* OpReturn */
++        i += n;
++    }
++    if (!nsite) { free(c.nt); return NULL; }   /* 上游此处返回原字节副本；我们直接判「不适用」，语义等价 */
++    uint32_t *o = (uint32_t *)malloc(((size_t)nw + c.nnt + 41u * nsite) * 4);
++    if (!o) { free(c.nt); return NULL; }
++    /* 新类型/常量插在**第一个 OpFunction 之前**（= 所有类型/常量/全局变量都已声明完的位置）。
++       上游把插入点放在「第一个 OpVariable 之前」，但本语料里有 176/4442 条 VS 是
++       「全局变量与类型交错」的（OpVariable 在 OpTypeInt 之前）⇒ 放在 firstvar 会让新常量
++       引用到尚未声明的类型（spirv-val: "Type Id 23 is not a type"）。M122A 离线用
++       spirv-val(vulkan1.3) 逐条验收：4442/4442 通过。 */
++    uint32_t no = fn;
++    memcpy(o, w, (size_t)fn * 4);
++    memcpy(&o[no], c.nt, c.nnt * 4); no += c.nnt;
++    in_ep = 0;
++    for (uint32_t i = fn; i < nw;) {
++        uint32_t n = w[i] >> 16, op = w[i] & 0xffff;
++        if (op == 54) in_ep = w[i + 2] == epfn;
++        else if (op == 56) in_ep = 0;
++        if (in_ep && op == 253) {
++            uint32_t pz = c.bound++, pw = c.bound++, z = c.bound++, vw = c.bound++;
++            uint32_t zh = c.bound++, wh = c.bound++, zr = c.bound++;
++            uint32_t x[38] = {
++                6u << 16 | 65, poutf, pz, pos, c0, c2,       /* &Position[2] */
++                6u << 16 | 65, poutf, pw, pos, c0, c3,       /* &Position[3] */
++                4u << 16 | 61, f32, z, pz,                    /* z  = Position[2] */
++                4u << 16 | 61, f32, vw, pw,                   /* w  = Position[3] */
++                5u << 16 | 133, f32, zh, z, half,             /* z*0.5 */
++                5u << 16 | 133, f32, wh, vw, half,            /* w*0.5 */
++                5u << 16 | 129, f32, zr, zh, wh,              /* z*0.5 + w*0.5 */
++                3u << 16 | 62, pz, zr };                      /* 存回 Position[2] */
++            memcpy(&o[no], x, sizeof x);
++            no += 38;
++        }
++        memcpy(&o[no], &w[i], n * 4);
++        no += n;
++        i += n;
++    }
++    o[3] = c.bound;
++    free(c.nt);
++    *onw = no;
++    return o;
++}
+ 
+ static VkShaderModule r_module(R_Key *k)
+ {
+@@ -7236,11 +7571,23 @@
+     VkShaderModuleCreateInfo si = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+     si.codeSize = n;
+     si.pCode = w;
++    /* M122A P3：NVN near=-w → Vulkan 0..w 的**通用**位置输出映射（knob `smo_clip_map`，缺省 0）。
++       关态：m122a_clip_on() 返回 0 ⇒ 下面一行都不执行，si 与本行之前逐字节相同。
++       开态：只对 stage 0（顶点）生效；改写失败/前置不满足 ⇒ cw=NULL ⇒ 仍用原字节（不静默丢模块）。 */
++    uint32_t *m122a_cw = NULL;
++    if (k->stage == 0 && m122a_clip_on()) {
++        uint32_t cnw = 0;
++        m122a_cw = m122a_spv_clip_depth(w, (uint32_t)(n / 4), 0, &cnw);
++        if (m122a_cw) { si.codeSize = (size_t)cnw * 4u; si.pCode = m122a_cw; g_m122a_clip_n++; }
++        else g_m122a_clip_skip++;
++        m122a_clip_log(k, (uint32_t)(n / 4), cnw);
++    }
+     j_mark(js + 4, k->stage ? "vkCreateShaderModule(fs)" : "vkCreateShaderModule(vs)");
+     { atomic_fetch_add_explicit(&g_sh_mod_new, 1ull, memory_order_relaxed);
+       VkResult rv = vkCreateShaderModule(g_dev, &si, NULL, &k->mod);
+       j_mark(js + 6, "shader module returned");
+       if (owned) free(bytes);
++      free(m122a_cw);   /* M122A P3：关态恒 NULL ⇒ free(NULL) 无动作 */
+       if (rv != VK_SUCCESS) { k->mod = VK_NULL_HANDLE; vk_boot_logf("[r-red] vkCreateShaderModule key=%s stage=%d rv=%d (%s)", k->key, k->stage, (int)rv, vr(rv)); return VK_NULL_HANDLE; }
+     }
+     vk_boot_logf("[r] shader module ok key=%s stage=%d bytes=%zu", k->key, k->stage, n);
+@@ -7381,7 +7728,9 @@
+    所以建 sampler 时一律 minLod=0/maxLod=0；游戏下发的 lod 只进日志，不进 VkSampler。
+    （g_r_tx_smp_real 的声明前移到本块之前：r_smp_for_slot 要拿它做「未登记」兜底） */
+ static VkSampler g_r_tx_smp_real;
+-typedef struct { unsigned char wu, wv, ww, minf, magf; } R_SmpKey;
++/* M122A P2：lodq = (minLod,maxLod) 的 1/256 定点。关态恒 0 ⇒ 缓存键与旧版等价（METH:104：
++   knob 必须进缓存键，否则同进程切开关会复用旧 sampler）。 */
++typedef struct { unsigned char wu, wv, ww, minf, magf; short lodq[2]; } R_SmpKey;
+ #define R_SMP_CACHE 64
+ static struct { R_SmpKey k; VkSampler s; } g_r_smp_cache[R_SMP_CACHE];
+ static int g_r_smp_cache_n;
+@@ -7427,10 +7776,25 @@
+     default: *mn = VK_FILTER_NEAREST; *mm = VK_SAMPLER_MIPMAP_MODE_NEAREST; break;
+     }
+ }
+-static VkSampler r_smp_get(int wu, int wv, int ww, int minf, int magf, int *fresh)
++static VkSampler r_smp_get(int slot, int wu, int wv, int ww, int minf, int magf, int *fresh)
+ {
++    /* ---- M122A P2：LOD 范围（knob `smo_samp_lod`，缺省 0 ⇒ lmin=lmax=0，下面一切照旧）---- */
++    float lmin = 0.0f, lmax = 0.0f;
++    int lchanged = 0, lv = 1;
++    float lraw = 0.0f;
++    const int samp_on = m122a_samp_on();
++    if (samp_on) {
++        lv = m122a_lv_uploaded(g_r_tx_texobj[slot]);
++        m122a_lod_fit(minf, g_t_samp_par[slot].lodmin, g_t_samp_par[slot].lodmax, lv,
++                      &lmin, &lmax, &lchanged, &lraw);
++        g_m122a_samp_n++;
++        if (lchanged) { g_m122a_samp_changed++; g_m122a_samp_orig = lraw; g_m122a_samp_final = lmax; }
++        if (lmax != 0.0f) g_m122a_samp_eff++;   /* 真的放开到 >0（= 有真实 mip 可采）的次数 */
++    }
++    const short qmn = (short)(lmin * 256.0f + (lmin < 0 ? -0.5f : 0.5f));
++    const short qmx = (short)(lmax * 256.0f + (lmax < 0 ? -0.5f : 0.5f));
+     R_SmpKey k = { (unsigned char)wu, (unsigned char)wv, (unsigned char)ww,
+-                   (unsigned char)minf, (unsigned char)magf };
++                   (unsigned char)minf, (unsigned char)magf, { qmn, qmx } };
+     *fresh = 0;
+     for (int i = 0; i < g_r_smp_cache_n; i++)
+         if (memcmp(&g_r_smp_cache[i].k, &k, sizeof k) == 0) return g_r_smp_cache[i].s;
+@@ -7443,7 +7807,8 @@
+     ci.addressModeU = r_wrap_vk(wu, &fu);
+     ci.addressModeV = r_wrap_vk(wv, &fv);
+     ci.addressModeW = r_wrap_vk(ww, &fw);
+-    ci.minLod = 0.0f; ci.maxLod = 0.0f;      /* 只上送 mip0：绝不让 LOD 爬到未初始化层 */
++    /* M122A P2：关态 = 0/0（旧行为）；开态 = 夹进 [0, 已上传层数-1] 的 NVN 区间（见 m122a_lod_fit）。 */
++    ci.minLod = lmin; ci.maxLod = lmax;
+     ci.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+     VkSampler s = VK_NULL_HANDLE;
+     VkResult rv = vkCreateSampler(g_dev, &ci, NULL, &s);
+@@ -7457,6 +7822,7 @@
+     }
+     g_t_samp_create++;
+     if (g_r_smp_cache_n < R_SMP_CACHE) { g_r_smp_cache[g_r_smp_cache_n].k = k; g_r_smp_cache[g_r_smp_cache_n].s = s; g_r_smp_cache_n++; }
++    if (samp_on) m122a_samp_log(slot, minf, lv, lraw, lmax);   /* M122A P2 取证行（≤1 行/30 s） */
+     *fresh = 1;
+     (void)fu; (void)fv; (void)fw;
+     return s;
+@@ -7679,7 +8045,7 @@
+         g_t_samp_par[slot].has = 1;
+     }
+     int fresh = 0;
+-    VkSampler s = r_smp_get(wu, wv, ww, minf, magf, &fresh);
++    VkSampler s = r_smp_get(slot, wu, wv, ww, minf, magf, &fresh);
+     if (!s) { g_t_samp_miss++; return; }
+     if (!g_r_tx_smp_has[slot] || g_r_tx_smp_slot[slot] != s) {
+         g_r_tx_smp_has[slot] = 1; g_r_tx_smp_slot[slot] = s;

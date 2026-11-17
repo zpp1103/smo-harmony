@@ -1,0 +1,653 @@
+diff --git a/mario-odessy-harmony/entry/src/main/cpp/host/game_patches.c b/mario-odessy-harmony/entry/src/main/cpp/host/game_patches.c
+index 9528e77..2dbac7e 100644
+--- a/mario-odessy-harmony/entry/src/main/cpp/host/game_patches.c
++++ b/mario-odessy-harmony/entry/src/main/cpp/host/game_patches.c
+@@ -6,6 +6,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <sys/mman.h>
+ 
+ /* Odyssey 1.3.0 / 1.4.1 (the same executables): the render size patches below (key 3). Each site is checked against the
+    original instruction before it is written, as CONTRIBUTING.md asks. Key 4 writes camera fields at the present instead
+@@ -192,11 +193,640 @@ static void scene_log(void) {
+         fprintf(stderr, "[odyssey] 3D scene %ux%u (change %u)\n", now & 0xffff, now >> 16, changes);
+ }
+ 
++/* ===== round9 E-gates：纯观测门（零行为改动）=====
++ * E1 main+0x57f950（派发/舞台迭代函数入口——emu8 已证活锁主线程每周期走它：0x1D 链
++ *   sdk+0xd3f174←main+0x8af3b8←main+0x57f98c←…，0x57f98c 就在本函数体内）。
++ *   x0=容器；[x0+8]→{u32 count@+0, el* arr@+8}；逐元素 this=[el+0x10]，游戏随后对
++ *   this+0x58 发 SignalProcessWideKey。门在入口把 {el,this} 快照进静态缓冲——多读的
++ *   地址恰是被换出的第 4 条指令（ldr x8,[x0,#8]）之后游戏自己立刻要读的同一批地址
++ *   （count/arr/el/[el+0x10]，见 0x57f95c-0x57f97c 反汇编），不新增任何解引用面。
++ *   dump 时打表与 threads.c 的 pkey/pkey2 发 key 族对照，验证两族是否同一数组算出。
++ * E2a main+0x8aef34、E2b main+0x8af418（两个 stage 排空方法，收 MQ@+0x168 完成包）：
++ *   命中计数 + 末次 x0。pkey2 发 key 族 wait(0x1C)=0 + 本门 0 命中 ⇒ 该池消费者线程
++ *   从未运行；与 threads.c 的 CreateThread/StartThread 账本（svc 0x08/0x09）对照区分
++ *   「从未创建」与「创建失败」。
++ * 机制：入口 16 字节换成 veneer（ldr x17,#8; br x17; .quad stub），stub 落在 main 镜像
++ *   尾部保留页 [page_up(file_size), +0x4000)（本移植 frame-step 空置；loader.c "Main's
++ *   extra private page … stays plain zero-filled memory" 即此页）。stub 保存
++ *   x0-x7/x29/x30 → 调 C 观察器（无锁、无 I/O、无 libc 调用）→ 恢复 → 原样重放被换的
++ *   4 条出厂指令 → b 回入口+0x10。编码字全部经 scripts_round9b/gen_obs_stub.py 的
++ *   capstone 往返校验；安装时先逐一比对 4 条出厂指令字，不符即不装该门（fail-soft）。
++ * round13 kick 断链观测门（fixPlan(2)：『kick 从未运行』从推断升级为指令级计数）：
++ * KICK1 main+0x8ad1f4（kick 入口+4：donor 语义里带优先队列入队后再 signal 的派发函数；
++ *   被 al thunk 0x587ea0 尾调与主线程排空循环 0x8abfa0 bl 调用）。计数=该函数全部真实
++ *   执行次数——与 donor 侧 0x8ad1f0 族 force/entry 计数（预期 ≈920+410+舞台数，与
++ *   wait#921/920/410 对账）对照：emu ≈0 ⇒ kick 从未运行（断链在注册上游），emu 大而
++ *   worker 不醒 ⇒ kick 运行但其虚调用路径分歧。
++ * ALKICK main+0x587ea8（al 层 kick 调用点：thunk 0x587ea0 过 NULL 检查后的尾调 b）。
++ *   该址仅一条无条件 b、且控制流不再返回（thunk 后继 0x587eac ret 只经 0x587ea4 cbz
++ *   到达），故走单字门（tail=1）：出厂 b→stub 计数→stub 尾 b 回原目标 0x8ad1f0，
++ *   无重放、不碰相邻 thunk（0x587eb0 起是另一个活 thunk）。KICK1−ALKICK=直接调用路径。
++ * KICK3 main+0x8ad318（kick 三参变体 0x8ad310 族的合流点：0x8ad310 and;0x8ad314 mov
++ *   顺流至此，0x8a671c cbz 也跳此——全镜像无其它落点，扫描实证）。同为单字门。
++ * round15 定向 watch（末三注册分析建议①）：kick 三门 13c/14c 全程 hits=0 后，区分主线程
++ * 排空路径「循环没跑」vs「跑了但链表恒空（kick 分支不满足）」——
++ * DRAIN-ENTER main+0x8abf70（主线程排空函数入口，其循环体 0x8abf94 的 bl 0x8ad1f0 即 kick 直接
++ *   调用源之二；str/stp/stp/add 四寄存器字，全镜像扫描无窗内落点）。与 KICK1 联读三分支：
++ *   ENTER=0 → 排空函数从未被调（两个调用源均未到达，上游断链实锤）；
++ *   ENTER>0 ∧ KICK1=0 → 每次进排空都走 b.eq 空表捷径（0x8abf84 cmp x0,[x0+8]）＝链表恒空＝
++ *   E2b 完成包从未入队的指令级证据；ENTER>0 ∧ KICK1>0 → kick 已被派发（破局）。
++ *   非空前置块 0x8abf8c 不可门：循环回边 0x8abfac b.ne 落 0x8abf94＝窗内第 3 字（全镜像扫描
++ *   实证），veneer 必炸；bl 本身含 PC 相对字亦不可重放。al thunk 0x587ea0 入口同理不可门
++ *   （第 2/3 字=cbz/b 出窗控制流），ALKICK(0x587ea8) 继续承担该路径唯一计数——记录在案。
++ * round16b 排空循环块门（DRAIN-LOOP）：KICK1−ALKICK 只剩「排空循环直接调用」无指令级计数，
++ *   循环头 0x8abf94（bl 0x8ad1f0@0x8abfa0 所在基本块入口＝b.ne 回边落点）装四字门。窗口第 4
++ *   字就是 bl——本轮 smo_obs_replay_fix 增加 bl 重定位（同绝对目标重算 imm26；返回地址语义
++ *   原样：重放 bl 的 lr=下一重放字＝w[23] b 回 0x8abfa4，kick 的 br x1 尾调亦回到 w[23]）。
++ *   窗内落点全镜像扫描：0x8abf98/9c/a0 零命中（b/cbz/tbz/adrp+add 全族），仅回边落窗口首字。
++ *   首见快照 kick 三条件值（0x8ad200 cmp w1,#1 / 0x8ad208 ldrb [x19,#0xf9] / 0x8ad278
++ *   ldr x0,[x19,#0x20]，x19=kick this=x8-0x1c0）：循环头处 w1 恒=w19（首进=参数、回边=上一轮
++ *   0x8abf9c 所写），x8=当前节点。观察器经新增 stub 参数取到（见下方 prologue 注）。
++ * ALKICK 覆盖确认（round16b 复核，指令级）：0x587ea0 ldr x0,[x0]; 0x587ea4 cbz x0,0x587eac;
++ *   0x587ea8 b 0x8ad1f0; 0x587eac ret——ALKICK 装在 0x587ea8＝过 NULL 检查后的尾调 b，计的是
++ *   「真调用」而非 thunk 入口（NULL 路径→ret 不计）。入口装门实测不可行：四字窗含 cbz
++ *   （imm19 ±1MiB），stub 页 0x14d4xxx 距 0x587eac 达 0xF4C254≈15.7MiB，cbz 无法重定位——
++ *   ALKICK 仍是该路径唯一可计数点，结论与 round15 记录一致。
++ * round17 三门（断链第一未满足条件已定位在游戏侧派发环节——round16 kick1=alkick=216 全走
++ * thunk、drain-enter=drain-loop=0、E4 confluence=1/e1-binding=0，宿主同步语义无一处失败）：
++ * BC310 main+0x954310（donor 侧「广播调用点」：donor_round2_thr.log:1436-1441 的
++ *   CreateThread→StartThread→svc0x1d×2→svc0x1b 序列现场 x3 恒=0x10c954310＝main 基址
++ *   0x10c000000（:12）+0x954310＝该函数入口值——全镜像扫描无任何直接分支落此入口（0x954310
++ *   no-landing），证明它只经函数指针被调（与 donor 现场 x3 携带入口值互证）。四字窗
++ *   sub sp/str x25/stp x24,x23/stp x22,x21 全寄存器字，窗内 0x954314/18/1c 零落点。
++ *   emu 命中>0 ⇒ emu main 也执行了这条 boot 广播链；首/末 x0 直接回答「InitSystem 收件箱
++ *   boot 窗口内到底有没有被 kick」（上轮 pkey 饱和使 0 行非结论性）。
++ * KICKVT main+0x8ad214（kick 虚调尾 0x8ad228 br x1 的取数点：x1=[[this]+0x20]，窗四字
++ *   ldr x8,[x19]/ldr x1,[x8,#0x20]/mov x0,x19/ldp x29,x30 全寄存器字；b.lt(0x8ad204) 与
++ *   cbz(0x8ad238) 均落窗口首字，0x8ad218/21c/220 全镜像零落点）。观察器读 vt=[x0]、
++ *   tgt=[vt+0x20]——与游戏 0x8ad214/0x8ad218 下一拍要读的同一批地址（无新解引用面），
++ *   8 槽去重计数出目标分布：donor 的 kick 虚路径入数对账定位分叉点（emu tgt 若指向
++ *   HLE thunk 表/错误槽即虚路径分叉实锤）。
++ * 门容量：尾部页 0x4000，11 门×104B+0x100 头部=1244B，余量充足。 */
++enum { SMO_OBS_E1 = 0, SMO_OBS_DRAIN_A = 1, SMO_OBS_DRAIN_B = 2, SMO_OBS_CELL2 = 3,
++       SMO_OBS_KICK1 = 4, SMO_OBS_ALKICK = 5, SMO_OBS_KICK3 = 6,
++       SMO_OBS_DRAIN_ENTER = 7, SMO_OBS_DRAIN_LOOP = 8,
++       SMO_OBS_BC310 = 9, SMO_OBS_KICKVT = 10, SMO_OBS_N = 11 };
++typedef struct { uint32_t off, gate, tail; uint32_t word[4]; } smo_obs_site_t;
++static const smo_obs_site_t smo_obs_site[] = {
++    {0x57f950, SMO_OBS_E1,      0, {0xa9be4ff4, 0xa9017bfd, 0x910043fd, 0xf9400408}},   /* stp x20,x19; stp x29,x30; add x29,sp,#0x10; ldr x8,[x0,#8] */
++    {0x8aef34, SMO_OBS_DRAIN_A, 0, {0xa9057bfd, 0x910143fd, 0x394c0008, 0xaa0103f5}},   /* stp x29,x30,[sp,#0x50]; add x29,sp,#0x50; ldrb w8,[x0,#0x300]; mov x21,x1 */
++    {0x8af418, SMO_OBS_DRAIN_B, 0, {0xa9027bfd, 0x910083fd, 0x2a0103f3, 0xaa0003f4}},   /* stp x29,x30,[sp,#0x20]; add x29,sp,#0x20; mov w19,w1; mov x20,x0 */
++    /* round12e 定名打点：GetLoadProgress 的 f()（main+0x9b9b80）第二表双间接调用。
++       0x9b9bc4 起四条 = adrp x8,0x136d000; ldr x8,[x8,#0xeb8] (=cell 0x136deb8); ldr x8,[x8]; blr x8。
++       loader.c round12d 已证两 cell 均非直接 reloc 目标（双间接指针表），静态无法定名——
++       此门借 26k/s 的既有洪流在首个命中处快照 cell→table→fn 链，dump 时符号化。 */
++    {0x9b9bc4, SMO_OBS_CELL2,   0, {0x90004da8, 0xf9475d08, 0xf9400108, 0xd63f0100}},
++    /* round13 kick 门：KICK1 四字门（stp/add/mov/cmp，无 PC 相对字，+0x10=0x8ad204 b.lt
++       恰消费重放 cmp 的标志位）；两个单字门的 word[1]=后继原字（卸载校验用）。 */
++    {0x8ad1f4, SMO_OBS_KICK1,   0, {0xa9017bfd, 0x910043fd, 0xaa0003f3, 0x7100043f}},   /* stp x29,x30,[sp,#0x10]; add x29,sp,#0x10; mov x19,x0; cmp w1,#1 */
++    {0x587ea8, SMO_OBS_ALKICK,  1, {0x140c94d2, 0xd65f03c0, 0, 0}},                     /* b 0x8ad1f0（后继 0x587eac ret） */
++    {0x8ad318, SMO_OBS_KICK3,   1, {0x14000002, 0x00000000, 0, 0}},                     /* b 0x8ad320（后继 0x8ad31c udf 填充） */
++    /* round15 排空路径门（0x8abf70 反汇编实测字，main.patched.bin 校验一致）： */
++    {0x8abf70, SMO_OBS_DRAIN_ENTER, 0, {0xf81d0ff5, 0xa9014ff4, 0xa9027bfd, 0x910083fd}}, /* str x21,[sp,#-0x30]!; stp x20,x19; stp x29,x30; add x29,sp,#0x20 */
++    /* round16b 排空循环块门：循环头=b.ne(0x8abfac) 回边落点=bl(0x8abfa0) 所在块入口。
++       第 4 字 bl 0x8ad1f0 经 smo_obs_replay_fix 的 bl 重定位原义重放（同绝对目标）。 */
++    {0x8abf94, SMO_OBS_DRAIN_LOOP, 0, {0xf9400515, 0xd1070100, 0x2a1303e1, 0x94000494}}, /* ldr x21,[x8,#8]; sub x0,x8,#0x1c0; mov w1,w19; bl 0x8ad1f0 */
++    /* round17 ②③：donor 广播调用点入口 + kick 虚调尾取数点（字取自 main.patched.bin 实测反汇编）。 */
++    {0x954310, SMO_OBS_BC310,   0, {0xd10203ff, 0xf9001bf9, 0xa9045ff8, 0xa90557f6}}, /* sub sp,sp,#0x80; str x25,[sp,#0x30]; stp x24,x23,[sp,#0x40]; stp x22,x21,[sp,#0x50] */
++    {0x8ad214, SMO_OBS_KICKVT,  0, {0xf9400268, 0xf9401101, 0xaa1303e0, 0xa9417bfd}}, /* ldr x8,[x19]; ldr x1,[x8,#0x20]; mov x0,x19; ldp x29,x30,[sp,#0x10] */
++};
++#define SMO_OBS_E1_CAP 128
++static struct {
++    _Atomic uint64_t seq;                       /* 偶=稳定，奇=写入中（g_spin_cap 范式） */
++    _Atomic uint64_t hits; _Atomic uint64_t last_x0;
++    unsigned n, truncated; uint64_t obj, arr;
++    uint64_t el[SMO_OBS_E1_CAP], thiz[SMO_OBS_E1_CAP];
++} g_e1;
++/* round15 变迁史（末三注册分析建议②）：E1 快照只存末值（threads.c 旧 1385-1401），count 从 N
++   缩到 2 的时刻无从对账。观察器在 26k/s 洪流里只在 count/arr 变化时记一笔 {E1 hits, count, arr}
++   （hits 单调，两次 dump 的 hits 差≈耗时 → 缩点时刻可换算），64 槽环形覆盖保最旧 64 条之外
++   的最近 64 条；写入仍是纯定长拷贝+原子头指针（观察器无锁无 I/O 红线不变）。
++   round16b：条目改 {hits,count,arr,ts}——ts=CNTVCT_EL0 裸读（mrs，非 libc，红线不破；观测器
++   若用 clock_gettime 即引 vDSO/libc）。环改 32 条（最近 32 次变迁），另存单调汇总标量 max_cnt
++   （曾否>2 一目了然，环覆盖也不丢）与缩点 tick（lastc>2 → n≤2 的首个变迁，prev→cur 值随行）。
++   tick→ns 换算在 dump 侧：安装时与 dump 时各取一对 {tick, runtime_now_ns()}，两点连线内插
++   （免读 CNTFRQ_EL0——EL0 可读性平台不一，内插自校准）。 */
++#define SMO_OBS_E1_HIST 32
++static struct {
++    _Atomic unsigned head;                      /* 已记录变迁总数（环覆盖） */
++    uint32_t lastc; uint64_t lastarr;           /* 上次记录值（去重；E1 单线程调用，无竞争） */
++    struct { uint64_t hits, arr, tick; uint32_t cnt; } e[SMO_OBS_E1_HIST];
++    uint32_t max_cnt, shrink_from, shrink_to, shrunk;   /* 汇总标量（E1 单线程，无竞争） */
++    uint64_t max_tick, shrink_tick;
++} g_e1h;
++/* round16b tick 基准对（安装时取；dump 侧配第二点做内插换算） */
++static uint64_t g_obs_tick0, g_obs_ns0; static int g_obs_tick0_set;
++static inline uint64_t smo_obs_tick(void) { uint64_t t; __asm__ volatile("mrs %0, cntvct_el0" : "=r"(t)); return t; }
++/* round16b DRAIN-LOOP 首见快照：kick 三条件值（w1 / [this+0xf9] / [this+0x20]，this=x8-0x1c0）
++   + 节点 x8 + tick。首见一次即定格（set=1），此后每命中只加 hits——快照读仅首见一次，
++   新解引用面=每 boot 至多 3 个字（对象本体是游戏下一拍 0x8ad208/0x8ad278 就要读的字段）。 */
++static struct { _Atomic unsigned set; uint64_t node, this, w1, f9, o20, tick; } g_dl;
++/* round17 ①：KICK1 门（0x8ad1f4）加挂 kick 三条件快照——DRAIN-LOOP 门随排空函数 0x8abf70
++   永不被调（round16 ENTER=LOOP=0）而永不命中，三条件改在 kick 真入口取：门点原参
++   x0=kick this（0x8ad1fc mov x19,x0 的原值）、原 x1=w1（stub 参4 抄走，movz 覆盖前）。
++   [this+0xf9]（1B）+[this+0x20]（8B）＝kick 0x8ad208/0x8ad278 自己要读的字段（护栏
++   <2^32 拒读 + 指针域 0x1_0000_0000..0x8000_0000_0000，DRAIN-LOOP 快照同款范式）。
++   分布标量按 kick 三分支交叉计数（0x8ad200 cmp w1,#1 / b.lt；0x8ad208 ldrb+cmp #2）：
++   n_lt1=w1<1 直虚调、n_ge1_f9eq2=w1≥1∧f9==2 直虚调、n_ge1_f9ne2=w1≥1∧f9≠2 动画路径、
++   n_o20z=[this+0x20]==0（动画路径 0x8ad28c cbz 跳过 bl 0x8ac800 的条件）。首见一次定格
++   {this,w1,f9,o20,tick}，末见逐字段原子覆盖 {w1,f9,o20}——216 次真 kick 的分支去向
++   一屏可读。多线程 kick 并发：标量全原子 fetch_add；首见幂等竞争下良性覆盖（观测用途）。 */
++static struct {
++    _Atomic unsigned set;
++    uint64_t this_, w1, f9, o20, tick;                         /* 首见（set=1 定格） */
++    _Atomic uint64_t last_w1, last_f9, last_o20;               /* 末见（逐字段原子） */
++    _Atomic uint64_t n_lt1, n_ge1_f9eq2, n_ge1_f9ne2, n_o20z;  /* 三分支交叉分布 */
++} g_k1;
++/* round17 ②：BC310 门首见 {x0, tick}（末见 x0 走既有 g_obs_x0[gate]）；③：KICKVT 8 槽
++   去重目标分布——tgt==0（虚表槽空，游戏自己 br x1 到 0 必崩，只计数不入表）＋
++   over=8 槽满后的溢出计数。CAS 占位是原子原语非锁，观察器红线（无锁/无 I/O/无 libc）不破。 */
++static struct { _Atomic unsigned set; uint64_t x0, tick; } g_bc;
++static struct {
++    _Atomic uint64_t val[8], cnt[8];
++    _Atomic uint64_t over, n_zero, first_vt, first_tgt, last_tgt;
++    _Atomic unsigned set;
++} g_vt;
++static _Atomic uint64_t g_obs_hits[SMO_OBS_N], g_obs_x0[SMO_OBS_N];
++/* round12e cell 链一次性快照（SMO_OBS_CELL2）：{cell1,table1,fn1, cell2,table2,fn2}
++   对应 cell 0x1363dc8（=Map，验证链条读法）与 cell 0x136deb8（待定名）。 */
++static _Atomic uint64_t g_cell2[6]; static _Atomic unsigned g_cell2_set;
++static uint64_t g_obs_main_base;   /* 安装期在宿主侧写好（main 模块基址），观察器只读 */
++static uint64_t g_obs_rx_lo, g_obs_rx_hi;   /* 尾部 stub 页的 RX 区间（安装成功后填；check_permissions 查询） */
++/* 客体小栈上被 veneer 调进来的观察器：只做原子计数与定长拷贝，无锁/无 I/O/无 libc。
++   gate=x1（stub 里 movz 立即数），x0=入口原参；round16b 起 x2=门点原 x8（caller-saved，
++   stub 里显式保存/传递——DRAIN-LOOP 的节点指针在 x8）、x3=门点原 x1（被 movz gate 覆盖前的
++   原值；DRAIN-LOOP 循环头处恒=w19=排空参数 w1）。其余门不读 x2/x3，传了也是废参。 */
++static void smo_obs_observer(uint64_t x0, uint64_t gate, uint64_t x2, uint64_t x3) {
++    if (gate >= SMO_OBS_N) return;
++    atomic_fetch_add_explicit(&g_obs_hits[gate], 1, memory_order_relaxed);
++    atomic_store_explicit(&g_obs_x0[gate], x0, memory_order_relaxed);
++    (void)g_cell2; (void)g_cell2_set; (void)g_obs_main_base;   /* round12e（本门无 E1 快照路径） */
++    if (gate != SMO_OBS_E1) {
++        /* round12e 定名打点：首命中时快照两条 cell→table→fn 链。只读 main 数据段里
++           游戏 0x9b9b9c-0x9b9bd0 自己刚读过的同一批地址（护栏只挡 <2^32 的明显非指针），
++           无 I/O/无 libc——符号化留给 dump 侧。 */
++        if (gate == SMO_OBS_CELL2 && !atomic_load_explicit(&g_cell2_set, memory_order_relaxed) && g_obs_main_base) {
++            uint64_t c[2] = {0, 0}, t[2] = {0, 0}, f[2] = {0, 0};
++            c[0] = *(const volatile uint64_t *)(const void *)(uintptr_t)(g_obs_main_base + 0x1363dc8);
++            c[1] = *(const volatile uint64_t *)(const void *)(uintptr_t)(g_obs_main_base + 0x136deb8);
++            for (int k = 0; k < 2; k++) {
++                if (c[k] > 0x100000000ULL) t[k] = *(const volatile uint64_t *)(const void *)(uintptr_t)c[k];
++                if (t[k] > 0x100000000ULL) f[k] = *(const volatile uint64_t *)(const void *)(uintptr_t)t[k];
++            }
++            for (int k = 0; k < 2; k++) {
++                atomic_store_explicit(&g_cell2[k*3+0], c[k], memory_order_relaxed);
++                atomic_store_explicit(&g_cell2[k*3+1], t[k], memory_order_relaxed);
++                atomic_store_explicit(&g_cell2[k*3+2], f[k], memory_order_relaxed);
++            }
++            atomic_store_explicit(&g_cell2_set, 1, memory_order_relaxed);
++        }
++        /* round16b DRAIN-LOOP 首见快照：kick 三条件值。this=x8-0x1c0（0x8abf98 sub 的原义），
++           字段护栏同全局范式（<2^32 拒读）；[this+0xf9] 1 字节 + [this+0x20] 8 字节——
++           kick 0x8ad208/0x8ad278 就要读的字段，首见一次定格。 */
++        if (gate == SMO_OBS_DRAIN_LOOP && !atomic_load_explicit(&g_dl.set, memory_order_relaxed)) {
++            uint64_t this_ = x2 > 0x1c0 ? x2 - 0x1c0 : 0;
++            g_dl.node = x2; g_dl.this = this_; g_dl.w1 = x3; g_dl.tick = smo_obs_tick();
++            if (this_ > 0x100000000ULL && this_ < 0x800000000000ULL) {
++                g_dl.f9 = *(const volatile uint8_t *)(const void *)(uintptr_t)(this_ + 0xf9);
++                g_dl.o20 = *(const volatile uint64_t *)(const void *)(uintptr_t)(this_ + 0x20);
++            }
++            atomic_store_explicit(&g_dl.set, 1, memory_order_relaxed);
++        }
++        /* round17 ①：KICK1 门每次命中记 kick 三条件（this=x0、w1=x3）＋三分支交叉分布。
++           首见一次定格，末见逐字段原子覆盖。kick 可多线程并发（thunk 路径多调用方）：
++           标量全原子，首见 set 检查非原子但幂等（良性覆盖，观测用途）。 */
++        if (gate == SMO_OBS_KICK1) {
++            uint64_t f9 = 0, o20 = 0;
++            int rd = x0 > 0x100000000ULL && x0 < 0x800000000000ULL;
++            if (rd) {
++                f9 = *(const volatile uint8_t *)(const void *)(uintptr_t)(x0 + 0xf9);
++                o20 = *(const volatile uint64_t *)(const void *)(uintptr_t)(x0 + 0x20);
++            }
++            if ((uint32_t)x3 < 1) atomic_fetch_add_explicit(&g_k1.n_lt1, 1, memory_order_relaxed);
++            else if (f9 == 2)     atomic_fetch_add_explicit(&g_k1.n_ge1_f9eq2, 1, memory_order_relaxed);
++            else                  atomic_fetch_add_explicit(&g_k1.n_ge1_f9ne2, 1, memory_order_relaxed);
++            if (o20 == 0) atomic_fetch_add_explicit(&g_k1.n_o20z, 1, memory_order_relaxed);
++            if (!atomic_load_explicit(&g_k1.set, memory_order_relaxed)) {
++                g_k1.this_ = x0; g_k1.w1 = x3; g_k1.f9 = f9; g_k1.o20 = o20; g_k1.tick = smo_obs_tick();
++                atomic_store_explicit(&g_k1.set, 1, memory_order_relaxed);
++            }
++            atomic_store_explicit(&g_k1.last_w1, x3, memory_order_relaxed);
++            atomic_store_explicit(&g_k1.last_f9, f9, memory_order_relaxed);
++            atomic_store_explicit(&g_k1.last_o20, o20, memory_order_relaxed);
++        }
++        /* round17 ②：BC310 首见 {x0, tick}（末见 x0 走 g_obs_x0[gate]）。 */
++        if (gate == SMO_OBS_BC310 && !atomic_load_explicit(&g_bc.set, memory_order_relaxed)) {
++            g_bc.x0 = x0; g_bc.tick = smo_obs_tick();
++            atomic_store_explicit(&g_bc.set, 1, memory_order_relaxed);
++        }
++        /* round17 ③：KICKVT 虚调目标分布——vt=[x0]（=kick this 的 vtable，游戏 0x8ad214
++           下一拍就读）、tgt=[vt+0x20]（0x8ad218 下一拍就读，br x1(0x8ad228) 的目标）。
++           8 槽去重：命中即计数，空槽 CAS 占位，满则 over。tgt==0 只计数（不入表）。 */
++        if (gate == SMO_OBS_KICKVT) {
++            uint64_t vt = 0, tgt = 0;
++            if (x0 > 0x100000000ULL && x0 < 0x800000000000ULL)
++                vt = *(const volatile uint64_t *)(const void *)(uintptr_t)x0;
++            if (vt > 0x100000000ULL && vt < 0x800000000000ULL)
++                tgt = *(const volatile uint64_t *)(const void *)(uintptr_t)(vt + 0x20);
++            atomic_store_explicit(&g_vt.last_tgt, tgt, memory_order_relaxed);
++            if (!atomic_load_explicit(&g_vt.set, memory_order_relaxed)) {
++                g_vt.first_vt = vt; g_vt.first_tgt = tgt;
++                atomic_store_explicit(&g_vt.set, 1, memory_order_relaxed);
++            }
++            if (tgt == 0) { atomic_fetch_add_explicit(&g_vt.n_zero, 1, memory_order_relaxed); return; }
++            for (int i = 0; i < 8; i++) {
++                uint64_t v = atomic_load_explicit(&g_vt.val[i], memory_order_relaxed);
++                if (v == tgt) { atomic_fetch_add_explicit(&g_vt.cnt[i], 1, memory_order_relaxed); return; }
++                if (v == 0) {
++                    uint64_t exp = 0;
++                    if (atomic_compare_exchange_strong_explicit(&g_vt.val[i], &exp, tgt, memory_order_relaxed, memory_order_relaxed)) {
++                        atomic_fetch_add_explicit(&g_vt.cnt[i], 1, memory_order_relaxed); return;
++                    }
++                    if (exp == tgt) { atomic_fetch_add_explicit(&g_vt.cnt[i], 1, memory_order_relaxed); return; }
++                }
++            }
++            atomic_fetch_add_explicit(&g_vt.over, 1, memory_order_relaxed);
++        }
++        return;
++    }
++    /* 与随后游戏自己同一地址集合的读：hv=[x0+8]（指向 {u32 count@+0, el* arr@+8}），
++       再 count=[hv]、arr=[hv+8]、el=arr[i]、this=[el+0x10]（0x57f95c-0x57f97c 反汇编）。
++       hv/arr/el 护栏只挡明显非指针值（<2^32），此后每一读都是游戏下一步也要读的地址。 */
++    uint64_t hv = *(const volatile uint64_t *)(const void *)(uintptr_t)(x0 + 8);
++    if (hv < 0x100000000ULL) return;
++    const volatile uint64_t *hdr = (const volatile uint64_t *)(const void *)(uintptr_t)hv;
++    uint64_t h0 = hdr[0], arr = hdr[1];
++    if (arr < 0x100000000ULL) return;
++    unsigned n = (unsigned)(uint32_t)h0;
++    /* round15 变迁史：count/arr 变化才记（同一值洪流不刷环）。hits 用本门单调计数对账时刻。
++       round16b：每条带 CNTVCT tick；max_cnt/缩点标量在此一并维护（lastc>2→n≤2 首变迁）。 */
++    if (n != g_e1h.lastc || arr != g_e1h.lastarr) {
++        uint64_t tk = smo_obs_tick();
++        if (n > g_e1h.max_cnt) { g_e1h.max_cnt = n; g_e1h.max_tick = tk; }
++        if (!g_e1h.shrunk && g_e1h.lastc > 2 && n <= 2) {
++            g_e1h.shrunk = 1; g_e1h.shrink_from = g_e1h.lastc; g_e1h.shrink_to = n; g_e1h.shrink_tick = tk;
++        }
++        g_e1h.lastc = n; g_e1h.lastarr = arr;
++        unsigned k = atomic_load_explicit(&g_e1h.head, memory_order_relaxed);
++        g_e1h.e[k % SMO_OBS_E1_HIST].hits = atomic_load_explicit(&g_obs_hits[SMO_OBS_E1], memory_order_relaxed);
++        g_e1h.e[k % SMO_OBS_E1_HIST].cnt = n;
++        g_e1h.e[k % SMO_OBS_E1_HIST].arr = arr;
++        g_e1h.e[k % SMO_OBS_E1_HIST].tick = tk;
++        atomic_store_explicit(&g_e1h.head, k + 1, memory_order_relaxed);
++    }
++    unsigned m = n > SMO_OBS_E1_CAP ? SMO_OBS_E1_CAP : n;
++    unsigned s = (unsigned)atomic_load_explicit(&g_e1.seq, memory_order_relaxed);
++    atomic_store_explicit(&g_e1.seq, s + 1, memory_order_relaxed);           /* 奇=写入中 */
++    g_e1.obj = x0; g_e1.arr = arr; g_e1.truncated = n > m ? n : 0; g_e1.n = m;
++    const volatile uint64_t *a = (const volatile uint64_t *)(const void *)(uintptr_t)arr;
++    for (unsigned i = 0; i < m; i++) {
++        uint64_t el = a[i], th = 0;
++        if (el > 0x10000) th = *(const volatile uint64_t *)(const void *)(uintptr_t)(el + 0x10);
++        g_e1.el[i] = el; g_e1.thiz[i] = th;
++    }
++    atomic_store_explicit(&g_e1.seq, s + 2, memory_order_relaxed);           /* 偶=稳定 */
++    atomic_fetch_add_explicit(&g_e1.hits, 1, memory_order_relaxed);
++    atomic_store_explicit(&g_e1.last_x0, x0, memory_order_relaxed);
++}
++/* stub 骨架字（gen_obs_stub.py capstone 校验过）：w0-w18 固定，w9 随 gate 变，
++   w19-w22=被换出的 4 条原指令，w23=b 入口+0x10（安装时算），w24/w25=.quad 观察器。
++   x18（合成 TCB，OHOS 载体方案）与 entry.S 的 runtime_gate 同样进栈保存。
++   round16b：新增 w6 str x8（caller-saved，DRAIN-LOOP 的重放字 ldr x21,[x8,#8]/sub x0,x8
++   要读它，必须横跨观察器保存）+ w7 mov x2,x8 / w8 mov x3,x1（观察器第 3/4 参=门点原
++   x8/x1——movz gate 会覆盖 x1，先抄走）+ w13 复原 x8。x19-x28 是 callee-saved，C 观察
++   器按 ABI 自存自复（DRAIN_ENTER 门重放 stp x20,x19 即依赖此，既有先例）。 */
++static const uint32_t smo_obs_prologue[19] = {
++    0xa9ba7bfd,   /* stp x29, x30, [sp, #-0x60]!      */
++    0xa90107e0,   /* stp x0, x1, [sp, #0x10]          */
++    0xa9020fe2,   /* stp x2, x3, [sp, #0x20]          */
++    0xa90317e4,   /* stp x4, x5, [sp, #0x30]          */
++    0xa9041fe6,   /* stp x6, x7, [sp, #0x40]          */
++    0xf9002bf2,   /* str x18, [sp, #0x50]             */
++    0xf9002fe8,   /* str x8, [sp, #0x58]（round16b）  */
++    0xaa0803e2,   /* mov x2, x8（round16b：参3）      */
++    0xaa0103e3,   /* mov x3, x1（round16b：参4）      */
++    0,            /* movz x1, #<gate>（按门填）       */
++    0x580001d0,   /* ldr x16, #0x38 → w24 字面量      */
++    0xd63f0200,   /* blr x16                          */
++    0xf9402bf2,   /* ldr x18, [sp, #0x50]             */
++    0xf9402fe8,   /* ldr x8, [sp, #0x58]（round16b）  */
++    0xa9441fe6,   /* ldp x6, x7, [sp, #0x40]          */
++    0xa94317e4,   /* ldp x4, x5, [sp, #0x30]          */
++    0xa9420fe2,   /* ldp x2, x3, [sp, #0x20]          */
++    0xa94107e0,   /* ldp x0, x1, [sp, #0x10]          */
++    0xa8c67bfd,   /* ldp x29, x30, [sp], #0x60        */
++};
++/* round13b 修复（崩溃定因）：四字门的重放字里出现 PC 相对指令时不能原样重放——adrp/分支族
++   会按 stub 的 PC 计算目标。13b 首跑即崩：round12e cell2 门（0x9b9bc4）重放首字 adrp x8，
++   以 stub 页（main+0x14d4xxx）算出 main 尾后地址，w16 读回垃圾 0x540007017100051f，w17
++   ldr x8,[x8] SEGV@0x000007017100051f（fault log：pc=stub+0x44 即 w17、x8=该垃圾、
++   lr=main+0x9b9bac 恰为门上游，三者互证）。修法：adrp 在安装期把 imm 重算到『stub 内该字
++   位置』仍指向原绝对页（同语义）；其余 PC 相对字形（b/bl/b.cond/cbz/cbnz/tbz/tbnz/adr/
++   ldr-literal）本机制不支持，直接拒装该门（fail-soft）。E1/E2/kick1 等四字门经此扫描
++   全为寄存器+立即数字形，不受影响。w[4] 为 4 个重放字（就地改写）；off=门在 main 的偏移，
++   stub_off=stub 在 main 的偏移。返回 0=拒装（why 填原因）。
++   round16b：bl 加入重定位（DRAIN-LOOP 窗口第 4 字就是 bl 0x8ad1f0）——同绝对目标重算
++   imm26（±128MiB；stub 页与 main 代码最远 ~21MiB，足够）。返回地址语义原样：重放 bl 的
++   lr=下一重放字，bl 在末字时 lr=&w[23]=b 回入口+0x10，kick（含 0x8ad228 br x1 尾调链）
++   最终都回到原 bl 的后继 0x8abfa4。b/b.cond/cbz 族仍拒装（cbz imm19 仅 ±1MiB，stub 页
++   距代码 ~16MiB，物理不可重定位）。 */
++static int smo_obs_replay_fix(uint32_t w[4], uint32_t off, uint64_t stub_off, char *why, size_t whyn) {
++    for (int i = 0; i < 4; i++) {
++        uint32_t v = w[i];
++        uint64_t wo = stub_off + (19 + i) * 4;              /* 该字在 stub 内的 main 相对地址 */
++        if ((v & 0x9f000000u) == 0x90000000u) {             /* adrp：重算 imm（同绝对页） */
++            int64_t imm = (int64_t)((v >> 29) & 3) | ((int64_t)((v >> 5) & 0x7ffff) << 2);
++            if (imm & (1 << 20)) imm -= 1 << 21;
++            uint64_t page_abs = (off & ~0xfffu) + ((uint64_t)imm << 12);   /* 原绝对页 */
++            int64_t want = (int64_t)(page_abs - (wo & ~0xfffu)) >> 12;
++            if (want < -(1 << 20) || want >= (1 << 20)) {
++                snprintf(why, whyn, "adrp relocation out of range (%+lld pages)", (long long)want);
++                return 0;
++            }
++            w[i] = (v & 0x9f00001fu) | ((uint32_t)(want & 3) << 29) | ((uint32_t)((want >> 2) & 0x7ffff) << 5);
++        } else if ((v >> 26) == 0x25u) {                    /* bl（round16b）：重算 imm26（同绝对目标） */
++            uint32_t imm26 = v & 0x3ffffffu;
++            int64_t disp = (imm26 & (1u << 25)) ? (int64_t)imm26 - (1 << 26) : (int64_t)imm26;
++            int64_t tgt = (int64_t)off + 4 * i + (disp << 2);   /* 原 target（main 相对） */
++            int64_t want = tgt - (int64_t)wo;
++            if (want < -(1 << 27) || want >= (1 << 27) || want & 3) {
++                snprintf(why, whyn, "bl relocation out of range (%+#llx)", (long long)want);
++                return 0;
++            }
++            w[i] = (v & 0xfc000000u) | (((uint64_t)want >> 2) & 0x3ffffff);
++        } else if ((v >> 26) == 0x05 || (v >> 26) == 0x25   /* b / bl */
++                   || (v & 0xff000000u) == 0x54000000u      /* b.cond */
++                   || (v & 0x7f000000u) >= 0x34000000u && (v & 0x7f000000u) <= 0x37000000u   /* cbz/cbnz/tbz/tbnz（含 sf 位屏蔽） */
++                   || (v & 0x9f000000u) == 0x10000000u      /* adr */
++                   || (v & 0xbf000000u) == 0x18000000u) {   /* ldr-literal */
++            snprintf(why, whyn, "PC-relative word %#x at slot %d unsupported", v, i);
++            return 0;
++        }
++    }
++    return 1;
++}
++static void smo_obs_gates_install(const Module *m) {
++    if (strcmp(m->name, "main")) return;
++    g_obs_main_base = (uint64_t)(uintptr_t)m->base;   /* round12e：cell 链快照用（任何 veneer 生效前已就位） */
++    {   /* round16b：tick→ns 换算基准点（安装时刻；dump 侧取第二点内插） */
++        extern uint64_t runtime_now_ns(void);
++        g_obs_tick0 = smo_obs_tick(); g_obs_ns0 = runtime_now_ns(); g_obs_tick0_set = 1;
++    }
++    uint64_t tail = (m->file_size + 0x3fff) & ~0x3fffULL;   /* main 的尾部保留页（loader.c:184 特批的 +0x4000） */
++    if (m->size < tail + 0x4000) { fprintf(stderr, "[odyssey] obs gates: no tail page (size=%#llx)\n", (unsigned long long)m->size); return; }
++    uint8_t *page = m->base + tail;
++    uint8_t *p = page + 0x100;
++    unsigned installed = 0;
++    for (size_t s = 0; s < sizeof smo_obs_site / sizeof *smo_obs_site; s++) {
++        const smo_obs_site_t *site = &smo_obs_site[s];
++        uint32_t have[4]; memcpy(have, m->base + site->off, sizeof have);
++        /* 单字门（tail=1）只占 1 条 b：校验该字与其后继原字（word[1]），不碰再后指令。 */
++        int ok = site->tail ? (have[0] == site->word[0] && have[1] == site->word[1])
++                            : (have[0] == site->word[0] && have[1] == site->word[1] &&
++                               have[2] == site->word[2] && have[3] == site->word[3]);
++        if (!ok) {
++            fprintf(stderr, "[odyssey] obs gate %#x: found %08x %08x %08x %08x, expected the four shipped words — NOT installed\n",
++                    site->off, have[0], have[1], have[2], have[3]);
++            continue;
++        }
++        uint8_t *stub = p; p += 26 * 4;
++        uint32_t w[26];
++        memcpy(w, smo_obs_prologue, sizeof smo_obs_prologue);
++        w[9] = 0xd2800000u | ((uint32_t)site->gate << 5) | 1;                /* movz x1, #gate */
++        uint64_t fn = (uint64_t)(uintptr_t)&smo_obs_observer;
++        memcpy(w + 24, &fn, 8);                                             /* .quad 观察器地址 */
++        if (site->tail) {
++            /* 单字尾跳门：出厂 word[0] 必是无条件 b；解出其目标，stub 末尾原义重定向。
++               veneer 只换这 1 个字（b→stub），相邻 thunk 的指令一个不动。 */
++            uint32_t imm26 = site->word[0] & 0x3ffffffu;
++            int64_t disp = (imm26 & (1u << 25)) ? (int64_t)imm26 - (1 << 26) : (int64_t)imm26;
++            int64_t tofs = (int64_t)site->off + (disp << 2);                /* 原目标（main 相对） */
++            if (disp == 0 || tofs <= 0 || (uint64_t)tofs >= m->file_size) {
++                fprintf(stderr, "[odyssey] obs gate %#x: tail word not an in-module b (target main+%#llx) — NOT installed\n",
++                        site->off, (unsigned long long)tofs);
++                continue;
++            }
++            uint64_t dst = (uint64_t)(uintptr_t)(m->base + tofs);           /* 原目标绝对地址 */
++            int64_t branch = (int64_t)dst - (int64_t)(stub + 19 * 4);        /* stub 尾 b 原目标 */
++            if (branch < -(1 << 27) || branch >= (1 << 27) || branch & 3) {
++                fprintf(stderr, "[odyssey] obs gate %#x: stub tail branch out of range (%+#llx) — NOT installed\n", site->off, (long long)branch);
++                continue;
++            }
++            w[19] = 0x14000000u | (((uint64_t)branch >> 2) & 0x3ffffff);
++            for (int i = 20; i <= 23; i++) w[i] = 0xd503201fu;              /* nop 填充（永不执行） */
++            memcpy(stub, w, sizeof w);
++            int64_t vb = (int64_t)(uintptr_t)stub - (int64_t)(uintptr_t)(m->base + site->off);
++            if (vb < -(1 << 27) || vb >= (1 << 27) || vb & 3) {
++                fprintf(stderr, "[odyssey] obs gate %#x: veneer branch out of range (%+#llx) — NOT installed\n", site->off, (long long)vb);
++                continue;
++            }
++            uint32_t veneer1 = 0x14000000u | (((uint64_t)vb >> 2) & 0x3ffffff);   /* 单字 b→stub */
++            memcpy(m->base + site->off, &veneer1, 4);
++            installed++;
++            fprintf(stderr, "[odyssey] obs gate main+%#x (id %u, tail b->main+%#llx) installed, stub at main+%#llx\n",
++                    site->off, site->gate, (unsigned long long)(dst - (uint64_t)(uintptr_t)m->base),
++                    (unsigned long long)(uintptr_t)(stub - m->base));
++            continue;
++        }
++        for (int i = 0; i < 4; i++) w[19 + i] = site->word[i];               /* 原样重放被换出的 4 条指令（PC 相对字见下方修正/拒装） */
++        {   /* round13b：重放字 PC 相对指令修正/拒装（cell2 门 adrp 13b 首跑即崩，见 smo_obs_replay_fix 注） */
++            char why[96];
++            if (!smo_obs_replay_fix(&w[19], site->off, (uint64_t)(uintptr_t)(stub - m->base), why, sizeof why)) {
++                fprintf(stderr, "[odyssey] obs gate %#x: replay %s — NOT installed\n", site->off, why);
++                continue;
++            }
++        }
++        int64_t branch = (int64_t)(m->base + site->off + 0x10) - (int64_t)(stub + 23 * 4);
++        if (branch < -(1 << 27) || branch >= (1 << 27) || branch & 3) {
++            fprintf(stderr, "[odyssey] obs gate %#x: branch out of range (%+#llx) — NOT installed\n", site->off, (long long)branch);
++            continue;
++        }
++        w[23] = 0x14000000u | (((uint64_t)branch >> 2) & 0x3ffffff);         /* b 入口+0x10 */
++        memcpy(stub, w, sizeof w);
++        uint32_t veneer[2] = {0x58000051, 0xd61f0220};                      /* ldr x17,#8; br x17（patch_scene_pick 同款） */
++        uint64_t target = (uint64_t)(uintptr_t)stub;
++        memcpy(m->base + site->off, veneer, 8);
++        memcpy(m->base + site->off + 8, &target, 8);
++        installed++;
++        fprintf(stderr, "[odyssey] obs gate main+%#x (id %u) installed, stub at main+%#llx\n",
++                site->off, site->gate, (unsigned long long)(uintptr_t)(stub - m->base));
++    }
++    if (!installed) return;
++    size_t used = (size_t)(p - page);
++    __builtin___clear_cache((char *)page, (char *)p);                       /* 新 stub 指令进 icache（文本侧 veneer 由 seal() 的 sys_icache_invalidate 覆盖） */
++    if (mprotect(page, 0x4000, PROT_READ | PROT_EXEC) != 0) {               /* 与 seal() 给补丁区的权限一致；check_permissions 经 smo_obs_rx_range 认得此页 */
++        fprintf(stderr, "[odyssey] obs gates: tail page mprotect RX FAILED (gates dead: veneer will fault)\n");
++        /* 装不上就把 veneer 撤掉：留一个跳进不可执行页的 veneer 必崩，回退到原指令才安全 */
++        for (size_t s = 0; s < sizeof smo_obs_site / sizeof *smo_obs_site; s++) {
++            const smo_obs_site_t *site = &smo_obs_site[s];
++            uint32_t have[4]; memcpy(have, m->base + site->off, sizeof have);
++            if (site->tail) {
++                /* 单字门：have[0]=我们写的 veneer b、have[1] 仍为出厂后继字 → 只回写 word[0]。 */
++                if (have[0] == site->word[0] || have[1] != site->word[1]) continue;
++                uint32_t imm26 = have[0] & 0x3ffffffu;
++                int64_t disp = (imm26 & (1u << 25)) ? (int64_t)imm26 - (1 << 26) : (int64_t)imm26;
++                uint64_t t = (uint64_t)(uintptr_t)(m->base + site->off) + ((uint64_t)disp << 2);
++                if (t < (uint64_t)(uintptr_t)page || t >= (uint64_t)(uintptr_t)(page + 0x4000)) continue;   /* 非 ours */
++                memcpy(m->base + site->off, &site->word[0], 4);
++                continue;
++            }
++            int ok = 1; for (int i = 0; i < 4; i++) ok &= have[i] == site->word[i];
++            if (ok) continue;   /* 没装上这门（字不符或分支越界），veneer 也没写 */
++            uint32_t veneer[2] = {0x58000051, 0xd61f0220};
++            uint32_t now[2]; memcpy(now, m->base + site->off, sizeof now);
++            if (now[0] == veneer[0] && now[1] == veneer[1])
++                memcpy(m->base + site->off, site->word, sizeof site->word);   /* 原样写回 4 条出厂指令 */
++        }
++        return;
++    }
++    g_obs_rx_lo = (uint64_t)(uintptr_t)page; g_obs_rx_hi = g_obs_rx_lo + 0x4000;
++    fprintf(stderr, "[odyssey] obs gates: %u gate(s), tail page main+%#llx RX, %zu bytes used\n",
++            installed, (unsigned long long)tail, used);
++}
++/* ---- dump 侧访问器（threads.c 的 dump_threads 调；偶 seq 才返回数据） ---- */
++uint64_t smo_obs_hits(int gate) { return gate >= 0 && gate < SMO_OBS_N ? atomic_load_explicit(&g_obs_hits[gate], memory_order_relaxed) : 0; }
++uint64_t smo_obs_last_x0(int gate) { return gate >= 0 && gate < SMO_OBS_N ? atomic_load_explicit(&g_obs_x0[gate], memory_order_relaxed) : 0; }
++/* round12e：cell 链快照读取（dump 侧符号化用）。out={cell1,table1,fn1,cell2,table2,fn2}；
++   cell1=0x1363dc8（已知=Map，作链条读法验证位），cell2=0x136deb8（待定名）。 */
++int smo_obs_cell2_snapshot(uint64_t out[6]) {
++    if (!atomic_load_explicit(&g_cell2_set, memory_order_relaxed)) return 0;
++    for (int i = 0; i < 6; i++) out[i] = atomic_load_explicit(&g_cell2[i], memory_order_relaxed);
++    return 1;
++}
++/* loader.c 的 check_permissions 用：尾部页里被本模块 mprotect 成 RX 的绝对地址区间
++   （未安装时 hi=0）。check_permissions 对 ≥page_up(file_size) 的页缺省期待 RW，
++   仅此区间期待 RX——权限巡检的「不期即报」语义保持不变。 */
++void smo_obs_rx_range(uint64_t *lo, uint64_t *hi) { *lo = g_obs_rx_lo; *hi = g_obs_rx_hi; }
++unsigned smo_obs_e1_snapshot(uint64_t *el, uint64_t *thiz, unsigned cap, uint64_t *obj, uint64_t *arr, unsigned *truncated) {
++    unsigned s0 = (unsigned)atomic_load_explicit(&g_e1.seq, memory_order_relaxed);
++    if (s0 & 1) return 0;                                                   /* 正在写：放弃本次（下一分钟 dump 再看） */
++    unsigned n = g_e1.n < cap ? g_e1.n : cap;
++    for (unsigned i = 0; i < n; i++) { el[i] = g_e1.el[i]; thiz[i] = g_e1.thiz[i]; }
++    if (obj) *obj = g_e1.obj; if (arr) *arr = g_e1.arr; if (truncated) *truncated = g_e1.truncated;
++    unsigned s1 = (unsigned)atomic_load_explicit(&g_e1.seq, memory_order_relaxed);
++    return s0 == s1 ? n : 0;                                                /* 读期间又写入：作废 */
++}
++/* round15：E1 count 变迁史（dump 侧）。返回本次可读条数（≤cap），按时间序填
++   hits[]/cnt[]/arrp[]；*total_out=全部变迁数（>32 时环已覆盖最旧）。
++   round16b：条目加 tsns[]——tick 经两点内插换算成自安装起的 ns（安装对 g_obs_{tick0,ns0}
++   + 本调用现取一对；CNTFRQ 不读，两点自校准；timer 停走/未设基准时原样给 tick 且 *raw=1）。 */
++unsigned smo_obs_e1_hist(uint64_t *hits, uint32_t *cnt, uint64_t *arrp, uint64_t *tsns, unsigned cap, unsigned *total_out, int *raw) {
++    extern uint64_t runtime_now_ns(void);
++    unsigned total = atomic_load_explicit(&g_e1h.head, memory_order_relaxed);
++    if (total_out) *total_out = total;
++    unsigned n = total > SMO_OBS_E1_HIST ? SMO_OBS_E1_HIST : total;
++    if (n > cap) n = cap;
++    unsigned start = total > SMO_OBS_E1_HIST ? total - SMO_OBS_E1_HIST : 0;
++    uint64_t t1 = 0, ns1 = 0; double npt = 0; int is_raw = 0;
++    if (g_obs_tick0_set) {
++        t1 = smo_obs_tick(); ns1 = runtime_now_ns();
++        if (t1 > g_obs_tick0) npt = (double)(ns1 - g_obs_ns0) / (double)(t1 - g_obs_tick0);
++        else is_raw = 1;
++    } else is_raw = 1;
++    if (raw) *raw = is_raw;
++    for (unsigned i = 0; i < n; i++) {
++        unsigned k = (start + i) % SMO_OBS_E1_HIST;
++        hits[i] = g_e1h.e[k].hits; cnt[i] = g_e1h.e[k].cnt; arrp[i] = g_e1h.e[k].arr;
++        tsns[i] = is_raw ? g_e1h.e[k].tick
++                         : g_obs_ns0 + (uint64_t)((double)(g_e1h.e[k].tick - g_obs_tick0) * npt + 0.5);
++    }
++    return n;
++}
++/* round16b：E1 汇总标量（dump 侧）——max_cnt=自启动最大 count（「曾否>2」环覆盖也不丢），
++   shrink=lastc>2→n≤2 的首个变迁（缩点时刻+前后值；shrunk=0=从未发生>2→≤2 缩点）。
++   tsns 同上换算（raw=1 时给裸 tick）。 */
++void smo_obs_e1_summary(uint32_t *max_cnt, uint64_t *max_ns, uint32_t *shrink_from, uint32_t *shrink_to,
++                        uint64_t *shrink_ns, uint32_t *shrunk, int *raw) {
++    extern uint64_t runtime_now_ns(void);
++    *max_cnt = g_e1h.max_cnt;
++    *shrink_from = g_e1h.shrink_from; *shrink_to = g_e1h.shrink_to; *shrunk = g_e1h.shrunk;
++    int is_raw = 0; double npt = 0; uint64_t t1 = 0;
++    if (g_obs_tick0_set) {
++        uint64_t ns1; t1 = smo_obs_tick(); ns1 = runtime_now_ns();
++        if (t1 > g_obs_tick0) npt = (double)(ns1 - g_obs_ns0) / (double)(t1 - g_obs_tick0);
++        else is_raw = 1;
++    } else is_raw = 1;
++    if (raw) *raw = is_raw;
++    *max_ns = is_raw || !g_e1h.max_tick ? g_e1h.max_tick
++              : g_obs_ns0 + (uint64_t)((double)(g_e1h.max_tick - g_obs_tick0) * npt + 0.5);
++    *shrink_ns = is_raw || !g_e1h.shrink_tick ? g_e1h.shrink_tick
++                 : g_obs_ns0 + (uint64_t)((double)(g_e1h.shrink_tick - g_obs_tick0) * npt + 0.5);
++}
++/* round16b：DRAIN-LOOP 首见快照（dump 侧）。未命中返回 0。ts_ns 同上换算。 */
++int smo_obs_dl_snapshot(uint64_t *node, uint64_t *this_, uint64_t *w1, uint64_t *f9, uint64_t *o20, uint64_t *ts_ns, int *raw) {
++    if (!atomic_load_explicit(&g_dl.set, memory_order_relaxed)) return 0;
++    *node = g_dl.node; *this_ = g_dl.this; *w1 = g_dl.w1; *f9 = g_dl.f9; *o20 = g_dl.o20;
++    extern uint64_t runtime_now_ns(void);
++    int is_raw = 0; double npt = 0;
++    if (g_obs_tick0_set) {
++        uint64_t t1 = smo_obs_tick(), ns1 = runtime_now_ns();
++        if (t1 > g_obs_tick0) npt = (double)(ns1 - g_obs_ns0) / (double)(t1 - g_obs_tick0);
++        else is_raw = 1;
++    } else is_raw = 1;
++    if (raw) *raw = is_raw;
++    *ts_ns = is_raw ? g_dl.tick : g_obs_ns0 + (uint64_t)((double)(g_dl.tick - g_obs_tick0) * npt + 0.5);
++    return 1;
++}
++/* round17 ①（dump 侧）：KICK1 三条件首/末见 + 三分支交叉分布。
++   first_out={this,w1,f9,o20,tsns}（set=0 时全 0 返回 0）；last_out={w1,f9,o20}；
++   dist_out={n_lt1, n_ge1_f9eq2, n_ge1_f9ne2, n_o20z}。 */
++int smo_obs_k1_stats(uint64_t first_out[5], uint64_t last_out[3], uint64_t dist_out[4]) {
++    extern uint64_t runtime_now_ns(void);
++    if (!atomic_load_explicit(&g_k1.set, memory_order_relaxed)) return 0;
++    first_out[0] = g_k1.this_; first_out[1] = g_k1.w1; first_out[2] = g_k1.f9; first_out[3] = g_k1.o20;
++    int is_raw = 0; double npt = 0;
++    if (g_obs_tick0_set) {
++        uint64_t t1 = smo_obs_tick(), ns1 = runtime_now_ns();
++        if (t1 > g_obs_tick0) npt = (double)(ns1 - g_obs_ns0) / (double)(t1 - g_obs_tick0);
++        else is_raw = 1;
++    } else is_raw = 1;
++    first_out[4] = is_raw ? g_k1.tick : g_obs_ns0 + (uint64_t)((double)(g_k1.tick - g_obs_tick0) * npt + 0.5);
++    last_out[0] = atomic_load_explicit(&g_k1.last_w1, memory_order_relaxed);
++    last_out[1] = atomic_load_explicit(&g_k1.last_f9, memory_order_relaxed);
++    last_out[2] = atomic_load_explicit(&g_k1.last_o20, memory_order_relaxed);
++    dist_out[0] = atomic_load_explicit(&g_k1.n_lt1, memory_order_relaxed);
++    dist_out[1] = atomic_load_explicit(&g_k1.n_ge1_f9eq2, memory_order_relaxed);
++    dist_out[2] = atomic_load_explicit(&g_k1.n_ge1_f9ne2, memory_order_relaxed);
++    dist_out[3] = atomic_load_explicit(&g_k1.n_o20z, memory_order_relaxed);
++    return 1;
++}
++/* round17 ②（dump 侧）：BC310 首见 {x0, tsns}（末见 x0=smo_obs_last_x0(SMO_OBS_BC310)）。 */
++int smo_obs_bc_snapshot(uint64_t *x0, uint64_t *ts_ns) {
++    extern uint64_t runtime_now_ns(void);
++    if (!atomic_load_explicit(&g_bc.set, memory_order_relaxed)) return 0;
++    *x0 = g_bc.x0;
++    int is_raw = 0; double npt = 0;
++    if (g_obs_tick0_set) {
++        uint64_t t1 = smo_obs_tick(), ns1 = runtime_now_ns();
++        if (t1 > g_obs_tick0) npt = (double)(ns1 - g_obs_ns0) / (double)(t1 - g_obs_tick0);
++        else is_raw = 1;
++    } else is_raw = 1;
++    *ts_ns = is_raw ? g_bc.tick : g_obs_ns0 + (uint64_t)((double)(g_bc.tick - g_obs_tick0) * npt + 0.5);
++    return 1;
++}
++/* round17 ③（dump 侧）：KICKVT 目标分布。vals/cnts 各 8 槽（val==0 的槽未用）、
++   over=溢出、n_zero=空槽、first={vt,tgt}、last_tgt。返回 set（0=门未命中）。 */
++int smo_obs_kickvt_dist(uint64_t vals[8], uint64_t cnts[8], uint64_t *over, uint64_t *n_zero,
++                        uint64_t first_out[2], uint64_t *last_tgt) {
++    if (!atomic_load_explicit(&g_vt.set, memory_order_relaxed)) return 0;
++    for (int i = 0; i < 8; i++) {
++        vals[i] = atomic_load_explicit(&g_vt.val[i], memory_order_relaxed);
++        cnts[i] = atomic_load_explicit(&g_vt.cnt[i], memory_order_relaxed);
++    }
++    *over = atomic_load_explicit(&g_vt.over, memory_order_relaxed);
++    *n_zero = atomic_load_explicit(&g_vt.n_zero, memory_order_relaxed);
++    first_out[0] = atomic_load_explicit(&g_vt.first_vt, memory_order_relaxed);
++    first_out[1] = atomic_load_explicit(&g_vt.first_tgt, memory_order_relaxed);
++    *last_tgt = atomic_load_explicit(&g_vt.last_tgt, memory_order_relaxed);
++    return 1;
++}
++
+ void runtime_game_patches(Module *main_module) {
+     patch_render_res(main_module);
+     if (g_render_w) { patch_scene_pick(main_module); patch_rt_pool(main_module); }
+     fprintf(stderr, "[odyssey] game patches: %s\n", g_render_w ? "docked render size, key 3 scene size" : "none");
+     odyssey_aspect_install(main_module);
++    smo_obs_gates_install(main_module);
+ }
+ void runtime_frame_step_pin(double ms) { (void)ms; }
+ void runtime_frame_step_update(uint64_t now_ns) { (void)now_ns; odyssey_aspect_present(); scene_log(); }   /* key 4, every present */

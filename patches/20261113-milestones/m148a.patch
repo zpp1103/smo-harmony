@@ -1,0 +1,140 @@
+--- mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c
++++ mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c
+@@ -32933,6 +32933,11 @@
+               上屏，成功即跳过 present_clear。**present_clear 只在无源时兜底。**
+      bit1(2)  泵按需（配合 smo_m67b bit4）：周期 >=33 ms、只推**新**帧、主线程已经写过的那一帧不再重写。
+      bit2(4)  真实源调试打印：[m80a] 每帧一行 + 一次槽表摘要（限流，只在排查时开）。
++     bit3(8)  passthru（M148A）：**只开通道、不改选源** —— gfx_bridge 侧仍按 bit0 每帧调
++              nvn_vk_present_offscreen（`[p] present #` 台账照旧），但本块整体跳过 ⇒ 送屏源回到
++              基础链（m7h-world / rt282 / worldRT…）。用于回答「B/C 轮的全 0 是被 M80A 覆盖掉
++              的那张源，还是拷贝可见性」——bit3=1 时打一行 `[m80a] passthru`（限流）。
++              **缺省 0 ⇒ 与改前逐位相同**（只是多读一个 bit，不产生日志、不产生分支差异）。
+    与 smo_m42f 的关系（选源策略）：m80a bit0=1 时 `m42f=0` = 真实窗口纹理上屏（本块）；`m42f=1` = 旧
+    M42F 链（comp 源 / 清色直上屏，逐字保留）。m80a=0 时 m42f 语义与改前**逐字相同**。
+    等价性（bit0=0）：nvn_vk_m80a_first() 只做一次文件整数读（每 16 次调用一次）+ 一次 m42f 缓存读
+@@ -32943,6 +32948,7 @@
+ static unsigned g_m80a_calls;
+ static unsigned long long g_m80a_pick, g_m80a_miss, g_m80a_tbl;
+ static unsigned g_m80a_pump_gen;                            /* 泵最近推过的 gen */
++static unsigned long long g_m80a_pass;                      /* M148A：bit3 passthru 计数（关态恒 0） */
+ static _Atomic unsigned g_m80a_main_gen;                    /* 主线程写成功的最大 gen */
+ static unsigned long long g_m80a_pump_skip;
+ 
+@@ -32959,7 +32965,7 @@
+ {
+     if (g_m80a_v == -2) { m80a_seed(); g_m80a_v = p_file_int(M80A_A, M80A_B, 0); g_m80a_calls = 0; }
+     else if ((++g_m80a_calls & 15u) == 0) g_m80a_v = p_file_int(M80A_A, M80A_B, g_m80a_v);
+-    return (g_m80a_v < 0) ? 0 : (g_m80a_v & 7);
++    return (g_m80a_v < 0) ? 0 : (g_m80a_v & 15);   /* M148A：含 bit3（passthru）；bit0..bit2 语义不变 */
+ }
+ /* gfx_bridge 侧入口（weak 调用）：本帧是否走 offscreen-first。=0 ⇒ 旧链逐字不变。 */
+ int nvn_vk_m80a_first(void) { return (m80a_bits() & 1) && !m42f_on(); }
+@@ -33204,7 +33210,66 @@
+     if (g_m104a_v == -2) { p_file_seed(M104A_A, M104A_B); g_m104a_v = p_file_int(M104A_A, M104A_B, -1); }
+     else if ((++g_m104a_reads & 15u) == 0) g_m104a_v = p_file_int(M104A_A, M104A_B, -1);
+     return (unsigned)g_m104a_v;
++}
++/* ===== M148A（2026-11-15）：present **同刻**对「拷贝实际读的那张源图」做一次廉价指纹 =====
++   位置：`[m104a] p` 行行尾（staging 已拷完、同一 present 调用内）⇒ 一行同时给出
++   「staging 里读到什么」与「源图在那一刻有什么」，用来分开两个子假设：
++     · `stag` 全 0 而 `srcsig` 非 0 ⇒ **拷贝可见性/同步 hazard**（转 barrier 保守化）；
++     · 两者都 0 ⇒ 图在 present 那一刻**真的空**（转「帧内快照上屏」，不是本单的解）。
++   knob `smo_pres_sig`（0 = 关 = **缺省**；1 = 开）：关态后缀是空串 ⇒ `[m104a] p` 行内容逐字节不变、
++   本帧拷贝/barrier/选源一行不动（只多一次 int 比较）。
++   实现：复用 m99a_sig_locked（= g_vkq_lock 保护下的 r_tex_signature，与既有 `[p] gsig` 同一条
++   代码路径，256 点 / 16 行），**不是**新造回读通道；采样率与 `[m104a] p` 完全一致（≤1 Hz）。
++   布局不是 SRO/CAO/TRANSFER_SRC 时 r_tex_signature 自己返回 0 ⇒ 记 ok=0，不猜、不转换布局。 */
++#define M148A_DIR_A P_SLOT_DIR_A
++#define M148A_DIR_B P_SLOT_DIR_B
++#define M148A_SIG_A M148A_DIR_A "/smo_pres_sig"
++#define M148A_SIG_B M148A_DIR_B "/smo_pres_sig"
++static int g_m148a_sig = -2;              /* -2 = 还没读过；0 = 关（缺省） */
++static unsigned g_m148a_reads;
++/* 照抄 m140a_seed：种 "0\n" + chmod 0666（hdc 是 uid=2000，只能覆盖**已存在**的 666 文件）。 */
++__attribute__((constructor)) static void m148a_seed(void)
++{
++    static const char *const p[2] = { M148A_SIG_A, M148A_SIG_B };
++    for (int i = 0; i < 2; i++) {
++        if (access(p[i], F_OK) == 0) { chmod(p[i], 0666); continue; }
++        int fd = open(p[i], O_CREAT | O_WRONLY | O_TRUNC, 0666);
++        if (fd >= 0) { ssize_t wr = write(fd, "0\n", 2); (void)wr; close(fd); chmod(p[i], 0666); }
++    }
++}
++static int m148a_pres_sig_on(void)   /* 每 16 次查询重读一次：hdc 改值 ~1 s 内生效（同 m104a_knob） */
++{
++    if (g_m148a_sig == -2) { g_m148a_sig = p_file_int(M148A_SIG_A, M148A_SIG_B, 0); g_m148a_reads = 0; }
++    else if ((++g_m148a_reads & 15u) == 0) g_m148a_sig = p_file_int(M148A_SIG_A, M148A_SIG_B, g_m148a_sig);
++    if (g_m148a_sig > 0) {
++        static int logged;
++        if (!logged) {
++            logged = 1;
++            vk_boot_logf("[m148a] pres srcsig on=1 file=%s (present 同刻回读源图，≤1 Hz，只读)",
++                         M148A_SIG_B);
++        }
++        return 1;
++    }
++    return 0;
+ }
++/* 把 srcsig 后缀写进 b（关态写空串 ⇒ 调用方的格式串输出与改前逐字节相同）。 */
++static void m148a_srcsig_sfx(char *b, size_t n, VkImage img, VkImageLayout lay, unsigned w, unsigned h)
++{
++    if (!n) return;
++    b[0] = 0;
++    if (!m148a_pres_sig_on() || !img || !w || !h) return;
++    r_sig_t sg;
++    const int ok = m99a_sig_locked(img, lay, w, h, 4, &sg);
++    const unsigned long long nn = (ok && sg.npx) ? sg.npx : 1ull;
++    snprintf(b, n, " srcsig[ok=%d img=%#llx lay=%d mean=%u/%u/%u max=%u/%u/%u min=%u/%u/%u "
++                   "nz=%llu/%llu hash=%#llx]",
++             ok, (unsigned long long)(uintptr_t)img, (int)lay,
++             ok ? (unsigned)(sg.sum[0] / nn) : 0u, ok ? (unsigned)(sg.sum[1] / nn) : 0u,
++             ok ? (unsigned)(sg.sum[2] / nn) : 0u,
++             ok ? (unsigned)sg.mx[0] : 0u, ok ? (unsigned)sg.mx[1] : 0u, ok ? (unsigned)sg.mx[2] : 0u,
++             ok ? (unsigned)sg.mn[0] : 0u, ok ? (unsigned)sg.mn[1] : 0u, ok ? (unsigned)sg.mn[2] : 0u,
++             ok ? sg.nz : 0ull, ok ? sg.npx : 0ull, ok ? sg.hash : 0ull);
++}
+ /* 合成测试图（640x360 RGBA）：5 条彩条 + 按帧号横向移动的白色方块 ⇒ 一眼可判「这是我们写的」，
+    且方块位置随帧变化 ⇒ 同时证明写是活的（不是一张冻住的旧帧）。 */
+ #define M104A_PAT_W 640
+@@ -34342,7 +34407,7 @@
+        不新建图、不改 bind/draw 语义、不碰 swapchain。映射不到 ⇒ 逐张试 idx 钉住的 g_win_key[]
+        （M4bv P2 的窗口身份缓存），仍不行则**保持链上原选源**并记 miss（不硬指、不猜）。 */
+     int m80a_sel = -1;
+-    if (nvn_vk_m80a_first()) {
++    if (nvn_vk_m80a_first() && !(m80a_bits() & 8)) {
+         const char *m80a_was = srcname; const unsigned m80a_wasw = sw, m80a_wash = sh;
+         h_rt_slot *ms = NULL; int mi = -1;
+         const unsigned long long mk = g_p_tex_key;
+@@ -34379,6 +34444,14 @@
+                              g_win_key[2], g_win_key[3], m80a_was, m80a_wasw, m80a_wash, g_m80a_pick);
+         }
+         if ((m80a_bits() & 4) && call >= 20) m80a_dump_slots(call);
++    } else if (nvn_vk_m80a_first() && (m80a_bits() & 8)) {
++        /* M148A bit3：passthru —— 通道照开（`[p] present #` 台账仍在），但**这一帧不覆盖选源**，
++           送屏源保持基础链（m7h-world / rt282 / worldRT…）。必须留一行可认日志：bit3=1 时
++           `[m80a] src=` 会变成 0 行，没有这一行下一轮无法证明 passthru 生效。限流 ≤1/120 + 首 8 次。 */
++        g_m80a_pass++;
++        if (g_m80a_pass <= 8 || (g_m80a_pass % 120) == 0)
++            vk_boot_logf("[m80a] passthru bit3=1 #%llu call=%llu was=%s %ux%u (不改选源, pick=%llu)",
++                         g_m80a_pass, (unsigned long long)call, srcname, sw, sh, g_m80a_pick);
+     }
+     /* ===== M98A（2026-11-13）：选源 = 按槽 + 内容优先（+ 上一帧内容帧兜底） =====
+        位置：所有选源分支（tex/ours/snap/worldRT/gpres/M38H/M39A/M40AT/M42F/M80A）之后、台账与拷贝之前
+@@ -35059,10 +35132,15 @@
+             lastp = nws;
+             unsigned mr = 0, mg = 0, mb = 0, mx = 0, nz10 = 0, yel10 = 0;
+             m104a_src_sig((const unsigned char *)g_p_map, cp_w, cp_h, &mr, &mg, &mb, &mx, &nz10, &yel10);
++            /* M148A：同刻对**拷贝实际读的那张源图**再取一次指纹（smo_pres_sig=0 时后缀为空串，
++               本行其余字段逐字节不变）。读的就是上面 vkCmdCopyImageToBuffer 用的 simg/slay/sw/sh。 */
++            char m148a_ss[224];
++            m148a_srcsig_sfx(m148a_ss, sizeof m148a_ss, simg, slay, sw, sh);
+             vk_boot_logf("[m104a] p call=%llu src=%s sel_slot=%d ext=%ux%u lay=%d pat=%d "
+-                         "stag[mean=%u/%u/%u max=%u nz=%u.%u%% yel=%u.%u%%]",
++                         "stag[mean=%u/%u/%u max=%u nz=%u.%u%% yel=%u.%u%%]%s",
+                          call, srcname, g_p_sel_slot, cp_w, cp_h, (int)slay, m104a_pat,
+-                         mr, mg, mb, mx, nz10 / 10u, nz10 % 10u, yel10 / 10u, yel10 % 10u);
++                         mr, mg, mb, mx, nz10 / 10u, nz10 % 10u, yel10 / 10u, yel10 % 10u,
++                         m148a_ss);
+         }
+     }
+     /* ===== M106A：目标图内容签名（= staging 里真正要送屏的像素，判据③④ 的「设备侧 target 数字」）=====

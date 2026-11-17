@@ -1,0 +1,360 @@
+--- mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c
++++ mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c
+@@ -865,8 +865,12 @@
+         atomic_load_explicit(&g_m40al_draws, memory_order_relaxed) == t_m40ao_d0[t_m40ao_dep])
+         atomic_fetch_add_explicit(&g_m40ao_rp0, 1ull, memory_order_relaxed);
+ }
++/* M119A（2026-11-14）：附件/声明取证 + `=3` 帧首清零。**函数体定义在 :25330 之后**，此处只前置声明；
++   挂在宏的**尾部**（真的 begin 之后）⇒ 既能数本 pass 的附件，也能在同一个 pass 里发 ClearAttachments。
++   注意宏参语义（与 m40ao_rp_begin 同口径）：_rp = **VkRenderPassBeginInfo***，_c = subpass contents。 */
++static void m119a_rp_done(VkCommandBuffer cb, const VkRenderPassBeginInfo *rb);
+ #define vkCmdBeginRenderPass(_cb, _rp, _c) \
+-    (m40ao_rp_begin(_rp), m108a_rp_hit(), vkCmdBeginRenderPass((_cb), (_rp), (_c)))
++    (m40ao_rp_begin(_rp), m108a_rp_hit(), vkCmdBeginRenderPass((_cb), (_rp), (_c)), m119a_rp_done((_cb), (_rp)))
+ #define vkCmdEndRenderPass(_cb) \
+     (m40ao_rp_end(), vkCmdEndRenderPass(_cb))
+ #define vkCmdClearColorImage(_cb, _img, _lay, _pc, _n, _pr) \
+@@ -25327,8 +25331,327 @@
+     g_m113a_capwant = (g_m113a_fno < 10ull || (g_m113a_fno % 60ull) == 0ull) ? 1 : 0;
+     g_m113a_blit_on = 0;
+ }
++
+ 
++/* ==========================================================================================
++   M119A（2026-11-14）：**多附件 / 声明取证** + 重复附件证据 + `=3` 目标槽帧首清零
++   ------------------------------------------------------------------------------------------
++   背景（M119A 主机侧结构事实，本单实测所得）：
++     ① 我们自己的 vk 层**全树只绑 1 个颜色附件**：色附件数 = 1 的三处硬编码在
++        nvn_vk.c:2132 / :4919 / :8461（`sp.colorAttachmentCount = 1`），深度变体在 :8673
++        （`wc ? 1u : 0u`）。真实 draw 通道唯一入口是 g_r_rp（:8460 起建），fb 见
++        h_rt_fbload_ensure（:5063）；颜色+深度变体 g_r_rp_d[var] 见 h_rp_depth（:8652 起）。
++     ② 游戏声明的颜色目标数 `n` 只走记账：gfx_bridge.c:2788 调 nvn_vk_rt_bind(n, colors[0], …)，
++        本层只收到 **colors[0]**；n>1 的其余颜色目标被**静默折叠**（n 只落到 nvn_vk_dk_note →
++        h_rt_slot.dk_n，见 :4233 / :31480 附近）。⇒ 上游 nxohos 的「6 附件 + 2 层别名层对」
++        TBDR tile store 触发条件（docs/HarmonyOS移植适配说明.md §6.5）在本引擎**结构上不可达**，
++        `dup` 恒 0；真正缺的是「MRT 输出被折叠」。
++   本块只做三件事，全部由 knob `smo_m119a` 门控（缺省 0 ⇒ 本块所有函数首句 return）：
++     · `>=1`：每 pass 一行 `[m119a] rp call=… rp=… natt=… dup=… decl=… att=[u0 img=… mip=… lay=… st=…]`
++              （3D 段前 10 帧 + 之后每 60 帧，逐帧 ≤2 行、全 boot ≤600 行），并每 30 s 一行
++              `[m119a] declhist bucket=… n=1:a n=2:b n=3:c n>3:d`（decl = 游戏声明的颜色目标数，
++              按「当帧目标槽是否 400x225」分两桶统计）+ `[m119a] drop call=… n_dropped=… slots=…`。
++     · `=2`：额外每 30 s 一行附件签名 `[m119a] sig slot=… att0[dcol mean sp]`（单附件 ⇒ 即该槽内容）。
++     · `=3`：帧首把目标 400x225 槽显式 `vkCmdClearAttachments` 清成 (0,0,0,255)（走既有
++              begin-pass 之后的附件清零，不新造通道、不改 render pass 语义）。
++   MRT（>1 附件）**本单未实现**：需要 colors[1..N-1]（现在被 cmd_trace.c:hle 层丢掉），
++   属跨文件改动，留 M119B；本块把 `mrt` 被阻的现场显式打出来（why=colors_not_delivered）。
++   ========================================================================================== */
++#define M119A_SW_A   P_SLOT_DIR_A "/smo_m119a"
++#define M119A_SW_B   P_SLOT_DIR_B "/smo_m119a"
++#define M119A_ATT_MAX 8u
++#define M119A_LINE_MAX 600u
+ 
++typedef struct {
++    unsigned n;
++    unsigned long long img[M119A_ATT_MAX];
++    unsigned mip[M119A_ATT_MAX], lay[M119A_ATT_MAX], nlay[M119A_ATT_MAX];
++    int dep[M119A_ATT_MAX];
++} m119a_att;
++
++static int g_m119a_v = -2;
++static double g_m119a_kt, g_m119a_klog;
++static unsigned long long g_m119a_pass, g_m119a_lines;
++static unsigned long long g_m119a_fno, g_m119a_fr_last, g_m119a_dropped;
++static unsigned long long g_m119a_dup_seen, g_m119a_natt_hist[M119A_ATT_MAX + 1];
++static unsigned long long g_m119a_decl[2][4];        /* [桶 0=400x225 1=其他][decl 1/2/3/>3] */
++static unsigned long long g_m119a_decl_tot[2];
++static unsigned long long g_m119a_mrt_decl_gt1, g_m119a_mrt_blocked;
++static double g_m119a_dt;
++static int g_m119a_clear_slot = -1, g_m119a_clear_pend, g_m119a_clear_logged;
++static unsigned long long g_m119a_clear_n, g_m119a_clear_fail;
++
++/* 缺省 0；B 视图优先（hdc 可写）、A 兜底；2 s 重读 ⇒ 写 0 秒级回退。与 m113a/knob 同口径。 */
++static int m119a_knob(void)
++{
++    const double t = (double)pf_now_us() / 1e6;
++    if (g_m119a_v == -2) {
++        const char *p[2] = { M119A_SW_A, M119A_SW_B };
++        int have = 0, i;
++        for (i = 0; i < 2 && !have; i++) { FILE *f = fopen(p[i], "r"); if (f) { fclose(f); have = 1; } }
++        for (i = 0; i < 2 && !have; i++) { FILE *f = fopen(p[i], "w"); if (f) { fputs("0\n", f); fclose(f); have = 1; } }
++        g_m119a_v = p_file_int(M119A_SW_A, M119A_SW_B, 0);
++        g_m119a_kt = t; g_m119a_klog = t;
++        if (g_m119a_v > 0) vk_boot_logf("[m119a] sw knob -> val=%d (seed)", g_m119a_v);
++        return g_m119a_v;
++    }
++    if (t - g_m119a_kt >= 2.0) {
++        const int nv = p_file_int(M119A_SW_A, M119A_SW_B, 0);
++        g_m119a_kt = t;
++        if (nv != g_m119a_v) {
++            g_m119a_v = nv; g_m119a_klog = t;
++            vk_boot_logf("[m119a] sw knob -> val=%d", g_m119a_v);
++        } else if (g_m119a_v > 0 && t - g_m119a_klog >= 10.0) {
++            g_m119a_klog = t;
++            vk_boot_logf("[m119a] sw knob -> val=%d", g_m119a_v);
++        }
++    }
++    return g_m119a_v;
++}
++
++/* 视图 → (VkImage, mip, layer)。只认我们自己 slots / 宿主 / 调试图（本引擎没有别名层对）。 */
++static int m119a_view_img(VkImageView v, unsigned long long *img, unsigned *mip, unsigned *lay,
++                          unsigned *nlay, int *dep, const char **who)
++{
++    int i;
++    if (!v) return 0;
++    if (v == g_host_view)  { *img = (unsigned long long)(uintptr_t)g_host_img;  *mip = 0; *lay = 0; *nlay = 1; *dep = 0; *who = "host"; return 1; }
++    if (v == g_p2.view)    { *img = (unsigned long long)(uintptr_t)g_p2.img;    *mip = 0; *lay = 0; *nlay = 1; *dep = 0; *who = "p2";   return 1; }
++    for (i = 0; i < H_RT_SLOTS; i++) {
++        const h_rt_slot *s = &g_rt_tab[i];
++        if (s->view && s->view == v) { *img = (unsigned long long)(uintptr_t)s->img; *mip = 0; *lay = 0; *nlay = 1; *dep = 0; *who = "slot"; return 1; }
++        if (s->s_view && s->s_view == v) { *img = (unsigned long long)(uintptr_t)s->s_img; *mip = 0; *lay = 0; *nlay = 1; *dep = 0; *who = "shadow"; return 1; }
++    }
++    for (i = 0; i < H_D_SLOTS; i++) {
++        const h_d_slot *d = &g_d_tab[i];
++        if (d->view && d->view == v) { *img = (unsigned long long)(uintptr_t)d->img; *mip = 0; *lay = 0; *nlay = 1; *dep = 1; *who = "depth"; return 1; }
++    }
++    return 0;
++}
++
++/* framebuffer → 附件清单（走我们自己的对象表反查，不猜、查不到就显式 n=0）。 */
++static int m119a_att_by_fb(VkFramebuffer fb, m119a_att *o)
++{
++    int i, j;
++    memset(o, 0, sizeof *o);
++    if (!fb) return 0;
++    for (i = 0; i < H_RT_SLOTS; i++) {
++        const h_rt_slot *s = &g_rt_tab[i];
++        if (!s->img) continue;
++        if (fb == s->fb_clear || fb == s->fb_load) {
++            o->n = 1;
++            o->img[0] = (unsigned long long)(uintptr_t)s->img; o->mip[0] = 0; o->lay[0] = 0; o->nlay[0] = 1; o->dep[0] = 0;
++            return 1;
++        }
++        if (fb == s->fb_load_d && s->ds && s->ds->img) {
++            o->n = 2;
++            o->img[0] = (unsigned long long)(uintptr_t)s->img;     o->mip[0] = 0; o->lay[0] = 0; o->nlay[0] = 1; o->dep[0] = 0;
++            o->img[1] = (unsigned long long)(uintptr_t)s->ds->img; o->mip[1] = 0; o->lay[1] = 0; o->nlay[1] = 1; o->dep[1] = 1;
++            return 1;
++        }
++    }
++    for (i = 0; i < H_D_SLOTS; i++) {
++        const h_d_slot *d = &g_d_tab[i];
++        if (d->img && fb == d->fb_do) {
++            o->n = 1;
++            o->img[0] = (unsigned long long)(uintptr_t)d->img; o->mip[0] = 0; o->lay[0] = 0; o->nlay[0] = 1; o->dep[0] = 1;
++            return 1;
++        }
++    }
++    for (i = 0; i < g_fbd_n; i++) {
++        if (g_fbd[i].fb != fb) continue;
++        o->n = 0;
++        for (j = 0; j < 2; j++) {
++            VkImageView v = j ? g_fbd[i].dv : g_fbd[i].cv;
++            unsigned long long im; unsigned mp, ly, nl; int dp; const char *wh = "-";
++            if (!m119a_view_img(v, &im, &mp, &ly, &nl, &dp, &wh)) continue;
++            o->img[o->n] = im; o->mip[o->n] = mp; o->lay[o->n] = ly; o->nlay[o->n] = nl; o->dep[o->n] = dp;
++            o->n++;
++        }
++        return o->n ? 1 : 0;
++    }
++    if (fb == g_p2.fb) {
++        o->n = 1; o->img[0] = (unsigned long long)(uintptr_t)g_p2.img; o->mip[0] = 0; o->lay[0] = 0; o->nlay[0] = 1; o->dep[0] = 0; return 1;
++    }
++    if (fb == g_host_fb || fb == g_host_fb_load || fb == g_h_fb) {
++        o->n = 1; o->img[0] = (unsigned long long)(uintptr_t)g_host_img; o->mip[0] = 0; o->lay[0] = 0; o->nlay[0] = 1; o->dep[0] = 0; return 1;
++    }
++    if (fb == g_h_fb) {
++        o->n = 1; o->img[0] = (unsigned long long)(uintptr_t)g_h_img; o->mip[0] = 0; o->lay[0] = 0; o->nlay[0] = 1; o->dep[0] = 0; return 1;
++    }
++    return 0;
++}
++
++/* render pass → (名字, 色附件数)。我们自己的 rp 集合是封闭的：多出来的不是我们的。 */
++static const char *m119a_rp_name(VkRenderPass rp, unsigned *ncol)
++{
++    int v;
++    *ncol = 0;
++    if (rp == g_r_rp)   { *ncol = 1; return "draw"; }
++    if (rp == g_h_rp)   { *ncol = 1; return "clear"; }
++    if (rp == g_sc_rp)  { *ncol = 1; return "swap"; }
++    for (v = 1; v <= 4; v++) if (rp && rp == g_r_rp_d[v]) { *ncol = (v <= 2) ? 1u : 0u; return "draw+depth"; }
++    return "?";
++}
++
++/* 声明直方图采样：每个 n>0 的 SET_RENDER_TARGETS 一条（在 nvn_vk_rt_bind 里、槽已解析之后调）。 */
++static void m119a_decl_sample(int n, const h_rt_slot *s)
++{
++    int b, k;
++    if (n <= 0) return;
++    if (m119a_knob() <= 0) return;
++    if (n > 1) g_m119a_mrt_decl_gt1++;
++    b = (s && s->w == 400u && s->h == 225u) ? 0 : 1;
++    k = (n <= 1) ? 0 : (n == 2) ? 1 : (n == 3) ? 2 : 3;
++    g_m119a_decl[b][k]++;
++    g_m119a_decl_tot[b]++;
++}
++
++static void m119a_decl_line(void)
++{
++    vk_boot_logf("[m119a] declhist bucket=400x225 n1=%llu n2=%llu n3=%llu ngt3=%llu tot=%llu | "
++                 "bucket=other n1=%llu n2=%llu n3=%llu ngt3=%llu tot=%llu | decl_gt1=%llu mrt_blocked=%llu",
++                 g_m119a_decl[0][0], g_m119a_decl[0][1], g_m119a_decl[0][2], g_m119a_decl[0][3], g_m119a_decl_tot[0],
++                 g_m119a_decl[1][0], g_m119a_decl[1][1], g_m119a_decl[1][2], g_m119a_decl[1][3], g_m119a_decl_tot[1],
++                 g_m119a_mrt_decl_gt1, g_m119a_mrt_blocked);
++}
++
++/* 每 pass 一行 + `=3` 的帧首清零。**由 vkCmdBeginRenderPass 宏在 begin 之后调用**。 */
++static void m119a_rp_done(VkCommandBuffer cb, const VkRenderPassBeginInfo *rb)
++{
++    const int v = m119a_knob();
++    VkRenderPass rp = rb ? rb->renderPass : VK_NULL_HANDLE;
++    unsigned ncol = 0, i, j, dup = 0, natt = 0;
++    const char *nm;
++    m119a_att at;
++    unsigned long long fr;
++    if (v <= 0) return;                            /* A0：关态一行不打、一个命令都不记 */
++    fr = dm_frame_anchor_get ? dm_frame_anchor_get() : 0ull;
++    if (fr != g_m119a_fr_last) {
++        if (g_m119a_fr_last) {
++            unsigned long long tot = 0;
++            const int inwin = (g_m119a_fno < 10ull) || ((g_m119a_fno % 60ull) == 0ull);
++            for (i = 0; i <= M119A_ATT_MAX; i++) tot += g_m119a_natt_hist[i];
++            if (inwin && g_m119a_lines < M119A_LINE_MAX)
++                vk_boot_logf("[m119a] drop call=%llu n_dropped=%llu slots=%llu dup_seen=%llu",
++                             g_m119a_fr_last, g_m119a_dropped, tot, g_m119a_dup_seen);
++        }
++        g_m119a_fr_last = fr; g_m119a_fno++;
++        g_m119a_dropped = 0; g_m119a_dup_seen = 0;
++        for (i = 0; i <= M119A_ATT_MAX; i++) g_m119a_natt_hist[i] = 0;
++        /* =3：本帧要清的目标槽 = M113A 选中的 400x225 槽（没有就全表找第一个 400x225 活槽） */
++        g_m119a_clear_pend = 0; g_m119a_clear_slot = -1;
++        if (v == 3) {
++            int sel = g_m113a_sel;
++            if (sel >= 0 && (g_rt_tab[sel].w != 400u || g_rt_tab[sel].h != 225u)) sel = -1;
++            if (sel < 0) {
++                unsigned long long best = 0;
++                for (i = 0; i < H_RT_SLOTS; i++) {
++                    const h_rt_slot *s = &g_rt_tab[i];
++                    if (!s->img || s->w != 400u || s->h != 225u) continue;
++                    if (s->key >= best) { best = s->key; sel = (int)i; }
++                }
++            }
++            g_m119a_clear_slot = sel;
++            g_m119a_clear_pend = (sel >= 0);
++            g_m119a_clear_logged = 0;
++        }
++    }
++    g_m119a_pass++;
++    nm = m119a_rp_name(rp, &ncol);
++    if (!m119a_att_by_fb(rb ? rb->framebuffer : VK_NULL_HANDLE, &at)) { at.n = 0; }
++    natt = at.n ? at.n : ncol;
++    if (natt > M119A_ATT_MAX) natt = M119A_ATT_MAX;
++    if (natt <= M119A_ATT_MAX) g_m119a_natt_hist[natt]++;
++    /* dup：同一 VkImage 出现在 ≥2 个**颜色**附件（上游判据：层/切片范围不同才算别名对） */
++    if (v >= 1) {
++        for (i = 0; i < at.n; i++) {
++            if (at.dep[i]) continue;
++            for (j = 0; j < i; j++) {
++                if (at.dep[j] || at.img[j] != at.img[i]) continue;
++                if (at.lay[j] != at.lay[i] || at.nlay[j] != at.nlay[i]) dup = 1;
++            }
++        }
++        if (dup) { g_m119a_dup_seen++; g_m119a_dropped++; }
++    }
++    /* =3：帧首显式把目标 400x225 槽清成 (0,0,0,255)（在既有 begin-pass 之后，不新造通道） */
++    if (v == 3 && g_m119a_clear_pend && g_m119a_clear_slot >= 0 && at.n >= 1) {
++        const h_rt_slot *s = &g_rt_tab[g_m119a_clear_slot];
++        VkFramebuffer fb = rb ? rb->framebuffer : VK_NULL_HANDLE;
++        if (s->img && (fb == s->fb_load || fb == s->fb_clear) && !at.dep[0]) {
++            VkClearAttachment ca; VkClearRect cr;
++            memset(&ca, 0, sizeof ca);
++            ca.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; ca.colorAttachment = 0;
++            ca.clearValue.color.float32[0] = 0.0f; ca.clearValue.color.float32[1] = 0.0f;
++            ca.clearValue.color.float32[2] = 0.0f; ca.clearValue.color.float32[3] = 1.0f;
++            cr.rect = (VkRect2D){ { 0, 0 }, { (int32_t)s->w, (int32_t)s->h } }; cr.baseArrayLayer = 0; cr.layerCount = 1;
++            vkCmdClearAttachments(cb, 1, &ca, 1, &cr);
++            g_m119a_clear_pend = 0; g_m119a_clear_n++;
++            if (!g_m119a_clear_logged) {
++                g_m119a_clear_logged = 1;
++                vk_boot_logf("[m119a] clear slot=%d wh=%ux%u img=%#llx rgba=0,0,0,255 via=begin-pass+ClearAttachments f=%llu",
++                             g_m119a_clear_slot, (unsigned)s->w, (unsigned)s->h,
++                             (unsigned long long)(uintptr_t)s->img, fr);
++            }
++        }
++    }
++    if (v >= 1 && ((g_m119a_fno < 10ull) || ((g_m119a_fno % 60ull) == 0ull)) && g_m119a_lines < M119A_LINE_MAX) {
++        const char *st = (v >= 1 && dup) ? "DONT" : "STORE";
++        char b[512]; int o = 0;
++        const int decl = g_rt_cur ? g_rt_cur->dk_n : -1;
++        o += snprintf(b + o, sizeof b - (size_t)o, "[m119a] rp call=%llu rp=%#llx natt=%u dup=%d decl=%d kind=%s att=[",
++                      g_m119a_pass, (unsigned long long)(uintptr_t)rp, natt, dup, decl, nm);
++        for (i = 0; i < (at.n ? at.n : ncol) && i < M119A_ATT_MAX && o < (int)sizeof b - 96; i++) {
++            if (i) o += snprintf(b + o, sizeof b - (size_t)o, " | ");
++            o += snprintf(b + o, sizeof b - (size_t)o, "u%u img=%#llx mip=%u lay=%u/%u st=%s%s",
++                          i, at.img[i], at.mip[i], at.lay[i], at.nlay[i], st, at.dep[i] ? " dep" : "");
++        }
++        snprintf(b + o, sizeof b - (size_t)o, " ext=%ux%u fb=%#llx]",
++                 (unsigned)(rb ? rb->renderArea.extent.width : 0u),
++                 (unsigned)(rb ? rb->renderArea.extent.height : 0u),
++                 (unsigned long long)(uintptr_t)(rb ? rb->framebuffer : VK_NULL_HANDLE));
++        vk_boot_logf("%s", b);
++        g_m119a_lines++;
++    }
++    {
++        const double now = (double)pf_now_us() / 1e6;
++        if (!g_m119a_dt) g_m119a_dt = now;
++        if (now - g_m119a_dt >= 30.0) {
++            g_m119a_dt = now;
++            m119a_decl_line();
++            if (g_m119a_mrt_decl_gt1 && !g_m119a_mrt_blocked)
++                m119a_decl_line();
++            if (g_m119a_mrt_decl_gt1)
++                vk_boot_logf("[m119a] mrt decl_gt1=%llu why=colors_not_delivered "
++                             "(nvn_vk_rt_bind 只收到 colors[0]，gfx_bridge.c:2788；MRT 留给 M119B)",
++                             g_m119a_mrt_decl_gt1);
++        }
++    }
++}
++
++/* 每帧收口（present 安全点，M113A 之后）：`=2` 的附件签名 + 30 s 直方图兜底 */
++static void m119a_frame(unsigned long long call)
++{
++    const int v = m119a_knob();
++    const double now = (double)pf_now_us() / 1e6;
++    if (v <= 0) return;
++    if (v >= 2 && g_m113a_sel >= 0) {
++        static double last;
++        if (now - last >= 30.0) {
++            m107a_sig_t sg; const h_rt_slot *s = &g_rt_tab[g_m113a_sel];
++            last = now;
++            if (m113a_sig_slot(g_m113a_sel, &sg))
++                vk_boot_logf("[m119a] sig call=%llu slot=%d wh=%ux%u decl=%d natt=1 "
++                             "att0[dcol=%u mean=%u/%u/%u sp=%u nz10=%u rb=1]",
++                             call, g_m113a_sel, (unsigned)s->w, (unsigned)s->h, s->dk_n,
++                             sg.dcol, sg.mr, sg.mg, sg.mb, sg.spread, sg.nz10);
++            else
++                vk_boot_logf("[m119a] sig call=%llu slot=%d wh=%ux%u rb=0 why=sig_fail",
++                             call, g_m113a_sel, (unsigned)s->w, (unsigned)s->h);
++        }
++    }
++}
++
+ int nvn_vk_draw_elements(int mode, int type, int count, uint64_t idx, int base_vertex, int base_instance,
+                          int instances, int dclass)
+ {
+@@ -33566,6 +33889,7 @@
+         m107a_frame(call, srcname, g_p_sel_slot, ok);   /* M107A：三处签名（t2 = 末笔之后）+ 逐笔时序 + 贴图白度 */
+         m109a_frame(call);   /* M109A：映射表 / 白链（t2 + 逐笔 + 采样递归 ≤2 跳） */
+         m113a_frame(call);   /* M113A：top 报告(30s)/d-t-g 抓取/每帧 f 行；knob=0 ⇒ 零输出 */
++        m119a_frame(call);   /* M119A：附件签名(=2)/直方图兜底；knob=0 ⇒ 零输出 */
+         if (psig_want)
+             p_sig_line(call, srcname, simg, sw, sh, crox, croy, ok, psig_verbose || g_p_m4ak_sig_pair);
+         g_p_m4ak_sig_pair = 0;
+@@ -33993,6 +34317,7 @@
+                          g_winbind_n, (unsigned long long)key, rw, rh, fmt, tex_id,
+                          s ? "ok" : "NULL(回落宿主图)");
+     }
++    m119a_decl_sample(g_dk_n, s);   /* M119A：游戏声明的颜色目标数直方图（只读、knob=0 立即返回） */
+     if (s && fmt) s->fmt = fmt;   /* M4t P1：反向登记（尺寸+格式）要靠它区分同尺寸的不同 RT */
+     if (s && tex_id >= 0 && s->tex_id != tex_id) {
+         if (s->tex_id < 0 && tex_id >= 0 && g_h_rt_switch < 64)

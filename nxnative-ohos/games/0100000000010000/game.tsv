@@ -1,0 +1,45 @@
+# Super Mario Odyssey (Nintendo EPD sead/agl 引擎, NintendoWare G3d/Ui2d/Vfx, SDK 7.3.2), update 1.4.1 —— 鸿蒙档案。
+# 键表权威：../README.md（43 键 = nxnative 37 + 鸿蒙 6）；odyssey 实值出处：infra/nxnative/dm/games/0100000000010000/game.tsv
+# 与 game-work/smo_build/patched/*/*.fixups.tsv 的 BUILD_ID 行。内存键对照宿主 services.c 现值（见各组注释）。
+
+# ---- 身份 ----
+title_id	0100000000010000
+program_id	0100000000010000
+
+# ---- 应用（鸿蒙组） ----
+name	Super Mario Odyssey
+hap_bundle	com.vibecc.smo
+hap_label	马里奥奥德赛
+hap_icon	$media:icon
+
+# ---- 版本 ----
+# build 行含 rtld（宿主 loader 也要它的 patched 镜像随 rawfile 分发；prepare_runtime 的 modules 表不含 rtld）
+build	v393216	1.4.1	main=b424be150a8e7d78701cbe7a439d9ebf	rtld=39e10c07096696c9c4e228496c4bc44d	subsdk0=93ff8252d975adf07230cb86c83301c5	sdk=fcf93a41b08c5193a1410d262602dc62
+package	v393216
+shader_versions	v393216
+
+# ---- 模块 ----
+modules	main subsdk0 sdk
+romfs_marker	SoundData/SeResourceStd2nd.aras
+
+# ---- 内存（对照 mario-odessy-harmony host/services.c 现值） ----
+# mem_reserve：nxnative odyssey 档案值；鸿蒙宿主实际按 GUEST_ADDRESS_LIMIT 2^39 预留（services.c），M4+ 参数化注入
+mem_reserve	0x100000000
+# mem_alias：nxnative 档案值（256 MiB）；宿主 services.c alias 区默认 64 GiB 搜缩（TOTK_ALIAS_GIB 钉），M4+ 收敛
+mem_alias	0x10000000
+# mem_stack：与 services.c STACK_SIZE 0x10000000 一致
+mem_stack	0x10000000
+# app_pool：与 services.c app_pool() 缺省 0xcd500000 一致（TOTK_APP_POOL env 可覆盖）
+app_pool	0xCD500000
+
+# ---- 着色器拆分 ----
+shader_groups	/ObjectData/=objectdata /StageData/=stagedata /SoundData/=sounddata /LayoutData/=layoutdata /LocalizedData/=localizeddata /EventData/=eventdata /MovieData/=moviedata /SystemData/=systemdata /ShaderData/=shaderdata /EffectData/=effectdata
+shader_note	Super Mario Odyssey shaders
+
+# ---- 鸿蒙组 ----
+# romfs_volume_mib：RomFS.img 5,678,065,309 B → 6 卷（make_romfs_runtime CHUNK=1<<30）
+romfs_volume_mib	1024
+# fonts_mode：embedded（make_shared_fonts.py 用 Windows TTF 伪造 BFTTF 内嵌，6 槽位 3,440,036 B 唯一数据）
+fonts_mode	embedded
+# nvn_backend：预留键，当前唯一合法值 vulkan（nvn_vk/ 实装于 M4）
+nvn_backend	vulkan

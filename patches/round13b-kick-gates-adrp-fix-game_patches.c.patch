@@ -1,0 +1,185 @@
+--- game_patches.c (round13b: kick 断链三观测门 + 单字尾跳门机制 + 重放 adrp 重定位修复)
+    fixPlan(2)：kick1 main+0x8ad1f4（kick 入口+4）、al-kick main+0x587ea8（al 层尾调 b，单字门
+    tail=1：veneer 只换 1 条 b→stub，stub 尾 b 回原目标 0x8ad1f0，无重放、不碰相邻 thunk）、
+    kick3 main+0x8ad318（三参变体 0x8ad310 族合流点，同为单字门）。
+    round13b 首跑崩溃定因+修复：round12e cell2 门（0x9b9bc4）重放首字 adrp 为 PC 相对指令，
+    原样重放按 stub 页算目标→读回垃圾 0x540007017100051f→SEGV@0x000007017100051f
+    （fault log pc=stub+0x44=w17、lr=main+0x9b9bac=门上游，互证）。smo_obs_replay_fix：
+    adrp 安装期重算 imm 指向同绝对页；其余 PC 相对字形（b/bl/b.cond/cbz/tbz/adr/ldr-literal）拒装。
+    150s 实测（emu_round13b.log）：三门 hits=0 ⇒ kick 族从未运行，断链在其上游注册（fixPlan(4)）。
+
+--- game_patches.c
++++ game_patches.c
+@@ -210,18 +210,36 @@
+  *   extra private page … stays plain zero-filled memory" 即此页）。stub 保存
+  *   x0-x7/x29/x30 → 调 C 观察器（无锁、无 I/O、无 libc 调用）→ 恢复 → 原样重放被换的
+  *   4 条出厂指令 → b 回入口+0x10。编码字全部经 scripts_round9b/gen_obs_stub.py 的
+- *   capstone 往返校验；安装时先逐一比对 4 条出厂指令字，不符即不装该门（fail-soft）。 */
+-enum { SMO_OBS_E1 = 0, SMO_OBS_DRAIN_A = 1, SMO_OBS_DRAIN_B = 2, SMO_OBS_CELL2 = 3, SMO_OBS_N = 4 };
+-typedef struct { uint32_t off, gate; uint32_t word[4]; } smo_obs_site_t;
++ *   capstone 往返校验；安装时先逐一比对 4 条出厂指令字，不符即不装该门（fail-soft）。
++ * round13 kick 断链观测门（fixPlan(2)：『kick 从未运行』从推断升级为指令级计数）：
++ * KICK1 main+0x8ad1f4（kick 入口+4：donor 语义里带优先队列入队后再 signal 的派发函数；
++ *   被 al thunk 0x587ea0 尾调与主线程排空循环 0x8abfa0 bl 调用）。计数=该函数全部真实
++ *   执行次数——与 donor 侧 0x8ad1f0 族 force/entry 计数（预期 ≈920+410+舞台数，与
++ *   wait#921/920/410 对账）对照：emu ≈0 ⇒ kick 从未运行（断链在注册上游），emu 大而
++ *   worker 不醒 ⇒ kick 运行但其虚调用路径分歧。
++ * ALKICK main+0x587ea8（al 层 kick 调用点：thunk 0x587ea0 过 NULL 检查后的尾调 b）。
++ *   该址仅一条无条件 b、且控制流不再返回（thunk 后继 0x587eac ret 只经 0x587ea4 cbz
++ *   到达），故走单字门（tail=1）：出厂 b→stub 计数→stub 尾 b 回原目标 0x8ad1f0，
++ *   无重放、不碰相邻 thunk（0x587eb0 起是另一个活 thunk）。KICK1−ALKICK=直接调用路径。
++ * KICK3 main+0x8ad318（kick 三参变体 0x8ad310 族的合流点：0x8ad310 and;0x8ad314 mov
++ *   顺流至此，0x8a671c cbz 也跳此——全镜像无其它落点，扫描实证）。同为单字门。 */
++enum { SMO_OBS_E1 = 0, SMO_OBS_DRAIN_A = 1, SMO_OBS_DRAIN_B = 2, SMO_OBS_CELL2 = 3,
++       SMO_OBS_KICK1 = 4, SMO_OBS_ALKICK = 5, SMO_OBS_KICK3 = 6, SMO_OBS_N = 7 };
++typedef struct { uint32_t off, gate, tail; uint32_t word[4]; } smo_obs_site_t;
+ static const smo_obs_site_t smo_obs_site[] = {
+-    {0x57f950, SMO_OBS_E1,      {0xa9be4ff4, 0xa9017bfd, 0x910043fd, 0xf9400408}},   /* stp x20,x19; stp x29,x30; add x29,sp,#0x10; ldr x8,[x0,#8] */
+-    {0x8aef34, SMO_OBS_DRAIN_A, {0xa9057bfd, 0x910143fd, 0x394c0008, 0xaa0103f5}},   /* stp x29,x30,[sp,#0x50]; add x29,sp,#0x50; ldrb w8,[x0,#0x300]; mov x21,x1 */
+-    {0x8af418, SMO_OBS_DRAIN_B, {0xa9027bfd, 0x910083fd, 0x2a0103f3, 0xaa0003f4}},   /* stp x29,x30,[sp,#0x20]; add x29,sp,#0x20; mov w19,w1; mov x20,x0 */
++    {0x57f950, SMO_OBS_E1,      0, {0xa9be4ff4, 0xa9017bfd, 0x910043fd, 0xf9400408}},   /* stp x20,x19; stp x29,x30; add x29,sp,#0x10; ldr x8,[x0,#8] */
++    {0x8aef34, SMO_OBS_DRAIN_A, 0, {0xa9057bfd, 0x910143fd, 0x394c0008, 0xaa0103f5}},   /* stp x29,x30,[sp,#0x50]; add x29,sp,#0x50; ldrb w8,[x0,#0x300]; mov x21,x1 */
++    {0x8af418, SMO_OBS_DRAIN_B, 0, {0xa9027bfd, 0x910083fd, 0x2a0103f3, 0xaa0003f4}},   /* stp x29,x30,[sp,#0x20]; add x29,sp,#0x20; mov w19,w1; mov x20,x0 */
+     /* round12e 定名打点：GetLoadProgress 的 f()（main+0x9b9b80）第二表双间接调用。
+        0x9b9bc4 起四条 = adrp x8,0x136d000; ldr x8,[x8,#0xeb8] (=cell 0x136deb8); ldr x8,[x8]; blr x8。
+        loader.c round12d 已证两 cell 均非直接 reloc 目标（双间接指针表），静态无法定名——
+        此门借 26k/s 的既有洪流在首个命中处快照 cell→table→fn 链，dump 时符号化。 */
+-    {0x9b9bc4, SMO_OBS_CELL2,   {0x90004da8, 0xf9475d08, 0xf9400108, 0xd63f0100}},
++    {0x9b9bc4, SMO_OBS_CELL2,   0, {0x90004da8, 0xf9475d08, 0xf9400108, 0xd63f0100}},
++    /* round13 kick 门：KICK1 四字门（stp/add/mov/cmp，无 PC 相对字，+0x10=0x8ad204 b.lt
++       恰消费重放 cmp 的标志位）；两个单字门的 word[1]=后继原字（卸载校验用）。 */
++    {0x8ad1f4, SMO_OBS_KICK1,   0, {0xa9017bfd, 0x910043fd, 0xaa0003f3, 0x7100043f}},   /* stp x29,x30,[sp,#0x10]; add x29,sp,#0x10; mov x19,x0; cmp w1,#1 */
++    {0x587ea8, SMO_OBS_ALKICK,  1, {0x140c94d2, 0xd65f03c0, 0, 0}},                     /* b 0x8ad1f0（后继 0x587eac ret） */
++    {0x8ad318, SMO_OBS_KICK3,   1, {0x14000002, 0x00000000, 0, 0}},                     /* b 0x8ad320（后继 0x8ad31c udf 填充） */
+ };
+ #define SMO_OBS_E1_CAP 128
+ static struct {
+@@ -307,6 +325,40 @@
+     0xa94107e0,   /* ldp x0, x1, [sp, #0x10]          */
+     0xa8c67bfd,   /* ldp x29, x30, [sp], #0x60        */
+ };
++/* round13b 修复（崩溃定因）：四字门的重放字里出现 PC 相对指令时不能原样重放——adrp/分支族
++   会按 stub 的 PC 计算目标。13b 首跑即崩：round12e cell2 门（0x9b9bc4）重放首字 adrp x8，
++   以 stub 页（main+0x14d4xxx）算出 main 尾后地址，w16 读回垃圾 0x540007017100051f，w17
++   ldr x8,[x8] SEGV@0x000007017100051f（fault log：pc=stub+0x44 即 w17、x8=该垃圾、
++   lr=main+0x9b9bac 恰为门上游，三者互证）。修法：adrp 在安装期把 imm 重算到『stub 内该字
++   位置』仍指向原绝对页（同语义）；其余 PC 相对字形（b/bl/b.cond/cbz/cbnz/tbz/tbnz/adr/
++   ldr-literal）本机制不支持，直接拒装该门（fail-soft）。E1/E2/kick1 等四字门经此扫描
++   全为寄存器+立即数字形，不受影响。w[4] 为 4 个重放字（就地改写）；off=门在 main 的偏移，
++   stub_off=stub 在 main 的偏移。返回 0=拒装（why 填原因）。 */
++static int smo_obs_replay_fix(uint32_t w[4], uint32_t off, uint64_t stub_off, char *why, size_t whyn) {
++    for (int i = 0; i < 4; i++) {
++        uint32_t v = w[i];
++        uint64_t wo = stub_off + (15 + i) * 4;              /* 该字在 stub 内的 main 相对地址 */
++        if ((v & 0x9f000000u) == 0x90000000u) {             /* adrp：重算 imm（同绝对页） */
++            int64_t imm = (int64_t)((v >> 29) & 3) | ((int64_t)((v >> 5) & 0x7ffff) << 2);
++            if (imm & (1 << 20)) imm -= 1 << 21;
++            uint64_t page_abs = (off & ~0xfffu) + ((uint64_t)imm << 12);   /* 原绝对页 */
++            int64_t want = (int64_t)(page_abs - (wo & ~0xfffu)) >> 12;
++            if (want < -(1 << 20) || want >= (1 << 20)) {
++                snprintf(why, whyn, "adrp relocation out of range (%+lld pages)", (long long)want);
++                return 0;
++            }
++            w[i] = (v & 0x9f00001fu) | ((uint32_t)(want & 3) << 29) | ((uint32_t)((want >> 2) & 0x7ffff) << 5);
++        } else if ((v >> 26) == 0x05 || (v >> 26) == 0x25   /* b / bl */
++                   || (v & 0xff000000u) == 0x54000000u      /* b.cond */
++                   || (v & 0x7f000000u) >= 0x34000000u && (v & 0x7f000000u) <= 0x37000000u   /* cbz/cbnz/tbz/tbnz（含 sf 位屏蔽） */
++                   || (v & 0x9f000000u) == 0x10000000u      /* adr */
++                   || (v & 0xbf000000u) == 0x18000000u) {   /* ldr-literal */
++            snprintf(why, whyn, "PC-relative word %#x at slot %d unsupported", v, i);
++            return 0;
++        }
++    }
++    return 1;
++}
+ static void smo_obs_gates_install(const Module *m) {
+     if (strcmp(m->name, "main")) return;
+     g_obs_main_base = (uint64_t)(uintptr_t)m->base;   /* round12e：cell 链快照用（任何 veneer 生效前已就位） */
+@@ -318,7 +370,10 @@
+     for (size_t s = 0; s < sizeof smo_obs_site / sizeof *smo_obs_site; s++) {
+         const smo_obs_site_t *site = &smo_obs_site[s];
+         uint32_t have[4]; memcpy(have, m->base + site->off, sizeof have);
+-        int ok = 1; for (int i = 0; i < 4; i++) ok &= have[i] == site->word[i];
++        /* 单字门（tail=1）只占 1 条 b：校验该字与其后继原字（word[1]），不碰再后指令。 */
++        int ok = site->tail ? (have[0] == site->word[0] && have[1] == site->word[1])
++                            : (have[0] == site->word[0] && have[1] == site->word[1] &&
++                               have[2] == site->word[2] && have[3] == site->word[3]);
+         if (!ok) {
+             fprintf(stderr, "[odyssey] obs gate %#x: found %08x %08x %08x %08x, expected the four shipped words — NOT installed\n",
+                     site->off, have[0], have[1], have[2], have[3]);
+@@ -328,15 +383,55 @@
+         uint32_t w[22];
+         memcpy(w, smo_obs_prologue, sizeof smo_obs_prologue);
+         w[6] = 0xd2800000u | ((uint32_t)site->gate << 5) | 1;                /* movz x1, #gate */
+-        for (int i = 0; i < 4; i++) w[15 + i] = site->word[i];               /* 原样重放被换出的 4 条指令 */
++        uint64_t fn = (uint64_t)(uintptr_t)&smo_obs_observer;
++        memcpy(w + 20, &fn, 8);                                             /* .quad 观察器地址 */
++        if (site->tail) {
++            /* 单字尾跳门：出厂 word[0] 必是无条件 b；解出其目标，stub 末尾原义重定向。
++               veneer 只换这 1 个字（b→stub），相邻 thunk 的指令一个不动。 */
++            uint32_t imm26 = site->word[0] & 0x3ffffffu;
++            int64_t disp = (imm26 & (1u << 25)) ? (int64_t)imm26 - (1 << 26) : (int64_t)imm26;
++            int64_t tofs = (int64_t)site->off + (disp << 2);                /* 原目标（main 相对） */
++            if (disp == 0 || tofs <= 0 || (uint64_t)tofs >= m->file_size) {
++                fprintf(stderr, "[odyssey] obs gate %#x: tail word not an in-module b (target main+%#llx) — NOT installed\n",
++                        site->off, (unsigned long long)tofs);
++                continue;
++            }
++            uint64_t dst = (uint64_t)(uintptr_t)(m->base + tofs);           /* 原目标绝对地址 */
++            int64_t branch = (int64_t)dst - (int64_t)(stub + 15 * 4);        /* stub 尾 b 原目标 */
++            if (branch < -(1 << 27) || branch >= (1 << 27) || branch & 3) {
++                fprintf(stderr, "[odyssey] obs gate %#x: stub tail branch out of range (%+#llx) — NOT installed\n", site->off, (long long)branch);
++                continue;
++            }
++            w[15] = 0x14000000u | (((uint64_t)branch >> 2) & 0x3ffffff);
++            for (int i = 16; i <= 19; i++) w[i] = 0xd503201fu;              /* nop 填充（永不执行） */
++            memcpy(stub, w, sizeof w);
++            int64_t vb = (int64_t)(uintptr_t)stub - (int64_t)(uintptr_t)(m->base + site->off);
++            if (vb < -(1 << 27) || vb >= (1 << 27) || vb & 3) {
++                fprintf(stderr, "[odyssey] obs gate %#x: veneer branch out of range (%+#llx) — NOT installed\n", site->off, (long long)vb);
++                continue;
++            }
++            uint32_t veneer1 = 0x14000000u | (((uint64_t)vb >> 2) & 0x3ffffff);   /* 单字 b→stub */
++            memcpy(m->base + site->off, &veneer1, 4);
++            installed++;
++            fprintf(stderr, "[odyssey] obs gate main+%#x (id %u, tail b->main+%#llx) installed, stub at main+%#llx\n",
++                    site->off, site->gate, (unsigned long long)(dst - (uint64_t)(uintptr_t)m->base),
++                    (unsigned long long)(uintptr_t)(stub - m->base));
++            continue;
++        }
++        for (int i = 0; i < 4; i++) w[15 + i] = site->word[i];               /* 原样重放被换出的 4 条指令（PC 相对字见下方修正/拒装） */
++        {   /* round13b：重放字 PC 相对指令修正/拒装（cell2 门 adrp 13b 首跑即崩，见 smo_obs_replay_fix 注） */
++            char why[96];
++            if (!smo_obs_replay_fix(&w[15], site->off, (uint64_t)(uintptr_t)(stub - m->base), why, sizeof why)) {
++                fprintf(stderr, "[odyssey] obs gate %#x: replay %s — NOT installed\n", site->off, why);
++                continue;
++            }
++        }
+         int64_t branch = (int64_t)(m->base + site->off + 0x10) - (int64_t)(stub + 19 * 4);
+         if (branch < -(1 << 27) || branch >= (1 << 27) || branch & 3) {
+             fprintf(stderr, "[odyssey] obs gate %#x: branch out of range (%+#llx) — NOT installed\n", site->off, (long long)branch);
+             continue;
+         }
+         w[19] = 0x14000000u | (((uint64_t)branch >> 2) & 0x3ffffff);         /* b 入口+0x10 */
+-        uint64_t fn = (uint64_t)(uintptr_t)&smo_obs_observer;
+-        memcpy(w + 20, &fn, 8);                                             /* .quad 观察器地址 */
+         memcpy(stub, w, sizeof w);
+         uint32_t veneer[2] = {0x58000051, 0xd61f0220};                      /* ldr x17,#8; br x17（patch_scene_pick 同款） */
+         uint64_t target = (uint64_t)(uintptr_t)stub;
+@@ -355,6 +450,16 @@
+         for (size_t s = 0; s < sizeof smo_obs_site / sizeof *smo_obs_site; s++) {
+             const smo_obs_site_t *site = &smo_obs_site[s];
+             uint32_t have[4]; memcpy(have, m->base + site->off, sizeof have);
++            if (site->tail) {
++                /* 单字门：have[0]=我们写的 veneer b、have[1] 仍为出厂后继字 → 只回写 word[0]。 */
++                if (have[0] == site->word[0] || have[1] != site->word[1]) continue;
++                uint32_t imm26 = have[0] & 0x3ffffffu;
++                int64_t disp = (imm26 & (1u << 25)) ? (int64_t)imm26 - (1 << 26) : (int64_t)imm26;
++                uint64_t t = (uint64_t)(uintptr_t)(m->base + site->off) + ((uint64_t)disp << 2);
++                if (t < (uint64_t)(uintptr_t)page || t >= (uint64_t)(uintptr_t)(page + 0x4000)) continue;   /* 非 ours */
++                memcpy(m->base + site->off, &site->word[0], 4);
++                continue;
++            }
+             int ok = 1; for (int i = 0; i < 4; i++) ok &= have[i] == site->word[i];
+             if (ok) continue;   /* 没装上这门（字不符或分支越界），veneer 也没写 */
+             uint32_t veneer[2] = {0x58000051, 0xd61f0220};

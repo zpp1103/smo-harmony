@@ -1,0 +1,192 @@
+--- nvn_vk2/rec/gfx_vk_exec.c
++++ nvn_vk2/rec/gfx_vk_exec.c
+@@ -475,6 +475,9 @@
+ static int m73a_ubo_patch(int st, const vkshader_t *s, const dmsv_bind *b, VkDescriptorBufferInfo *bi);   // 同一份常量银行，按 M73A 的预设置 c1[2]/c2[2]/c2[3]/c4[0]/c4[1]
+ float m71a_bconst(void);                                                // bit3 的压缩系数（DM_VK_M71A_BC，默认 0.55）
+ static int g_m71a_bc;   // 这一笔 draw 的输出要不要乘 DM_VK_M71A_BC（bit3；prepare_draw 顶部按 pass 尺寸置位，set_dynamic 取用）
++int vk_m74a_mode(void);                                                 // M74A：pass 71 的 luma（c0 点积亮通道）权重 + 末级累加归一化（默认关；见本文件 M74A 块）
++float m74a_bconst(void);                                                // M74A bit4 的末级压缩系数（DM_VK_M74A_BC，默认 0.55）
++static int g_m74a_bc;   // 这一笔 draw 的输出要不要乘 m74a_bconst()（M74A bit4；prepare_draw 顶部按 pass 尺寸置位）
+ int vk_m72a_mode(void);                                                 // M72A：谁该写那张 800×450 D32（默认关；见本文件 M72A 块）
+ void m72a_pass_end(int m);                                              // bit0 的 pass 表 + bit1/bit2 的深度读回 + bit3 的窗口判定
+ void m72a_draw(int m);                                                  // 逐 draw 的 depthTest / depthWrite / compare / bias 汇总
+@@ -1733,7 +1736,7 @@
+         bfac(k->bl[i].srca), bfac(k->bl[i].dsta), bop(k->bl[i].eqa), k->wmask[i]};
+     if (flat & 4) for (uint32_t i = 0; i < k->ncol; i++) { cba[i].blendEnable = 0; cba[i].colorWriteMask = 0xf; }
+     VkPipelineColorBlendStateCreateInfo cb = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, NULL, 0, k->logic_en, (VkLogicOp)k->logic_op, k->ncol, cba,
+-                                              {k->m71abc ? m71a_bconst() : 0.f, k->m71abc ? m71a_bconst() : 0.f, k->m71abc ? m71a_bconst() : 0.f, 1.f}};   // (VK_DYNAMIC_STATE_BLEND_CONSTANTS 也是动态的，set_dynamic 每笔再设)
++                                              {k->m71abc ? (g_m74a_bc ? m74a_bconst() : m71a_bconst()) : 0.f, k->m71abc ? (g_m74a_bc ? m74a_bconst() : m71a_bconst()) : 0.f, k->m71abc ? (g_m74a_bc ? m74a_bconst() : m71a_bconst()) : 0.f, 1.f}};   // (VK_DYNAMIC_STATE_BLEND_CONSTANTS 也是动态的，set_dynamic 每笔再设)
+     VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
+                             VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_DEPTH_BIAS, VK_DYNAMIC_STATE_LINE_WIDTH};
+     VkPipelineDynamicStateCreateInfo dy = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, sizeof dyn / sizeof *dyn, dyn};
+@@ -2236,8 +2239,8 @@
+     { int32_t vx0 = (int32_t)fmaxf(vp.x, 0), vy0 = (int32_t)fmaxf(fminf(vp.y, vp.y + vp.height), 0), vx1 = (int32_t)(vp.x + vp.width), vy1 = (int32_t)fmaxf(vp.y, vp.y + vp.height);   // what this draw can touch
+       int32_t x0 = sc.offset.x > vx0 ? sc.offset.x : vx0, y0 = sc.offset.y > vy0 ? sc.offset.y : vy0, x1 = sc.offset.x + (int32_t)sc.extent.width < vx1 ? sc.offset.x + (int32_t)sc.extent.width : vx1, y1 = sc.offset.y + (int32_t)sc.extent.height < vy1 ? sc.offset.y + (int32_t)sc.extent.height : vy1;
+       if (x0 < g_pass_bb[0]) g_pass_bb[0] = x0; if (y0 < g_pass_bb[1]) g_pass_bb[1] = y0; if (x1 > g_pass_bb[2]) g_pass_bb[2] = x1; if (y1 > g_pass_bb[3]) g_pass_bb[3] = y1; }
+-    { float bcs[4]; memcpy(bcs, S.blendc, sizeof bcs);   // M71A bit3: this draw's output compression (the pipeline blends with CONSTANT_COLOR)
+-      if (g_m71a_bc) { const float v = m71a_bconst(); bcs[0] = bcs[1] = bcs[2] = v; bcs[3] = 1.f; }
++    { float bcs[4]; memcpy(bcs, S.blendc, sizeof bcs);   // M71A bit3 / M74A bit4: this draw's output compression (the pipeline blends with CONSTANT_COLOR)
++      if (g_m71a_bc) { const float v = g_m74a_bc ? m74a_bconst() : m71a_bconst(); bcs[0] = bcs[1] = bcs[2] = v; bcs[3] = 1.f; }
+       if (!BC_SAME(bc, bcs)) { vkCmdSetBlendConstants(cb, bcs); memcpy(g_bc.bc, bcs, sizeof g_bc.bc); } }
+     if (!BC_SAME(sm, S.smask)) { vkCmdSetStencilCompareMask(cb, VK_STENCIL_FACE_FRONT_BIT, (uint32_t)S.smask[0]); vkCmdSetStencilCompareMask(cb, VK_STENCIL_FACE_BACK_BIT, (uint32_t)S.smask[1]); memcpy(g_bc.sm, S.smask, sizeof g_bc.sm); }
+     if (!BC_SAME(sw, S.swmask)) { vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_FRONT_BIT, (uint32_t)S.swmask[0]); vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_BACK_BIT, (uint32_t)S.swmask[1]); memcpy(g_bc.sw, S.swmask, sizeof g_bc.sw); }
+@@ -2295,6 +2298,11 @@
+        常数在 set_dynamic 里按 DM_VK_M71A_BC 设）。按 pass 尺寸认，不认 pass 号（帧型换了 pass 号会动）；关态只读一个 env。 */
+     { int mk = vk_m71a_mode();   // 40×22（游玩 1280×720）/ 25×14（800×450 动态分辨率）那一级；20×11 也在内；2×1 的曝光 pass 与 128² 阴影不在
+       g_m71a_bc = (mk & 8) && S.pass_w >= 16 && S.pass_w <= 40 && S.pass_h >= 8 && S.pass_h <= 24 ? 1 : 0; }
++    /* M74A bit4：把**累加链最后一级**（800×450 帧型里 25×14 那一级 = pass 78/79/80）的输出等比例归一化，走同一条 blend-constant 通道。
++       尺寸窗比 M71A 的窄（20≤W≤40、10≤H≤24）：排除 8×8（M71A 的 bit3 顺带命中过一条阴影/模糊级）与 12×7（81..83 更下一级）。 */
++    g_m74a_bc = 0;
++    { int m74 = vk_m74a_mode();
++      if (m74 && m74a_bconst() > 0.f && S.pass_w >= 20 && S.pass_w <= 40 && S.pass_h >= 10 && S.pass_h <= 24) { g_m71a_bc = 1; g_m74a_bc = 1; } }
+     // DM_VK_CB_DRAWS (read every submission, default 128, 0 = never): the replay is cut every that many draws and what is recorded goes to the GPU at once
+     // (vk_cmd_split), so the GPU works on the frame while the rest is replayed instead of after all of it: NEO's Scramble Crossing 36.7 → 15.7 ms a frame
+     g_cb_draws++;   // the cut itself happens between passes (begin_pass); inside one only with DM_VK_PASS_SPLIT (below): a pass cut in two stores and reloads its attachments
+@@ -3193,6 +3201,66 @@
+     }
+ }
+ 
++// ============================ M74A：清掉剩余白斑的第二来源——`luma`（c0 点积亮通道）+ 末级累加归一化（默认关；smo_m74a → DM_VK_M74A）============================
++/* 派活单（2026-11-12 12:26）：M73A 已把 t 连续化（t=1 38.71%→0%）并把斑区 nearwhite 压 −53.4%，但 **t≡0 参考档的斑区仍有 12.79%**
++   ⇒ 剩下的白不来自 t，而来自同一条 FS 的第二项 **luma**：
++     out.rgb = col.rgb · c1[2] · (t² + luma)，luma = clamp(dot(col.rgba, c0[0..3]), 0, 1)
++   c0 = 这份 65536 B 常量银行的**头 4 个 float** = (2.98912, 5.86610, 1.14478, −2)（M70A `[m69a-ubo]` 实测，紧邻 c1 的 100/0/0.06/10000）：
++   前三个正好是 Rec.601 亮度系数的 10 倍（0.2989/0.5866/0.1145 × 10），第 4 个 −2 是常数偏置 ⇒
++   **luma = clamp(10·L601(col) − 2, 0, 1)** = 「亮度 0.2 以上开始亮、0.3 以上饱和」的**纯颜色**掩码，与深度/t 完全无关
++   ⇒ 无论 t 怎么标定，它都把亮像素原样加进雾项，再被下游 8 级未归一化累加放大。
++   本块只动 **pass 71 那一份常量银行副本**里的 c0（与 M73A 共用 `m73a_ubo_patch` 的同一个落点，不新增描述符改道、不碰别的 pass）：
++     klum    = c0[0..2] 的缩放（压 luma 的主体）
++     koff    = c0[3]（−2 偏置）的缩放（=1 时阈值不动、只把「亮」的幅度压低；=klum 时是整体等比缩，连阈值一起抬）
++     gainmul = 乘在 c1[2] 上（在 M73A 档的 gain 之上再乘）
++     bc      = 末级（25×14 那一级 = 累加链最后一级）输出的等比例压缩系数（复用 M71A bit3 已验证的 blend-constant 通道）
++   预设 = smo_m74a 的 bit（2 s 热切；每次变档打一行 [m74a-seg]）：
++     bit0(1)  luma×0.5（只缩权重：klum=0.5, koff=1）
++     bit1(2)  luma×0.25（klum=0.25, koff=1）
++     bit2(4)  luma=0（klum=0 ⇒ dot 恒 −2 ⇒ clamp 到 0；**探边界，不许当选**）
++     bit3(8)  增益 1/8（gainmul=0.125 = 派活单允许的「只压 71 的 c1[2] 到 gain/8」）
++     bit4(16) 末级归一化（bc=0.55）
++     bit5(32) luma 整体等比×0.5（klum=koff=0.5，连阈值一起抬 ⇒ 与 bit0 的差别就是「饱和区也真的减半」）
++   字符串 `smo_m74a_p = "klum [koff [gainmul [bc]]]"` 覆盖上面的数值（同一 build 里细扫，不必再 build）。
++   全 0 = 零日志、零分配、零行为变化（`m73a_ubo_patch` 仍只由 M73A 的开关或本块的开关打开）。 */
++typedef struct { float klum, koff, gainmul, bc; } m74p_t;
++static m74p_t g_m74p = {1.f, 1.f, 1.f, 0.f};   // 生效值（vk_m74a_mode 每次重读时写；关态恒为中性）
++static int g_m74a_lines;
++float m74a_bconst(void) { return g_m74p.bc; }
++int vk_m74a_mode(void) {
++    static int v = -1; static long last = 0; static m74p_t prev; static int have;
++    const long now = (long)time(NULL);
++    if (v >= 0 && now == last) return v;
++    last = now;
++    const char *e = getenv("DM_VK_M74A"); const int nv = e ? atoi(e) : 0;
++    const char *s = getenv("DM_VK_M74A_P");
++    float fv[4]; int nf = 0;
++    if (s && *s) { const char *q = s; while (*q && nf < 4) { char *end = NULL; const float x = (float)strtod(q, &end); if (end == q) break; fv[nf++] = x; q = end; } }
++    m74p_t p; p.klum = 1.f; p.koff = 1.f; p.gainmul = 1.f; p.bc = 0.f;
++    if (nv & 1)  { p.klum = 0.5f;  p.koff = 1.f; }    // 顺序 = 后写的覆盖前面的：bit2 的 luma=0 最强
++    if (nv & 2)  { p.klum = 0.25f; p.koff = 1.f; }
++    if (nv & 32) { p.klum = 0.5f;  p.koff = 0.5f; }
++    if (nv & 4)  { p.klum = 0.f;   p.koff = 1.f; }
++    if (nv & 8)  { p.gainmul = 0.125f; }
++    if (nv & 16) { p.bc = 0.55f; }
++    if (nf >= 1) p.klum = fv[0];
++    if (nf >= 2) p.koff = fv[1];
++    if (nf >= 3) p.gainmul = fv[2];
++    if (nf >= 4) p.bc = fv[3];
++    const int on = nv > 0 || nf >= 1;
++    g_m74p = p;
++    v = on ? (nv > 0 ? nv : 64) : 0;
++    if (on && (!have || memcmp(&prev, &p, sizeof p))) {
++        have = 1; prev = p; g_ubo_gen[1]++;   // 变档要让 stage 1 的描述符重算（否则 set memo 会把上一档的 set 直接复给这一帧）
++        VKLOG("[m74a-seg] pass 71 luma: c0[0..2] x%g, c0[3] x%g, gain x%g, last-level bc=%g (bits=%d override=\"%s\"); every [m74a-*] line after this one belongs to this variant",
++              (double)p.klum, (double)p.koff, (double)p.gainmul, (double)p.bc, nv, s && *s ? s : "");
++    } else if (!on && have) {
++        have = 0; g_ubo_gen[1]++;
++        VKLOG("[m74a-seg] off (DM_VK_M74A=0, no override): pass 71 keeps the game's own luma weights, no last-level compression");
++    }
++    return v;
++}
++
+ // ============================ M73A：pass 71 的 z→视距换算式重标定（默认关；smo_m73a → DM_VK_M73A）============================
+ /* 派活单（2026-11-12 11:20）：M72A 已证明那张 800×450 D32 **就是场景深度本身**（0.9–0.999 是 f/n≈10⁴ 投影下的正常落位，
+    0.5–0.9 与 <0.5 两档构造上永远为空），白斑的物理入口在 **pass 71**（200×112 / 320×180，1 笔全屏三角形，FS 4761cab3adf56549）
+@@ -3240,7 +3308,7 @@
+     const char *s = getenv("DM_VK_M73A_P");
+     float fv[5]; int nf = 0;
+     if (s && *s) { const char *q = s; while (*q && nf < 5) { char *end = NULL; const float x = (float)strtod(q, &end); if (end == q) break; fv[nf++] = x; q = end; } }
+-    const int on = nv > 0 || nf >= 3;
++    const int on = nv > 0 || nf >= 3 || vk_m74a_mode() != 0;   // M74A：只开 luma/末级时这条银行副本也要改道（A/B/gain 用游戏原值）
+     m73p_t p; m73a_preset(nv, &p);
+     if (nf >= 3) { p.A = fv[0]; p.B = fv[1]; p.gain = fv[2]; if (nf >= 5) { p.c40 = fv[3]; p.c41 = fv[4]; } }
+     if (!on) {
+@@ -3284,13 +3352,34 @@
+     vk_ubd_read(u->addr, n, d);
+     float *pa = (float *)(d + o2), *pg = (float *)(d + o1);
+     const float oldA = pa[0], oldB = pa[1], oldG = *pg;
+-    pa[0] = g_m73p.A; pa[1] = g_m73p.B; *pg = g_m73p.gain;
++    const float gain_final = g_m73p.gain * g_m74p.gainmul;   // M74A：在 M73A 的 gain 之上再乘（默认 1 = 不变）
++    pa[0] = g_m73p.A; pa[1] = g_m73p.B; *pg = gain_final;
+     if (g_m73p.c40 > 0.f && c4ok) { float *pc = (float *)(d + o2 + 24); pc[0] = g_m73p.c40; pc[1] = g_m73p.c41; }
++    /* M74A：luma = clamp(dot(col.rgba, c0[0..3]), 0, 1)。c0 就是这份银行的头 4 个 float（M70A 实测 (2.98912, 5.86610, 1.14478, −2)，
++       与 c1 的 100/0/0.06/10000 相邻）⇒ 缩 c0 只改 luma 项，t² 项与 col 都不动。先按实测值定位，不符再扫前 512 B。 */
++    const float kL = g_m74p.klum, kO = g_m74p.koff;
++    if (kL != 1.f || kO != 1.f) {
++        int o0 = -1;
++        if (m71a_near(f[0], 2.98912f) && m71a_near(f[1], 5.86610f) && m71a_near(f[2], 1.14478f) && m71a_near(f[3], -2.f)) o0 = 0;
++        else for (int i = 0; i + 3 < (int)(nread / 4) && i < 128; i++)
++            if (m71a_near(f[i], 2.98912f) && m71a_near(f[i + 1], 5.86610f) && m71a_near(f[i + 2], 1.14478f) && m71a_near(f[i + 3], -2.f)) { o0 = i * 4; break; }
++        if (o0 >= 0) {
++            float *p0 = (float *)(d + o0);
++            const float b0 = p0[0], b1 = p0[1], b2 = p0[2], b3 = p0[3];
++            p0[0] = b0 * kL; p0[1] = b1 * kL; p0[2] = b2 * kL; p0[3] = b3 * kO;
++            if (g_m74a_lines < 16) { g_m74a_lines++;
++                VKLOG("[m74a-luma] pass 71 FS %016llx bank=%#llx+%llu c0+%d: (%g %g %g %g) -> (%g %g %g %g) [x%g on rgb, x%g on the -2 offset] — luma = clamp(dot(col.rgba,c0),0,1); the t^2 term, col and every other pass are untouched",
++                      (unsigned long long)M71A_FOG_FS, (unsigned long long)u->addr, (unsigned long long)u->size, o0,
++                      (double)b0, (double)b1, (double)b2, (double)b3, (double)p0[0], (double)p0[1], (double)p0[2], (double)p0[3], (double)kL, (double)kO); }
++        } else if (g_m74a_lines < 16) { g_m74a_lines++;
++            VKLOG("[m74a-miss] pass 71 bank=%#llx: the c0 pattern (2.98912 5.86610 1.14478 -2) is not in the first 512 B; luma untouched (head floats %g %g %g %g)",
++                  (unsigned long long)u->addr, (double)f[0], (double)f[1], (double)f[2], (double)f[3]); }
++    }
+     bi->buffer = sb; bi->offset = so; bi->range = n;
+     if (g_m73a_lines < 64) { g_m73a_lines++;
+         VKLOG("[m73a-ubo] pass 71 FS %016llx bank=%#llx+%llu n=%llu: gain c1[2]+%d %g->%g, A c2[2]+%d %g->%g, B c2[3]+%d %g->%g, c4[0/1]+%d %s (c4 usable=%d) — this draw reads a patched copy; VS and every other pass untouched",
+               (unsigned long long)M71A_FOG_FS, (unsigned long long)u->addr, (unsigned long long)u->size, (unsigned long long)n,
+-              o1, (double)oldG, (double)g_m73p.gain, o2, (double)oldA, (double)g_m73p.A, o2 + 4, (double)oldB, (double)g_m73p.B,
++              o1, (double)oldG, (double)gain_final, o2, (double)oldA, (double)g_m73p.A, o2 + 4, (double)oldB, (double)g_m73p.B,
+               o2 + 24, g_m73p.c40 > 0.f ? (c4ok ? "patched" : "WANTED but pattern off") : "game's", c4ok); }
+     if (g_m73a_lines < 64 && g_m73p.c40 > 0.f && c4ok) { g_m73a_lines++;
+         VKLOG("[m73a-c4] pass 71 FS %016llx: c4[0] %g->%g, c4[1] %g->%g (the hyperbolic inversion is now 1/(1-d*c4[0])*c4[1], then A/B above)",
+--- nvn_vk2/rec/m48a_probe.c
++++ nvn_vk2/rec/m48a_probe.c
+@@ -104,9 +104,14 @@
+        bit2(4) = 线性视距插值 clamp((z−50)/750)；bit3(8) = 取消饱和 t=0.30·f；bit4(16) = bit1 + 增益 0.045；bit5(32) = 只压增益 0.045。
+        字符串 smo_m73a_p = "A B gain [c4_0 c4_1]" 覆盖前三/五项（同一 build 里细扫 fog_near/far）。默认 0 = 零日志零行为变化；2 s 热切。 */
+     "smo_m73a",
+-    "smo_m73a_p"
++    "smo_m73a_p",
++    /* M74A：smo_m74a → DM_VK_M74A（**本单的行为开关**：pass 71 的 luma 通道 + 末级累加归一化）。bit0(1) = luma×0.5（只缩 c0[0..2]）；
++       bit1(2) = luma×0.25；bit2(4) = luma=0（探边界，不许当选）；bit3(8) = 增益 1/8（gainmul=0.125）；bit4(16) = 末级（25×14）输出×0.55；
++       bit5(32) = luma 整体等比×0.5（连 −2 偏置一起缩）。字符串 smo_m74a_p = "klum [koff [gainmul [bc]]]" 覆盖数值。默认 0 = 零日志零行为变化；2 s 热切。 */
++    "smo_m74a",
++    "smo_m74a_p"
+ };
+-enum { K_MASTER, K_RB10, K_FMT10, K_PD, K_SRGB, K_SWZLOG, K_RBPOOL, K_PDSKIP, K_TRACEPASS, K_UBOPASS, K_WATCH, K_SHPASS, K_PDDEPTH, K_M55A, K_M56A, K_M57A, K_M59A, K_M64A, K_M66A, K_M67A, K_M69A, K_M70A, K_M70AP, K_M70AO, K_M71A, K_M72A, K_M73A, K_M73AP, K_N };
++enum { K_MASTER, K_RB10, K_FMT10, K_PD, K_SRGB, K_SWZLOG, K_RBPOOL, K_PDSKIP, K_TRACEPASS, K_UBOPASS, K_WATCH, K_SHPASS, K_PDDEPTH, K_M55A, K_M56A, K_M57A, K_M59A, K_M64A, K_M66A, K_M67A, K_M69A, K_M70A, K_M70AP, K_M70AO, K_M71A, K_M72A, K_M73A, K_M73AP, K_M74A, K_M74AP, K_N };
+ 
+ /* 每个开关一份 2 s 缓存：读 B 视图优先，退 A 视图。 */
+ int m48a_knob(int i)
+@@ -286,6 +291,15 @@
+       if (m71 != m71_state) { m71_state = m71; char b[16]; snprintf(b, sizeof b, "%d", m71 > 0 ? m71 : 0); setenv("DM_VK_M71A", b, 1);
+           vk_boot_logf("[m71a] knob %s (DM_VK_M71A=%s: c2[2]/2 %s, c1[2]/2 %s, both %s, last-stage compress %s, depth histogram %s)", m71 > 0 ? "on" : "off", b,
+                        (m71 & 1) ? "on" : "off", (m71 & 2) ? "on" : "off", (m71 & 4) ? "on" : "off", (m71 & 8) ? "on" : "off", (m71 & 16) ? "on" : "off"); } }
++    /* M74A：smo_m74a → DM_VK_M74A（pass 71 的 luma 通道 c0 + 末级累加归一化；默认 0 = 零日志、零分配、零行为变化）。
++       字符串 smo_m74a_p → DM_VK_M74A_P = "klum [koff [gainmul [bc]]]"，非空即覆盖预设（同一 build 里细扫）。 */
++    { static int m74_state = -2; int m74 = m48a_knob(K_M74A);
++      char ps[48]; m48a_knob_str(K_M74AP, ps, sizeof ps); static char ps_raw[48];
++      if (m74 != m74_state || strcmp(ps, ps_raw)) {
++          m74_state = m74; char b[16]; snprintf(b, sizeof b, "%d", m74 > 0 ? m74 : 0); setenv("DM_VK_M74A", b, 1);
++          if (strcmp(ps, ps_raw)) { snprintf(ps_raw, sizeof ps_raw, "%s", ps); setenv("DM_VK_M74A_P", ps, 1); }
++          vk_boot_logf("[m74a] knob DM_VK_M74A=%s override=\"%s\" (luma x0.5 %s, x0.25 %s, luma=0 %s, gain/8 %s, last-level bc %s, luma even x0.5 %s)",
++                       b, ps, (m74 & 1) ? "on" : "off", (m74 & 2) ? "on" : "off", (m74 & 4) ? "on" : "off", (m74 & 8) ? "on" : "off", (m74 & 16) ? "on" : "off", (m74 & 32) ? "on" : "off"); } }
+     /* M73A：smo_m73a → DM_VK_M73A（pass 71 的 z→视距换算式/UBO 常量；默认 0 = 零日志、零分配、零行为变化）。
+        另有字符串 smo_m73a_p → DM_VK_M73A_P = "A B gain [c4_0 c4_1]"，非空即覆盖预设（同一 build 里细扫 fog_near/far）。 */
+     { static int m73_state = -2; int m73 = m48a_knob(K_M73A);

@@ -1,0 +1,27 @@
+--- entry/src/main/cpp/host/threads.c	2026-10-31 22:51:05
++++ /Users/zpp/VibeCoding/ns-mario-odessy-to-harmony/mario-odessy-harmony/entry/src/main/cpp/host/threads.c	2026-10-31 23:27:42
+@@ -297,6 +297,12 @@
+ #ifdef __MUSL__
+     t->htid = (int)syscall(__NR_gettid);
+ #endif
++    {   /* emu3 定谳：采样器 pthread_kill(SIGUSR2) 全超时 + SigBlk 含 bit12 = 客体线程继承了创建者
++           （appspawn 主线程）的屏蔽掩码。SIGUSR2 同时是 CORE_PREEMPT_SIGNAL（核抢占），屏蔽它
++           也会让核抢占静默失效。客体线程出生即解除继承屏蔽（信号 handler 进程级已注册）。 */
++        sigset_t us; sigemptyset(&us); sigaddset(&us, SIGUSR2);
++        pthread_sigmask(SIG_UNBLOCK, &us, NULL);
++    }
+     {   /* round3：客体线程装独立信号栈——SIGUSR2 采样 handler 若落在客体栈上，SP 贴保护页的
+            深递归线程一压栈即 SEGV_ACCERR（emu_round3 第二次崩溃，0x6e03a47ffc 即栈保护区）。
+            16KiB 备用栈随线程泄漏（取证构建可接受），SA_ONSTACK 已在 spin_sampler_start 注册。 */
+@@ -892,6 +898,11 @@
+ }
+ void runtime_event_signal(uint32_t hw) {
+     pthread_mutex_lock(&G); event_t *e = h_get(hw, O_EVENT_W); if (!e) die("service event handle %#x", hw);
++    /* evlog 可观测性（round5）：宿主服务侧的 signal 一直只在 SVC 0x11 路径入环，audio renderer 每帧
++       （5ms）经此处无条件触发（audio_renderer.c render_thread），环里却看不到——被误读成「evlog 无 signal
++       = 无信号源」。此处入环后 dump 环常驻 signal 条目（renderer 写端 0x1021 与游戏等的读端同一 event_t、
++       refs=2，可互证信号源活着）。runtime_describe_address（loader.c）不取 G，持 G 调用安全。 */
++    evlog(EVLOG_SIGNAL, hw, 0, (uint64_t)(uintptr_t)__builtin_return_address(0));
+     e->signaled = 1; wake_sync_waiters(); pthread_mutex_unlock(&G);
+ }
+ 

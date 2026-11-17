@@ -1,0 +1,476 @@
+--- mario-odessy-harmony/entry/src/main/cpp/platform/loader.c
++++ mario-odessy-harmony/entry/src/main/cpp/platform/loader.c
+@@ -23,12 +23,20 @@
+ #include "runtime_tables.h"
+ #include "game_patches.h"
+ #include "game_version.h"
++#include "m126a_probe.h"   /* M126A（2026-11-14）：RX 探针 / seal 明文取证 / smo_exec_mmap 变体 */
+ void smo_obs_rx_range(uint64_t *lo, uint64_t *hi);   /* round9b：E-gate 尾部 stub 页的 RX 区间（game_patches.c；未安装时 hi=0） */
+ /* M115A（2026-11-14）：门/seal 的 mprotect RX 失败取证 + 非致命开关（都定义在 games/…/game_patches.c，
+    同属 libgame.so；loader.c 沿用 smo_obs_rx_range 同款 extern 声明方式，不动公共头）。 */
+ int smo_obs_gate_fatal(void);                                                     /* 0（缺省）=非致命 / 1=旧致命 */
+ int smo_obs_page_owner(uint64_t addr, char *out, size_t outn);                     /* /proc/self/maps 归属行或 "maps=none" */
+ #define NM (sizeof(modules)/sizeof(modules[0]))
++/* M126A（2026-11-14）：smo_exec_mmap=1 的簿记（只在 knob=1 时有非零值；knob=0 逐字节走 build #7 路径）。
++   g_m126a_exec_live[i] = 第 i 个模块是用「文件背衬 + 创建即 R|W|X」映射成功装进来的
++   ⇒ seal() 只做「降权」（去掉 W），失败也不等于拿不到执行权；check_permissions 接受权限超集。 */
++static unsigned char g_m126a_exec_live[NM];
++static int g_m126a_exec_fallback;   /* 映射创建失败、回落旧路径的模块数 */
++static int g_m126a_demote_fail;     /* 降权 mprotect 失败次数（页仍是 RWX，可执行） */
++static int g_m126a_perms_logged;    /* 权限超集日志上限（8 行） */
+ pthread_key_t runtime_keys[8];
+ static uint64_t timer_calls, svc_calls;
+ _Noreturn void runtime_fail(const char *message) { runtime_svc_context_line("[totk] FAIL svc ctx: "); fprintf(stderr,"[totk] FAIL: %s\n",message); fflush(stderr); usleep(50000); exit(1); }   /* round9：FAIL 前先 write(2) 落笔在飞 SVC（runtime_svc+5104 即 svc 0x26 Break→本函数）；usleep：等 stderr→hilog 转发线程把 FAIL 行送出（OHOS）再退 */
+@@ -197,8 +205,39 @@
+  /* The main module gets one private, writable page after its rewritten image. The
+     real-time frame-step patch reads its two floats from this page via ADRP. */
+  m->size=page_up(m->file_size)+(!strcmp(m->name,"main")?0x4000:0);
+- m->base=mmap(NULL,m->size,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0);
+- need(m->base!=MAP_FAILED,"map module");need(fread(m->base,1,m->file_size,f)==m->file_size,"read image");fclose(f);
++ /* M126A（2026-11-14）：smo_exec_mmap=1 ⇒ 走「文件背衬 MAP_PRIVATE + 映射创建即带 PROT_EXEC」。
++    真机上「先 RW 再 mprotect(RX)」这一跳一律 EINVAL，所以本变体让 X 在 mmap 那一刻就有；
++    重定位/补丁/门 veneer 都发生在 seal() 之前、需要写这些页 ⇒ 创建权限必须同时含 PROT_WRITE，
++    由 seal() 再把 W 降掉（降不掉也仍是 RWX、仍可执行，见 seal() 里的 M126A 分支）。
++    尾部处理：文件只覆盖到 page_up(file_size)（按真实页大小对齐；末尾不足一页的字节由内核零填），
++    再往后的 [maplen, m->size)（main 的 0x4000 私有页）落在一块**先整块 anon RW 预留**的区域里
++    ⇒ 不会 SIGBUS。任一步失败 ⇒ errno 记进日志、整块回落 build #7 的 anon RW + fread（fallback=1）。 */
++ void *m126a_res=NULL;   /* knob=1 时的 anon 预留区（成功=文件映射的地基；失败=fread 的落点） */
++ if(m126a_exec_mmap_on()){
++  static size_t m126a_ps;   /* 只用于把文件长度对齐到真实页大小（4 KiB），不是模块布局用的 16 KiB */
++  if(!m126a_ps){long v=sysconf(_SC_PAGESIZE);m126a_ps=v>0?(size_t)v:4096u;}
++  const size_t maplen=(m->file_size+m126a_ps-1)&~(m126a_ps-1);
++  int e=0;
++  m126a_res=mmap(NULL,m->size,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0);
++  if(m126a_res==MAP_FAILED){e=errno;m126a_res=NULL;}
++  else{
++   void *fb=mmap(m126a_res,maplen,PROT_READ|PROT_WRITE|PROT_EXEC,MAP_PRIVATE|MAP_FIXED,fileno(f),0);
++   if(fb==MAP_FAILED){e=errno;}   /* 预留区仍是干净的 anon RW，下面 fread 直接用它 */
++   else{m->base=m126a_res;g_m126a_exec_live[m-modules]=1;
++    m126a_execmap_note(m->name,path,(uint64_t)(uintptr_t)fb,(uint64_t)maplen,
++                       (unsigned)(PROT_READ|PROT_WRITE|PROT_EXEC),1,0,0,(uint64_t)(uintptr_t)m126a_res);}
++  }
++  if(!m->base){
++   g_m126a_exec_fallback++;
++   m126a_execmap_note(m->name,path,0,(uint64_t)m->size,(unsigned)(PROT_READ|PROT_WRITE|PROT_EXEC),0,e,1,
++                      (uint64_t)(uintptr_t)m126a_res);
++  }
++ }
++ if(!m->base&&m126a_res)m->base=m126a_res;                      /* 回落路径复用已建的 anon RW */
++ if(!m->base){m->base=mmap(NULL,m->size,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0);
++  need(m->base!=MAP_FAILED,"map module");}
++ if(!g_m126a_exec_live[m-modules])need(fread(m->base,1,m->file_size,f)==m->file_size,"read image");
++ fclose(f);
+  unsigned char digest[32];CC_SHA256(m->base,(CC_LONG)m->file_size,digest);char hex[65];
+  for(unsigned i=0;i<32;i++)snprintf(hex+i*2,3,"%02x",digest[i]);
+  need(!strcmp(hex,m->digest),"image SHA256 differs from verified rewrite");
+@@ -282,6 +321,10 @@
+  const int rc=mprotect(addr,len,PROT_READ|PROT_EXEC),e=errno,fatal=smo_obs_gate_fatal();
+  char owner[512];
+  smo_obs_page_owner((uint64_t)(uintptr_t)addr,owner,sizeof owner);
++ /* M126A（2026-11-14）：seal 的明文取证在**这一条路径（knob 全 0 = build #7 行为）**上也要有：
++    精确 (addr,len,prot) 十六进制 + mmap 返回值 + 失败时该窗口附近 /proc/self/maps ≤8 行。
++    （m115a 那一行只有 page/errno/maps 归属，prot 与 len 不可见，且不打 maps 窗口。） */
++ m126a_seal_args(what,(uint64_t)(uintptr_t)addr,(uint64_t)len,(unsigned)(PROT_READ|PROT_EXEC),rc,e,(uint64_t)(uintptr_t)m->base);
+  fprintf(stderr,"[m115a] seal %s RX %s: rc=%d errno=%d(%s) page=%p base=%p tail=%#zx seg_end=%#zx file_size=%#zx size=%#zx fatal=%d %s\n",
+          what,rc==0?"OK":"FAILED",rc,e,strerror(e),addr,(void *)m->base,
+          (size_t)((uint8_t *)addr-m->base),(size_t)((uintptr_t)m->base+m->size),
+@@ -289,6 +332,16 @@
+  if(rc!=0&&!fatal)g_m115a_seal_degraded=1;
+  return rc;
+ }
++/* M126A（2026-11-14）：smo_exec_mmap=1 且本模块是「文件背衬 + 创建即 R|W|X」装进来的 ⇒ seal() 里每个
++   mprotect 都只是**降权**（去掉 W / 去掉多余权限）：失败不致命——页仍是 RWX、仍可执行，这恰恰是本变体
++   要在「mprotect(W→X) 一律 EINVAL」的设备上拿到的东西。每次调用打一行 [m126a] seal（addr/len/prot 全
++   十六进制 + rc/errno + mmap 返回值），失败立即 dump 该窗口附近 /proc/self/maps ≤8 行。 */
++static void m126a_soft_protect(Module *m, void *addr, size_t len, int prot, const char *what) {
++ errno=0;
++ const int rc=mprotect(addr,len,prot),e=errno;
++ m126a_seal_args(what,(uint64_t)(uintptr_t)addr,(uint64_t)len,(unsigned)prot,rc,e,(uint64_t)(uintptr_t)m->base);
++ if(rc!=0)g_m126a_demote_fail++;
++}
+ static void seal(Module *m) {
+  size_t rx=page_up(m->text_end),ro_end=m->data_off&~(size_t)0x3fff;
+  need(rx<=ro_end,"text/data overlap");
+@@ -298,6 +351,16 @@
+  return;
+ #endif
+  (void)smo_obs_gate_fatal();   /* M115A 读点 ②：早于本函数的两次 RX 尝试 */
++ {const int mi=(int)(m-modules);
++  if(mi>=0&&mi<(int)NM&&g_m126a_exec_live[mi]&&m126a_exec_mmap_on()){
++   const size_t patch_end=page_up(m->file_size);
++   m126a_soft_protect(m,m->base,rx,PROT_READ|PROT_EXEC,"text");
++   if(ro_end>rx)m126a_soft_protect(m,m->base+rx,ro_end-rx,PROT_READ,"rodata");
++   m126a_soft_protect(m,m->base+m->key_off,0x4000,PROT_READ,"key");
++   m126a_soft_protect(m,m->base+m->patch_off,patch_end-m->patch_off,PROT_READ|PROT_EXEC,"patch");
++   sys_icache_invalidate(m->base,rx);sys_icache_invalidate(m->base+m->patch_off,patch_end-m->patch_off);
++   return;
++  }}
+  if(m115a_seal_rx(m,m->base,rx,"text")!=0&&smo_obs_gate_fatal())runtime_fail("text RX");   /* =1：逐字恢复旧行为 */
+  if(ro_end>rx)need(mprotect(m->base+rx,ro_end-rx,PROT_READ)==0,"rodata R");
+  need(mprotect(m->base+m->key_off,0x4000,PROT_READ)==0,"key page R");
+@@ -322,6 +385,15 @@
+     (off<page_up(m->text_end)||off>=m->patch_off)?(VM_PROT_READ|VM_PROT_EXECUTE):
+     ((off>=page_up(m->text_end)&&off<(m->data_off&~0x3fffULL))||(off>=m->key_off&&off<m->key_off+0x4000ULL))?VM_PROT_READ:(VM_PROT_READ|VM_PROT_WRITE);
+    if(info.protection!=expected){
++    /* M126A（2026-11-14）：smo_exec_mmap=1 且本模块是文件背衬「创建即 X」⇒ 页可能是 RWX（降权没成功）
++       或仍是 RX。这里接受**权限超集**（actual 覆盖 expected）并记一行：执行权来自 mmap 创建那一刻，
++       不是运行期 mprotect 给的。knob=0 时这段不可达（g_m126a_exec_live 全 0）。 */
++    {const int mi=(int)(m-modules);
++     if(mi>=0&&mi<(int)NM&&g_m126a_exec_live[mi]&&m126a_exec_mmap_on()&&
++        (((unsigned)info.protection&(unsigned)expected)==(unsigned)expected)){
++      if(g_m126a_perms_logged<8){g_m126a_perms_logged++;fprintf(stderr,"[m126a] seal degraded: perms superset %s off=%#llx region=[%#llx,%#llx) prot=%u expected=%u (execmap live: 执行权来自映射创建, non-fatal)\n",m->name,(unsigned long long)off,(unsigned long long)a,(unsigned long long)(a+size),(unsigned)info.protection,(unsigned)expected);}
++      continue;
++     }}
+     /* M115A：seal 的 RX 已被系统拒绝（g_m115a_seal_degraded 只在这种情况置位）⇒ 这里的期望值必然
+        对不上。smo_obs_gate_fatal=0（缺省）时降级成日志（前 8 页，够看清实际 prot），不再 exit(1)，
+        否则"非致命"在下一步照样死，knob 等于没开。=1 时控制流与旧版逐字相同（runtime_fail）。 */
+@@ -797,6 +869,8 @@
+  signal(SIGABRT,SIG_DFL);raise(SIGABRT);
+ }
+ int main(int argc,char **argv) {
++ m126a_rxprobe_early();   /* M126A：same once-guard as the constructor(101) call —— 正常路径上它已经在
++                             vk_boot.c:vk_boot_init() 第一行跑过；这里只是保证「构造器没跑」时也不丢证据。 */
+  need(argc==3,"usage: totk-native rewritten-dir probe|boot");
+  /* One game or GPU probe at a time (memory, GPU time): wait for the slot before anything is loaded. */
+  if(!strcmp(argv[2],"boot")||!strncmp(argv[2],"probe-gpu",9))runtime_game_slot_acquire(argv[2]);
+@@ -824,6 +898,7 @@
+ #endif
+  verify_identity(!strcmp(argv[2],"probe-identity-negative"));
+  for(unsigned i=0;i<NM;i++){seal(&modules[i]);check_permissions(&modules[i]);}
++ if(m126a_exec_mmap_on())m126a_execmap_summary(g_m126a_exec_fallback,g_m126a_demote_fail);   /* M126A 收口行（knob=0 不打） */
+  if(!strcmp(argv[2],"probe-gpu-pool-retire")||!strcmp(argv[2],"probe-gpu-tex-slots")||!strcmp(argv[2],"probe-gpu-arg-epoch")||!strcmp(argv[2],"probe-gpu-anomaly")||!strcmp(argv[2],"probe-gpu-vertex-streams")||!strcmp(argv[2],"probe-gpu-layer-merge")||!strcmp(argv[2],"probe-gpu-cube-merge")||!strcmp(argv[2],"probe-gpu-texture-retire")||!strcmp(argv[2],"probe-gpu-linear-rt")||!strcmp(argv[2],"probe-gpu-storage-view")||!strcmp(argv[2],"probe-gpu-compressed-alias")||!strcmp(argv[2],"probe-gpu-upload-batch")||!strcmp(argv[2],"probe-gpu-ds-clear")||!strcmp(argv[2],"probe-gpu-ub-rename")||!strcmp(argv[2],"probe-gpu-ubo-snapshot")||!strcmp(argv[2],"probe-gpu-drv-c0")||!strcmp(argv[2],"probe-gpu-dispatch-chain")||!strcmp(argv[2],"probe-gpu-copy-alias")||!strcmp(argv[2],"probe-gpu-srgb-view")||!strcmp(argv[2],"probe-gpu-depth-output"))runtime_gpu_path_probe(argv[2]);else if(!strcmp(argv[2],"probe-memory"))runtime_memory_probe();else if(!strcmp(argv[2],"probe-gfx"))runtime_gfx_probe(0);else if(!strcmp(argv[2],"probe-vpool"))runtime_vpool_probe();else if(!strcmp(argv[2],"probe-gpu-widen")||!strcmp(argv[2],"probe-gpu-blockrt")||!strcmp(argv[2],"probe-gpu-midclear")||!strcmp(argv[2],"probe-gpu-winding")||!strcmp(argv[2],"probe-gpu-tile"))runtime_gpu_path_probe(argv[2]);else if(!strcmp(argv[2],"probe-audio"))runtime_audio_probe();else if(!strcmp(argv[2],"probe-gfx-negative"))runtime_gfx_probe(1);else if(!strcmp(argv[2],"probe"))probe();else if(!strcmp(argv[2],"probe-fs"))runtime_fs_probe();else if(!strcmp(argv[2],"probe-swkbd"))runtime_swkbd_probe();else if(!strcmp(argv[2],"probe-save"))runtime_save_probe();else if(!strcmp(argv[2],"boot")){if(getenv("TOTK_HEADLESS"))boot();else runtime_front_run(boot);}else runtime_fail("unknown mode");return 0;
+ }
+ 
+--- mario-odessy-harmony/entry/src/main/cpp/platform/vk_boot.c
++++ mario-odessy-harmony/entry/src/main/cpp/platform/vk_boot.c
+@@ -27,6 +27,7 @@
+ #include <pthread.h>
+ #include <hilog/log.h>
+ #include "vk_boot.h"
++#include "m126a_probe.h"   /* M126A：RX 权限判决探针（极早，见 vk_boot_init 第一行） */
+ 
+ /* M3b：诊断行一律走 hilog。此前全用 fprintf(stderr)，实测 boot 抓包里 [vk-boot] 一行都看不到
+  * （stderr 未进 hilog 环形缓冲），"setenv 没生效"的判断缺证据。tag 与 nvn_vk.c 同款 SmoVK，
+@@ -1090,6 +1091,13 @@
+ 
+ int vk_boot_init(void)
+ {
++    /* M126A（2026-11-14）：RX 权限判决探针的极早插入点。
++       本函数是 libgame.so 的 constructor(101) 入口（先于 applet_host/system_services 等默认优先级
++       constructor，更先于 nvn_vk.c 的 vk_boot_log_open@nvn_vk.c:1894 与 loader 的 map_module/seal
++       ≈3 s），所以这行是整个进程里第一条我们自己的代码：探针在这里跑，崩溃（首条 guest 指令，
++       ≈4 s 后）之前一定已经落笔。函数内部自己先 vk_boot_log_open()，不依赖本函数下面任何初始化。 */
++    m126a_rxprobe_early();
++
+     /* 1) dladdr 拿本模块（libgame.so）自身路径 → 推出 libs 目录（不硬编码安装路径） */
+     Dl_info info;
+     if (!dladdr((void *)&vk_boot_init, &info) || !info.dli_fname) {
+--- /dev/null	2026-11-14 21:33:35
++++ mario-odessy-harmony/entry/src/main/cpp/platform/m126a_probe.c
+@@ -0,0 +1,256 @@
++/* m126a_probe.c — M126A（2026-11-14）RX 权限判决探针 + seal() 明文取证 + 直接 exec mmap 变体的日志端。
++ *
++ * 本单要一刀切开的分歧（M125A 已钉死：同一 md5 的 #5 也崩、重启+清 swap 后 #7 仍崩、证书到 2049）：
++ *   整个进程拿不到可执行页（设备/签名策略）
++ *   vs 只有「我们 patch 出来的匿名页」拿不到（背衬/映射方式/时机）。
++ * 所以这里跑一个 5 格矩阵（每格一行，都在 shader/loader 初始化之前）：
++ *   anon        : mmap(anon RW, 2 页) → 写一字节 → mprotect(RX)      = seal() 对 patch/text 页做的事
++ *   anon-create : mmap(anon R|X) 创建即带 X
++ *   file        : mmap(libgame.so 只读页) → mprotect(RX)
++ *   file-rw     : mmap(libgame.so, R|W MAP_PRIVATE) → mprotect(RX)   = 最贴近 seal 的 W→X
++ *   file-create : mmap(libgame.so, R|X MAP_PRIVATE) 创建即带 X       = smo_exec_mmap=1 用的写法
++ * verdict 一行把五格答案并列，报告里直接引用。
++ *
++ * 为什么这一行一定能在崩溃前打出来：本函数的第一条语句就是 vk_boot_log_open()（vk_boot.c，幂等），
++ * 之后每行都是 fprintf(stderr) + vk_boot_logf（后者每行 fflush），与崩溃点（首条 guest 指令，
++ * 4 s 后）之间有数秒余量；调用点是 vk_boot.c 的 constructor(101) 第一行（早于 Vulkan/ICD、
++ * 早于 nvn_vk.c 的 vk_boot_log_open@1894、早于 loader 的 map_module/seal）。
++ *
++ * 两个 knob（app 自己先建文件，hdc 只能覆盖已有文件）：
++ *   smo_rxprobe   缺省 1：开启即打印；写 0 ⇒ 除 seed 行外一条探针行都不打（判据 5 关态口径）。
++ *   smo_exec_mmap 缺省 0：=1 ⇒ map_module 用「文件背衬 + 创建即 R|W|X」，失败回落 build #7 旧路径。
++ */
++#include "m126a_probe.h"
++
++#include <dlfcn.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++extern int vk_boot_log_open(void);       /* vk_boot.c：幂等；打开 /data/storage/el2/base/files/vk_boot.log */
++extern void vk_boot_logf(const char *fmt, ...);
++
++#define M126A_KNOB_RX_A "/data/storage/el2/base/files/smo_rxprobe"
++#define M126A_KNOB_RX_B "/data/app/el2/100/base/com.vibecc.smo/files/smo_rxprobe"
++#define M126A_KNOB_EX_A "/data/storage/el2/base/files/smo_exec_mmap"
++#define M126A_KNOB_EX_B "/data/app/el2/100/base/com.vibecc.smo/files/smo_exec_mmap"
++
++static int g_m126a_rxprobe = -2;    /* -2 = 未读；0/1 = 已读并缓存 */
++static int g_m126a_execmmap = -2;
++
++static size_t m126a_page(void)
++{
++    long ps = sysconf(_SC_PAGESIZE);
++    return ps > 0 ? (size_t)ps : 4096u;
++}
++
++/* stderr（hilog 转发）+ vk_boot.log 双写；第一条语句先保证日志文件已开。
++   format(printf) 属性 ⇒ 每个 % 与实参的匹配由 clang 在编译期核对（本单的探针行正是靠它防 M99A 那类事故）。 */
++__attribute__((format(printf, 1, 2)))
++static void m126a_emit(const char *fmt, ...)
++{
++    char buf[1024];
++    va_list ap;
++    va_start(ap, fmt);
++    vsnprintf(buf, sizeof buf, fmt, ap);
++    va_end(ap);
++    fprintf(stderr, "%s\n", buf);
++    fflush(stderr);
++    (void)vk_boot_log_open();
++    vk_boot_logf("%s", buf);
++}
++
++/* /proc/self/maps 里包含 addr 的那一行的 perms（找不到 = maps=none）。 */
++static void m126a_perms_for(uint64_t addr, char *out, size_t n)
++{
++    FILE *f = fopen("/proc/self/maps", "r");
++    snprintf(out, n, "maps=none");
++    if (!f) return;
++    char line[512];
++    while (fgets(line, sizeof line, f)) {
++        unsigned long long s = 0, e = 0;
++        char perms[8] = { 0 };
++        if (sscanf(line, "%llx-%llx %7s", &s, &e, perms) != 3) continue;
++        if (addr >= (uint64_t)s && addr < (uint64_t)e) { snprintf(out, n, "perms=%s", perms); break; }
++    }
++    fclose(f);
++}
++
++int m126a_rxprobe_on(void);
++int m126a_exec_mmap_on(void);
++
++static int m126a_knob(const char *path_a, const char *path_b, int dflt, const char *name)
++{
++    const char *p[2] = { path_a, path_b };
++    int v = dflt, have = 0;
++    for (int i = 0; i < 2 && !have; i++) {
++        FILE *f = fopen(p[i], "r");
++        if (!f) continue;
++        char b[16] = { 0 };
++        size_t n = fread(b, 1, sizeof b - 1, f);
++        fclose(f);
++        have = 1;
++        v = (n > 0 && b[0] == '1') ? 1 : 0;
++    }
++    if (!have) { FILE *f = fopen(path_a, "w"); if (f) { fputs(dflt ? "1\n" : "0\n", f); fclose(f); } }   /* hdc 只能覆盖已有文件 ⇒ app 先建 */
++    m126a_emit("[m126a] %s=%d (%s) file=[%s]", name, v, v == 1 ? "ON" : "OFF", path_a);
++    return v;
++}
++
++int m126a_rxprobe_on(void)
++{
++    if (g_m126a_rxprobe == -2) g_m126a_rxprobe = m126a_knob(M126A_KNOB_RX_A, M126A_KNOB_RX_B, 1, "smo_rxprobe");
++    return g_m126a_rxprobe == 1;
++}
++
++int m126a_exec_mmap_on(void)
++{
++    if (g_m126a_execmmap == -2) g_m126a_execmmap = m126a_knob(M126A_KNOB_EX_A, M126A_KNOB_EX_B, 0, "smo_exec_mmap");
++    return g_m126a_execmmap == 1;
++}
++
++/* 文件背衬的一格：prot 是 mmap 时的权限；do_mprotect=1 时再看 mprotect(RX) 能不能成功。
++   返回 1 = 这一格最终拿到可执行页。 */
++static int m126a_file_try(const char *tag, const char *path, int fd, size_t len, unsigned prot, int do_mprotect)
++{
++    char perms[64] = "maps=none";
++    errno = 0;
++    void *p = mmap(NULL, len, (int)prot, MAP_PRIVATE, fd, 0);
++    int e = errno;
++    if (p == MAP_FAILED) {
++        m126a_emit("[m126a] rxprobe %s ok=0 path=%s len=0x%zx prot=0x%x errno=%d(%s) stage=mmap",
++                   tag, path, len, prot, e, strerror(e));
++        return 0;
++    }
++    int rc = 0;
++    if (do_mprotect) {
++        errno = 0;
++        rc = mprotect(p, len, PROT_READ | PROT_EXEC);
++        e = errno;
++    }
++    int ok = do_mprotect ? (rc == 0) : 1;
++    m126a_perms_for((uint64_t)(uintptr_t)p, perms, sizeof perms);
++    m126a_emit("[m126a] rxprobe %s ok=%d path=%s addr=0x%llx len=0x%zx prot=0x%x errno=%d(%s) rc=%d %s",
++               tag, ok, path, (unsigned long long)(uintptr_t)p, len,
++               do_mprotect ? (unsigned)(PROT_READ | PROT_EXEC) : prot, e, strerror(e), rc, perms);
++    munmap(p, len);
++    return ok;
++}
++
++void m126a_rxprobe_early(void)
++{
++    static int done;
++    if (done) return;
++    done = 1;
++    (void)vk_boot_log_open();                 /* 最早打开取证文件：探针绝不因「stderr 被丢/日志未开」而丢 */
++    if (!m126a_rxprobe_on()) return;
++    const size_t len = 2 * m126a_page();      /* 2 页 */
++    int anon_ok = 0, anon_create_ok = 0, file_ok = 0, file_rw_ok = 0, file_create_ok = 0;
++
++    /* ① 匿名 RW → mprotect RX：与 seal() 对 patch/text 页做的事完全同型（页先被写过，再 W→X） */
++    {
++        errno = 0;
++        void *p = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
++        int e = errno;
++        if (p == MAP_FAILED) {
++            m126a_emit("[m126a] rxprobe anon ok=0 addr=0x0 len=0x%zx errno=%d(%s) stage=mmap", len, e, strerror(e));
++        } else {
++            *(volatile unsigned char *)p = 0x5a;   /* 先把页碰实（seal 的页在 RW 阶段也都被写过） */
++            char perms[64];
++            errno = 0;
++            int rc = mprotect(p, len, PROT_READ | PROT_EXEC);
++            e = errno;
++            m126a_perms_for((uint64_t)(uintptr_t)p, perms, sizeof perms);
++            anon_ok = (rc == 0);
++            m126a_emit("[m126a] rxprobe anon ok=%d addr=0x%llx len=0x%zx errno=%d(%s) prot=0x5 rc=%d %s",
++                       anon_ok, (unsigned long long)(uintptr_t)p, len, e, strerror(e), rc, perms);
++            munmap(p, len);
++        }
++    }
++    /* ② 匿名「创建即带 X」 */
++    {
++        errno = 0;
++        void *p = mmap(NULL, len, PROT_READ | PROT_EXEC, MAP_PRIVATE | MAP_ANON, -1, 0);
++        int e = errno;
++        if (p != MAP_FAILED) { anon_create_ok = 1; munmap(p, len); }
++        m126a_emit("[m126a] rxprobe anon-create ok=%d len=0x%zx errno=%d(%s)", anon_create_ok, len, e, strerror(e));
++    }
++    /* ③④⑤ 文件背衬：拿本模块 libgame.so 自己的路径（dladdr，不硬编码安装路径） */
++    {
++        Dl_info di;
++        const char *path = NULL;
++        if (dladdr((void *)(uintptr_t)&m126a_rxprobe_early, &di) && di.dli_fname && di.dli_fname[0]) path = di.dli_fname;
++        errno = 0;
++        int fd = path ? open(path, O_RDONLY) : -1;
++        int oe = errno;
++        if (fd < 0) {
++            m126a_emit("[m126a] rxprobe file ok=0 path=%s errno=%d(%s) stage=open", path ? path : "(null)", oe, strerror(oe));
++        } else {
++            m126a_emit("[m126a] rxprobe file path=%s (本模块 libgame.so 自身)", path);
++            file_ok = m126a_file_try("file", path, fd, len, PROT_READ, 1);                             /* 只读页 → RX */
++            file_rw_ok = m126a_file_try("file-rw", path, fd, len, PROT_READ | PROT_WRITE, 1);          /* 可写文件页 → RX */
++            file_create_ok = m126a_file_try("file-create", path, fd, len, PROT_READ | PROT_EXEC, 0);   /* 创建即 RX */
++            close(fd);
++        }
++    }
++    m126a_emit("[m126a] rxprobe verdict anon=%d anon_create=%d file=%d file_rw=%d file_create=%d knob=1 pid=%d",
++               anon_ok, anon_create_ok, file_ok, file_rw_ok, file_create_ok, (int)getpid());
++    m126a_emit("[m126a] rxprobe reading anon=1&&file_rw=1 => 进程能拿可执行页（问题在背衬/时机）；"
++               "anon=0&&file_create=0 => 设备/签名策略对本进程整体禁执行");
++}
++
++void m126a_seal_args(const char *what, uint64_t addr, uint64_t len, unsigned prot, int rc, int err, uint64_t mmap_base)
++{
++    if (!m126a_rxprobe_on()) return;
++    m126a_emit("[m126a] seal what=%s addr=0x%llx len=0x%llx prot=0x%x mmap=0x%llx rc=%d errno=%d(%s)%s",
++               what, (unsigned long long)addr, (unsigned long long)len, prot,
++               (unsigned long long)mmap_base, rc, err, strerror(err), rc == 0 ? "" : " -> maps dump");
++    if (rc != 0) m126a_maps_dump(what, addr, len);
++}
++
++void m126a_maps_dump(const char *tag, uint64_t addr, uint64_t len)
++{
++    FILE *f = fopen("/proc/self/maps", "r");
++    if (!f) { m126a_emit("[m126a] maps tag=%s open FAILED errno=%d(%s)", tag, errno, strerror(errno)); return; }
++    char line[512];
++    uint64_t end = addr + (len ? len : 1);
++    int hit = 0, printed = 0;
++    while (fgets(line, sizeof line, f)) {
++        unsigned long long s = 0, e = 0;
++        if (sscanf(line, "%llx-%llx", &s, &e) != 2) continue;
++        if ((uint64_t)s >= end || (uint64_t)e <= addr) continue;
++        hit++;
++        if (printed < 8) {
++            size_t n = strlen(line);
++            while (n && line[n - 1] == '\n') line[--n] = 0;
++            m126a_emit("[m126a] maps#%d %s", printed, line);
++            printed++;
++        }
++    }
++    fclose(f);
++    m126a_emit("[m126a] maps tag=%s addr=0x%llx len=0x%llx hit=%d printed=%d%s",
++               tag, (unsigned long long)addr, (unsigned long long)len, hit, printed,
++               hit > printed ? " (only first 8)" : "");
++}
++
++void m126a_execmap_summary(int fallback, int demote_fail)
++{
++    if (!m126a_rxprobe_on()) return;
++    m126a_emit("[m126a] execmap summary fallback=%d demote_fail=%d (fallback>0 => 文件背衬创建即 X 被拒，已回落 build #7 路径)",
++               fallback, demote_fail);
++}
++
++void m126a_execmap_note(const char *mod, const char *path, uint64_t base, uint64_t len,
++                        unsigned prot, int ok, int err, int fallback, uint64_t reserve)
++{
++    if (!m126a_rxprobe_on()) return;
++    m126a_emit("[m126a] execmap mod=%s ok=%d mmap=0x%llx reserve=0x%llx len=0x%llx prot=0x%x fallback=%d errno=%d(%s) path=%s",
++               mod, ok, (unsigned long long)base, (unsigned long long)reserve,
++               (unsigned long long)len, prot, fallback, err, strerror(err), path);
++}
+--- /dev/null	2026-11-14 21:33:35
++++ mario-odessy-harmony/entry/src/main/cpp/platform/m126a_probe.h
+@@ -0,0 +1,47 @@
++/* m126a_probe.h — M126A（2026-11-14）RX 权限判决探针 / seal 明文取证 / 直接 exec mmap 变体的公共声明。
++ *
++ * 只用 extern 声明（同 loader.c 里 smo_obs_rx_range / smo_obs_gate_fatal 的风格），
++ * 不把 knob 语义塞进任何公共头；实现全在 platform/m126a_probe.c（CMake 的
++ * CMake 的 platform 目录 .c 通配会自动收编，不需要改 CMakeLists）。
++ *
++ * 两个 knob（都是 app 自己先建文件，hdc 只能覆盖已有文件；缺省值写在文件里）：
++ *   smo_rxprobe   缺省 1：探针开启即打印；写 0 = 一条探针行都不打（判据 5 的关态口径）。
++ *   smo_exec_mmap 缺省 0：=1 时 map_module 改成「文件背衬 + 创建即 R|W|X」，失败回落 build #7 旧路径。
++ */
++#ifndef M126A_PROBE_H
++#define M126A_PROBE_H
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* knob 读点（一次性缓存；首次读会打一行 seed） */
++int m126a_rxprobe_on(void);
++int m126a_exec_mmap_on(void);
++
++/* 极早探针：anon RW→RX / anon 创建即 X / 文件背衬 R→RX / 文件背衬 RW→RX / 文件背衬创建即 X，
++   外加一行 verdict。整个进程只跑一次（内部 once 守卫），第一行就打开 vk_boot.log。 */
++void m126a_rxprobe_early(void);
++
++/* seal() 取证：mprotect 的精确入参（addr/len/prot 全十六进制）+ rc/errno + mmap 返回值；
++   rc != 0 时立即 dump 该窗口附近 /proc/self/maps（最多 8 行，另打命中总数）。 */
++void m126a_seal_args(const char *what, uint64_t addr, uint64_t len, unsigned prot,
++                     int rc, int err, uint64_t mmap_base);
++
++/* 任意窗口的 /proc/self/maps dump（最多 8 行）。 */
++void m126a_maps_dump(const char *tag, uint64_t addr, uint64_t len);
++
++/* smo_exec_mmap=1 的映射结果行：mod / path / mmap 返回值 / len / prot / ok / errno / fallback。 */
++void m126a_execmap_note(const char *mod, const char *path, uint64_t base, uint64_t len,
++                        unsigned prot, int ok, int err, int fallback, uint64_t reserve);
++
++/* smo_exec_mmap=1 的收口行：fallback 次数（映射创建失败回落旧路径）/ 降权失败次数。 */
++void m126a_execmap_summary(int fallback, int demote_fail);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* M126A_PROBE_H */

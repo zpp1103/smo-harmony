@@ -1,0 +1,184 @@
+--- entry/src/main/cpp/host/game_patches.c
++++ /Users/zpp/VibeCoding/ns-mario-odessy-to-harmony/mario-odessy-harmony/entry/src/main/cpp/host/game_patches.c
+@@ -6,6 +6,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <sys/mman.h>
+ 
+ /* Odyssey 1.3.0 / 1.4.1 (the same executables): the render size patches below (key 3). Each site is checked against the
+    original instruction before it is written, as CONTRIBUTING.md asks. Key 4 writes camera fields at the present instead
+@@ -192,11 +193,173 @@
+         fprintf(stderr, "[odyssey] 3D scene %ux%u (change %u)\n", now & 0xffff, now >> 16, changes);
+ }
+ 
++/* ===== round9 E-gates：纯观测门（零行为改动）=====
++ * E1 main+0x57f950（派发/舞台迭代函数入口——emu8 已证活锁主线程每周期走它：0x1D 链
++ *   sdk+0xd3f174←main+0x8af3b8←main+0x57f98c←…，0x57f98c 就在本函数体内）。
++ *   x0=容器；[x0+8]→{u32 count@+0, el* arr@+8}；逐元素 this=[el+0x10]，游戏随后对
++ *   this+0x58 发 SignalProcessWideKey。门在入口把 {el,this} 快照进静态缓冲——多读的
++ *   地址恰是被换出的第 4 条指令（ldr x8,[x0,#8]）之后游戏自己立刻要读的同一批地址
++ *   （count/arr/el/[el+0x10]，见 0x57f95c-0x57f97c 反汇编），不新增任何解引用面。
++ *   dump 时打表与 threads.c 的 pkey/pkey2 发 key 族对照，验证两族是否同一数组算出。
++ * E2a main+0x8aef34、E2b main+0x8af418（两个 stage 排空方法，收 MQ@+0x168 完成包）：
++ *   命中计数 + 末次 x0。pkey2 发 key 族 wait(0x1C)=0 + 本门 0 命中 ⇒ 该池消费者线程
++ *   从未运行；与 threads.c 的 CreateThread/StartThread 账本（svc 0x08/0x09）对照区分
++ *   「从未创建」与「创建失败」。
++ * 机制：入口 16 字节换成 veneer（ldr x17,#8; br x17; .quad stub），stub 落在 main 镜像
++ *   尾部保留页 [page_up(file_size), +0x4000)（本移植 frame-step 空置；loader.c "Main's
++ *   extra private page … stays plain zero-filled memory" 即此页）。stub 保存
++ *   x0-x7/x29/x30 → 调 C 观察器（无锁、无 I/O、无 libc 调用）→ 恢复 → 原样重放被换的
++ *   4 条出厂指令 → b 回入口+0x10。编码字全部经 scripts_round9b/gen_obs_stub.py 的
++ *   capstone 往返校验；安装时先逐一比对 4 条出厂指令字，不符即不装该门（fail-soft）。 */
++enum { SMO_OBS_E1 = 0, SMO_OBS_DRAIN_A = 1, SMO_OBS_DRAIN_B = 2, SMO_OBS_N = 3 };
++typedef struct { uint32_t off, gate; uint32_t word[4]; } smo_obs_site_t;
++static const smo_obs_site_t smo_obs_site[] = {
++    {0x57f950, SMO_OBS_E1,      {0xa9be4ff4, 0xa9017bfd, 0x910043fd, 0xf9400408}},   /* stp x20,x19; stp x29,x30; add x29,sp,#0x10; ldr x8,[x0,#8] */
++    {0x8aef34, SMO_OBS_DRAIN_A, {0xa9057bfd, 0x910143fd, 0x394c0008, 0xaa0103f5}},   /* stp x29,x30,[sp,#0x50]; add x29,sp,#0x50; ldrb w8,[x0,#0x300]; mov x21,x1 */
++    {0x8af418, SMO_OBS_DRAIN_B, {0xa9027bfd, 0x910083fd, 0x2a0103f3, 0xaa0003f4}},   /* stp x29,x30,[sp,#0x20]; add x29,sp,#0x20; mov w19,w1; mov x20,x0 */
++};
++#define SMO_OBS_E1_CAP 128
++static struct {
++    _Atomic uint64_t seq;                       /* 偶=稳定，奇=写入中（g_spin_cap 范式） */
++    _Atomic uint64_t hits; _Atomic uint64_t last_x0;
++    unsigned n, truncated; uint64_t obj, arr;
++    uint64_t el[SMO_OBS_E1_CAP], thiz[SMO_OBS_E1_CAP];
++} g_e1;
++static _Atomic uint64_t g_obs_hits[SMO_OBS_N], g_obs_x0[SMO_OBS_N];
++static uint64_t g_obs_rx_lo, g_obs_rx_hi;   /* 尾部 stub 页的 RX 区间（安装成功后填；check_permissions 查询） */
++/* 客体小栈上被 veneer 调进来的观察器：只做原子计数与定长拷贝，无锁/无 I/O/无 libc。
++   gate=x1（stub 里 movz 立即数），x0=入口原参。 */
++static void smo_obs_observer(uint64_t x0, uint64_t gate) {
++    if (gate >= SMO_OBS_N) return;
++    atomic_fetch_add_explicit(&g_obs_hits[gate], 1, memory_order_relaxed);
++    atomic_store_explicit(&g_obs_x0[gate], x0, memory_order_relaxed);
++    if (gate != SMO_OBS_E1) return;
++    /* 与随后游戏自己同一地址集合的读：hv=[x0+8]（指向 {u32 count@+0, el* arr@+8}），
++       再 count=[hv]、arr=[hv+8]、el=arr[i]、this=[el+0x10]（0x57f95c-0x57f97c 反汇编）。
++       hv/arr/el 护栏只挡明显非指针值（<2^32），此后每一读都是游戏下一步也要读的地址。 */
++    uint64_t hv = *(const volatile uint64_t *)(const void *)(uintptr_t)(x0 + 8);
++    if (hv < 0x100000000ULL) return;
++    const volatile uint64_t *hdr = (const volatile uint64_t *)(const void *)(uintptr_t)hv;
++    uint64_t h0 = hdr[0], arr = hdr[1];
++    if (arr < 0x100000000ULL) return;
++    unsigned n = (unsigned)(uint32_t)h0;
++    unsigned m = n > SMO_OBS_E1_CAP ? SMO_OBS_E1_CAP : n;
++    unsigned s = (unsigned)atomic_load_explicit(&g_e1.seq, memory_order_relaxed);
++    atomic_store_explicit(&g_e1.seq, s + 1, memory_order_relaxed);           /* 奇=写入中 */
++    g_e1.obj = x0; g_e1.arr = arr; g_e1.truncated = n > m ? n : 0; g_e1.n = m;
++    const volatile uint64_t *a = (const volatile uint64_t *)(const void *)(uintptr_t)arr;
++    for (unsigned i = 0; i < m; i++) {
++        uint64_t el = a[i], th = 0;
++        if (el > 0x10000) th = *(const volatile uint64_t *)(const void *)(uintptr_t)(el + 0x10);
++        g_e1.el[i] = el; g_e1.thiz[i] = th;
++    }
++    atomic_store_explicit(&g_e1.seq, s + 2, memory_order_relaxed);           /* 偶=稳定 */
++    atomic_fetch_add_explicit(&g_e1.hits, 1, memory_order_relaxed);
++    atomic_store_explicit(&g_e1.last_x0, x0, memory_order_relaxed);
++}
++/* stub 骨架字（gen_obs_stub.py capstone 校验过）：w0-w14 固定，w6 随 gate 变，
++   w15-w18=被换出的 4 条原指令，w19=b 入口+0x10（安装时算），w20/w21=.quad 观察器。
++   x18（合成 TCB，OHOS 载体方案）与 entry.S 的 runtime_gate 同样进栈保存。 */
++static const uint32_t smo_obs_prologue[15] = {
++    0xa9ba7bfd,   /* stp x29, x30, [sp, #-0x60]!      */
++    0xa90107e0,   /* stp x0, x1, [sp, #0x10]          */
++    0xa9020fe2,   /* stp x2, x3, [sp, #0x20]          */
++    0xa90317e4,   /* stp x4, x5, [sp, #0x30]          */
++    0xa9041fe6,   /* stp x6, x7, [sp, #0x40]          */
++    0xf9002bf2,   /* str x18, [sp, #0x50]             */
++    0,            /* movz x1, #<gate>（按门填）       */
++    0x580001b0,   /* ldr x16, #0x50 → w20 字面量      */
++    0xd63f0200,   /* blr x16                          */
++    0xf9402bf2,   /* ldr x18, [sp, #0x50]             */
++    0xa9441fe6,   /* ldp x6, x7, [sp, #0x40]          */
++    0xa94317e4,   /* ldp x4, x5, [sp, #0x30]          */
++    0xa9420fe2,   /* ldp x2, x3, [sp, #0x20]          */
++    0xa94107e0,   /* ldp x0, x1, [sp, #0x10]          */
++    0xa8c67bfd,   /* ldp x29, x30, [sp], #0x60        */
++};
++static void smo_obs_gates_install(const Module *m) {
++    if (strcmp(m->name, "main")) return;
++    uint64_t tail = (m->file_size + 0x3fff) & ~0x3fffULL;   /* main 的尾部保留页（loader.c:184 特批的 +0x4000） */
++    if (m->size < tail + 0x4000) { fprintf(stderr, "[odyssey] obs gates: no tail page (size=%#llx)\n", (unsigned long long)m->size); return; }
++    uint8_t *page = m->base + tail;
++    uint8_t *p = page + 0x100;
++    unsigned installed = 0;
++    for (size_t s = 0; s < sizeof smo_obs_site / sizeof *smo_obs_site; s++) {
++        const smo_obs_site_t *site = &smo_obs_site[s];
++        uint32_t have[4]; memcpy(have, m->base + site->off, sizeof have);
++        int ok = 1; for (int i = 0; i < 4; i++) ok &= have[i] == site->word[i];
++        if (!ok) {
++            fprintf(stderr, "[odyssey] obs gate %#x: found %08x %08x %08x %08x, expected the four shipped words — NOT installed\n",
++                    site->off, have[0], have[1], have[2], have[3]);
++            continue;
++        }
++        uint8_t *stub = p; p += 22 * 4;
++        uint32_t w[22];
++        memcpy(w, smo_obs_prologue, sizeof smo_obs_prologue);
++        w[6] = 0xd2800000u | ((uint32_t)site->gate << 5) | 1;                /* movz x1, #gate */
++        for (int i = 0; i < 4; i++) w[15 + i] = site->word[i];               /* 原样重放被换出的 4 条指令 */
++        int64_t branch = (int64_t)(m->base + site->off + 0x10) - (int64_t)(stub + 19 * 4);
++        if (branch < -(1 << 27) || branch >= (1 << 27) || branch & 3) {
++            fprintf(stderr, "[odyssey] obs gate %#x: branch out of range (%+#llx) — NOT installed\n", site->off, (long long)branch);
++            continue;
++        }
++        w[19] = 0x14000000u | (((uint64_t)branch >> 2) & 0x3ffffff);         /* b 入口+0x10 */
++        uint64_t fn = (uint64_t)(uintptr_t)&smo_obs_observer;
++        memcpy(w + 20, &fn, 8);                                             /* .quad 观察器地址 */
++        memcpy(stub, w, sizeof w);
++        uint32_t veneer[2] = {0x58000051, 0xd61f0220};                      /* ldr x17,#8; br x17（patch_scene_pick 同款） */
++        uint64_t target = (uint64_t)(uintptr_t)stub;
++        memcpy(m->base + site->off, veneer, 8);
++        memcpy(m->base + site->off + 8, &target, 8);
++        installed++;
++        fprintf(stderr, "[odyssey] obs gate main+%#x (id %u) installed, stub at main+%#llx\n",
++                site->off, site->gate, (unsigned long long)(uintptr_t)(stub - m->base));
++    }
++    if (!installed) return;
++    size_t used = (size_t)(p - page);
++    __builtin___clear_cache((char *)page, (char *)p);                       /* 新 stub 指令进 icache（文本侧 veneer 由 seal() 的 sys_icache_invalidate 覆盖） */
++    if (mprotect(page, 0x4000, PROT_READ | PROT_EXEC) != 0) {               /* 与 seal() 给补丁区的权限一致；check_permissions 经 smo_obs_rx_range 认得此页 */
++        fprintf(stderr, "[odyssey] obs gates: tail page mprotect RX FAILED (gates dead: veneer will fault)\n");
++        /* 装不上就把 veneer 撤掉：留一个跳进不可执行页的 veneer 必崩，回退到原指令才安全 */
++        for (size_t s = 0; s < sizeof smo_obs_site / sizeof *smo_obs_site; s++) {
++            const smo_obs_site_t *site = &smo_obs_site[s];
++            uint32_t have[4]; memcpy(have, m->base + site->off, sizeof have);
++            int ok = 1; for (int i = 0; i < 4; i++) ok &= have[i] == site->word[i];
++            if (ok) continue;   /* 没装上这门（字不符或分支越界），veneer 也没写 */
++            uint32_t veneer[2] = {0x58000051, 0xd61f0220};
++            uint32_t now[2]; memcpy(now, m->base + site->off, sizeof now);
++            if (now[0] == veneer[0] && now[1] == veneer[1])
++                memcpy(m->base + site->off, site->word, sizeof site->word);   /* 原样写回 4 条出厂指令 */
++        }
++        return;
++    }
++    g_obs_rx_lo = (uint64_t)(uintptr_t)page; g_obs_rx_hi = g_obs_rx_lo + 0x4000;
++    fprintf(stderr, "[odyssey] obs gates: %u gate(s), tail page main+%#llx RX, %zu bytes used\n",
++            installed, (unsigned long long)tail, used);
++}
++/* ---- dump 侧访问器（threads.c 的 dump_threads 调；偶 seq 才返回数据） ---- */
++uint64_t smo_obs_hits(int gate) { return gate >= 0 && gate < SMO_OBS_N ? atomic_load_explicit(&g_obs_hits[gate], memory_order_relaxed) : 0; }
++uint64_t smo_obs_last_x0(int gate) { return gate >= 0 && gate < SMO_OBS_N ? atomic_load_explicit(&g_obs_x0[gate], memory_order_relaxed) : 0; }
++/* loader.c 的 check_permissions 用：尾部页里被本模块 mprotect 成 RX 的绝对地址区间
++   （未安装时 hi=0）。check_permissions 对 ≥page_up(file_size) 的页缺省期待 RW，
++   仅此区间期待 RX——权限巡检的「不期即报」语义保持不变。 */
++void smo_obs_rx_range(uint64_t *lo, uint64_t *hi) { *lo = g_obs_rx_lo; *hi = g_obs_rx_hi; }
++unsigned smo_obs_e1_snapshot(uint64_t *el, uint64_t *thiz, unsigned cap, uint64_t *obj, uint64_t *arr, unsigned *truncated) {
++    unsigned s0 = (unsigned)atomic_load_explicit(&g_e1.seq, memory_order_relaxed);
++    if (s0 & 1) return 0;                                                   /* 正在写：放弃本次（下一分钟 dump 再看） */
++    unsigned n = g_e1.n < cap ? g_e1.n : cap;
++    for (unsigned i = 0; i < n; i++) { el[i] = g_e1.el[i]; thiz[i] = g_e1.thiz[i]; }
++    if (obj) *obj = g_e1.obj; if (arr) *arr = g_e1.arr; if (truncated) *truncated = g_e1.truncated;
++    unsigned s1 = (unsigned)atomic_load_explicit(&g_e1.seq, memory_order_relaxed);
++    return s0 == s1 ? n : 0;                                                /* 读期间又写入：作废 */
++}
++
+ void runtime_game_patches(Module *main_module) {
+     patch_render_res(main_module);
+     if (g_render_w) { patch_scene_pick(main_module); patch_rt_pool(main_module); }
+     fprintf(stderr, "[odyssey] game patches: %s\n", g_render_w ? "docked render size, key 3 scene size" : "none");
+     odyssey_aspect_install(main_module);
++    smo_obs_gates_install(main_module);
+ }
+ void runtime_frame_step_pin(double ms) { (void)ms; }
+ void runtime_frame_step_update(uint64_t now_ns) { (void)now_ns; odyssey_aspect_present(); scene_log(); }   /* key 4, every present */

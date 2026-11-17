@@ -1,0 +1,16 @@
+diff --git a/mario-odessy-harmony/entry/src/main/cpp/host/game_patches.h b/mario-odessy-harmony/entry/src/main/cpp/host/game_patches.h
+index 10af940..679b8d8 100644
+--- a/mario-odessy-harmony/entry/src/main/cpp/host/game_patches.h
++++ b/mario-odessy-harmony/entry/src/main/cpp/host/game_patches.h
+@@ -4,3 +4,11 @@
+ /* TOTK version-specific game-code patches, applied to the loaded main module after relocation and before its text is sealed.
+    Every site is checked against the original instruction word first; a mismatch stops the boot. */
+ void runtime_game_patches(Module *main_module);
++
++/* round20 最小扰动构建开关（threads.c 与 game_patches.c 共用）。
++   0（本轮）＝编译关闭三个重探针：early1d_note（boot 前 10s 持全局锁 G 的 0x1D 键
++   全录账本——256 槽线性扫在锁内，boot 期扰动最大源）、KICK1 门挂的 kick 三条件快照
++   （[this+0xf9]/[this+0x20] 双读+首 16 环+6 边际计数）、BC310 first-16 唯一 x0 环
++   （45807 hits×CAS 去重）。保留轻量计数门：kick1/thunk1 双门(thunk2 双门同留，0 命中
++   零成本)/E1/E2/pkey+ct 账本。1＝恢复 round19 全量观测（下轮直接改回）。 */
++#define SMO_OBS_HEAVY 0

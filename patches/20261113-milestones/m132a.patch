@@ -1,0 +1,238 @@
+--- mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c
++++ mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c
+@@ -1268,6 +1268,115 @@
+     }
+     free(init);
+     return g_m40ac_state > 0 ? g_m40ac_cache : VK_NULL_HANDLE;
++}
++
++/* ============ M130A（2026-11-14）：建管线统一守卫（knob `smo_pso_guard`，缺省 0 = 关）============
++   动机（M128A boot#1，logs/m130a/nullhandle_chain.md）：pipe#1 在 vkCreateGraphicsPipelines 里崩，
++   sig=11 addr=0x110，符号在 libEGL_impl.so；而全部 4 个建管线点（N=5998/11429/18844/28274）在本函数
++   之前对入参 handle 一个都没判空 —— 空句柄进驱动 = 驱动内部空引用，我们拿不到栈，所以只能在**入口**
++   把空句柄拦住并落证（哪个 site、哪个字段、哪个 pso、哪条线程）。
++   守三条链：链1 renderPass（本函数 precheck）；链2 pSetLayouts 元素（N=11322）；链3 rv=OK 但 *ps=NULL（N=11434）。
++   关态（0）纪律：`m130a_guard_on()` 是**启动期一次性读好的 static int**，运行期只是一次 int 读
++   ⇒ 零日志、零 syscall、零 Vulkan 调用、零分支副作用；不改任何既有 knob 语义（smo_m40ac/smo_m40c 仍 0）。
++   为什么不做 2 s 热重读：守卫要判的是「启动后 ≈4 s 内的首个 pso」，热重读只会在**关态**给运行期多出
++   open()/read()（违背「关态零新增 syscall 面」）。真机 A/B 的做法是**起进程前**写好 knob ——
++   见 logs/m132a/report.md「真机 A/B 怎么跑」。 */
++#define M130A_SW_A   "/data/storage/el2/base/files/smo_pso_guard"
++#define M130A_SW_B   "/data/app/el2/100/base/com.vibecc.smo/files/smo_pso_guard"
++static int g_m130a_guard;        /* 0 = 关（缺省）：只在 constructor 里读文件；运行期不再 open */
++volatile int g_m130a_pipe_tid;   /* 正在建管线的线程 tid；loader.c 的 FAULT handler 用 weak extern 只读它 */
++
++/* 照抄 m40ac_seed：种 "0\n" + chmod 0666（hdc 是 uid=2000，只能覆盖**已存在**的 666 文件）。 */
++__attribute__((constructor)) static void m130a_seed(void)
++{
++    static const char *const p[2] = { M130A_SW_A, M130A_SW_B };
++    for (int i = 0; i < 2; i++) {
++        if (access(p[i], F_OK) == 0) { chmod(p[i], 0666); continue; }
++        int fd = open(p[i], O_CREAT | O_WRONLY | O_TRUNC, 0666);
++        if (fd >= 0) { ssize_t wr = write(fd, "0\n", 2); (void)wr; close(fd); chmod(p[i], 0666); }
++    }
++    /* 读一次（A→B 兜底）。只在 constructor 里做 ⇒ 建管线路径与崩溃 handler 上永远只有一次 int 读。 */
++    for (int i = 0; i < 2; i++) {
++        int fd = open(p[i], O_RDONLY);
++        if (fd < 0) continue;
++        char b[16]; ssize_t n = read(fd, b, sizeof b - 1); close(fd);
++        if (n <= 0) break;
++        b[n] = 0; g_m130a_guard = atoi(b) != 0; break;
++    }
++}
++static int m130a_guard_on(void)
++{
++    /* 开态只在**首次**使用时打一行（证明 knob 真的生效；关态连这个判断都不进 ⇒ 零日志，逐字节同 build #8）。 */
++    static int logged;
++    if (g_m130a_guard && !logged) {
++        logged = 1;
++        vk_boot_logf("[m130a] guard on=1 file=%s (precheck before vkCreateGraphicsPipelines; FAULT line carries tid)",
++                     M130A_SW_B);
++    }
++    return g_m130a_guard;
++}
++
++/* 与 m68b_tid 同款（真线程 id；musl 下 syscall(__NR_gettid)，非 musl 退 getpid）。 */
++static int m130a_tid(void)
++{
++#ifdef __MUSL__
++    return (int)syscall(__NR_gettid);
++#else
++    return (int)getpid();
++#endif
++}
++
++/* 固定格式（便于 grep / 后续自动化）：`[m130a] guard site=… field=… cnt=… pso=… tid=…` */
++static void m130a_guard_log(const char *site, const char *field, uint32_t cnt, const VkPipeline *ps)
++{
++    unsigned long long pv = 0;
++    if (ps) pv = (unsigned long long)(uintptr_t)*ps;
++    vk_boot_logf("[m130a] guard site=%s field=%s cnt=%u pso=%llu tid=%d", site, field, cnt, pv, m130a_tid());
++}
++
++/* 动态渲染例外：`pNext` 链上挂了 VkPipelineRenderingCreateInfo 时 renderPass 允许为空。
++   本移植当前**没有任何**动态渲染路径（全树无 VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO 的使用者；
++   mrt 分支的 gi.renderPass 走 g_r_rp_n/g_r_rp_dn，建不出来时上游已提前 return）⇒ 实际恒返回 0（空即拦），
++   留着只为将来接动态渲染时不误拦。上限 16 跳防环。 */
++static int m130a_dyn_render_ok(const VkGraphicsPipelineCreateInfo *g)
++{
++#ifdef VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO
++    const VkBaseInStructure *p = (const VkBaseInStructure *)g->pNext;
++    for (int i = 0; p && i < 16; i++) {
++        if (p->sType == VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO) return 1;
++        p = p->pNext;
++    }
++#else
++    (void)g;
++#endif
++    return 0;
++}
++
++/* 逐字段判空。返回 0 = 发现空句柄 ⇒ 调用方直接返回 VK_ERROR_INITIALIZATION_FAILED（空句柄不送驱动），
++   由既有 fallback（`*slot=VK_NULL_HANDLE` → color-only 变体 / 单附件回退）接住。
++   只拦「送进驱动就必然解引用」的字段；pDepthStencilState / pColorBlendState 允许为空
++   （动态渲染或 attachmentCount=0）⇒ 只记录不拦。 */
++static int m130a_pipe_precheck(const char *site, VkDevice dev, uint32_t cnt,
++                               const VkGraphicsPipelineCreateInfo *ci, VkPipeline *ps)
++{
++    if (!dev || !ci || !ps || !cnt) { m130a_guard_log(site, "dev/ci/ps/cnt", cnt, ps); return 0; }
++    for (uint32_t i = 0; i < cnt; i++) {
++        const VkGraphicsPipelineCreateInfo *g = &ci[i];
++        if (!g->layout) { m130a_guard_log(site, "layout", cnt, ps); return 0; }
++        if (!g->renderPass && !m130a_dyn_render_ok(g)) { m130a_guard_log(site, "renderPass", cnt, ps); return 0; }
++        if (!g->pStages || !g->stageCount) { m130a_guard_log(site, "pStages", cnt, ps); return 0; }
++        for (uint32_t s = 0; s < g->stageCount; s++) {
++            if (!g->pStages[s].module) { m130a_guard_log(site, "stage.module", cnt, ps); return 0; }
++            if (!g->pStages[s].pName)  { m130a_guard_log(site, "stage.pName", cnt, ps); return 0; }
++        }
++        if (!g->pVertexInputState || !g->pInputAssemblyState || !g->pViewportState ||
++            !g->pRasterizationState || !g->pMultisampleState) { m130a_guard_log(site, "state.*", cnt, ps); return 0; }
++        if (!g->pDepthStencilState || !g->pColorBlendState)
++            m130a_guard_log(site, (!g->pDepthStencilState && !g->pColorBlendState) ? "ds+cb-allowed"
++                                 : (!g->pDepthStencilState ? "ds-allowed" : "cb-allowed"), cnt, ps);
++    }
++    if (*ps != VK_NULL_HANDLE) m130a_guard_log(site, "*ps!=null (stale)", cnt, ps);   /* 出参脏值：只记不拦 */
++    return 1;
+ }
+ 
+ /* 4 处创建的唯一入口：开态才加锁+带 cache；关态走原样调用（逐字节旧行为）。
+@@ -1277,6 +1386,10 @@
+ static VkResult m40ac_create_pipe(VkDevice dev, uint32_t cnt, const VkGraphicsPipelineCreateInfo *ci,
+                                  const VkAllocationCallbacks *ac, VkPipeline *ps)
+ {
++    /* M130A（2026-11-14）：入口统一判空。关态（smo_pso_guard=0）⇒ 短路，不进 precheck、不碰任何 Vulkan 调用；
++       开态发现空句柄 ⇒ 一律不送驱动，直接返回失败，让既有 fallback 接住（链 1：renderPass 等）。 */
++    if (m130a_guard_on() && !m130a_pipe_precheck("m40ac_create_pipe", dev, cnt, ci, ps))
++        return VK_ERROR_INITIALIZATION_FAILED;
+     VkPipelineCache c = m40ac_cache_get();
+     int ser = smo_m40ai_lock();
+     struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
+@@ -11320,6 +11433,13 @@
+ 
+     VkPipelineLayoutCreateInfo pl = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+     VkDescriptorSetLayout sl[2] = { kv->dsl, kf->dsl };
++    /* M130A（2026-11-14）链 2：pSetLayouts 的**元素**为空时 vkCreatePipelineLayout 拿到空句柄，
++       驱动侧 layout 里存 setLayout 表 ⇒ 同一形状的空指针解引用（紧接的 create pipeline 里爆）。
++       下面只查了 rv、从没查过 sl[] 元素；关态一行不执行（逐字节同 build #8）。 */
++    if (m130a_guard_on() && (!sl[0] || !sl[1])) {
++        m130a_guard_log("r_pipe_var.layout", (!sl[0] && !sl[1]) ? "dsl0+dsl1" : (sl[0] ? "dsl1" : "dsl0"), 2, NULL);
++        return VK_NULL_HANDLE;
++    }
+     pl.setLayoutCount = 2; pl.pSetLayouts = sl;
+     VkPipelineLayout layout = e->lay;   /* M4r P1：变体复用基础条目的 layout */
+     VkResult rv = VK_SUCCESS;
+@@ -11426,12 +11546,22 @@
+     {   /* M6t B: the one place SwiftShader translates SPIR-V and JITs a routine for this pipeline. */
+         unsigned long long t0 = pf_now_us();
+         atomic_fetch_add_explicit(&g_sh_pipe_new, 1ull, memory_order_relaxed);
++        /* M130A（2026-11-14）：建管线线程归属。崩在 create 里时这个值**不会**被清掉 ⇒ loader.c 的
++           FAULT 行能给出 on_pipe_thread=1（H1：驱动内部空引用）还是 0（H2：别的线程把进程打死）。
++           关态只在开态才 gettid()（关态零 syscall）；多出来的是两次 volatile int 写。 */
++        const int m130a_g = m130a_guard_on();
++        if (m130a_g) g_m130a_pipe_tid = m130a_tid();
+         rv = m40ac_create_pipe(g_dev, 1, &gi, NULL, slot);   /* M40AC：主表 444 条走持久化 pipeline cache */
++        if (m130a_g) g_m130a_pipe_tid = 0;
+         atomic_fetch_add_explicit(&g_sh_pipe_ms, pf_now_us() - t0, memory_order_relaxed);
+     }
+     j_mark(7, "create returned");
+     runtime_thread_note_op(25);   /* M5b：create 已返回；下一笔 SVC 会把它清 0，故冻结时看到 24 才算「卡在 create 里」 */
+     vk_boot_logf("[r] pipe ret rv=%d #%llu vs=%s fs=%s", (int)rv, g_r_pipe_ok + g_r_pipe_fail + 1, kv->key, kf->key);
++    /* M130A（2026-11-14）链 3：驱动违约 —— rv 说成功、出参句柄还是空。这种句柄一旦被
++       vkCmdBindPipeline 绑上去，同样落到空句柄面（且无任何日志）。关态一行不打。 */
++    if (m130a_guard_on() && rv == VK_SUCCESS && *slot == VK_NULL_HANDLE)
++        m130a_guard_log("r_pipe_var", "ret null-on-success", 1, slot);
+     if (rv != VK_SUCCESS) {
+         *slot = VK_NULL_HANDLE;
+         if (mrt_n) {   /* M119B：N 附件变体建失败 ⇒ 记 -1（不再反复撞）+ 回落单附件画（不整笔丢） */
+--- mario-odessy-harmony/entry/src/main/cpp/platform/loader.c
++++ mario-odessy-harmony/entry/src/main/cpp/platform/loader.c
+@@ -37,6 +37,52 @@
+ static int g_m126a_exec_fallback;   /* 映射创建失败、回落旧路径的模块数 */
+ static int g_m126a_demote_fail;     /* 降权 mprotect 失败次数（页仍是 RWX，可执行） */
+ static int g_m126a_perms_logged;    /* 权限超集日志上限（8 行） */
++/* ============ M130A（2026-11-14）：FAULT 行的线程归属（knob `smo_pso_guard`，缺省 0 = 关）============
++   要一刀切开的分歧（logs/m130a/fix_plan.md §4）：M128A `[j] pipe#1 step=6` 之后既没有 `j_mark(7,…)`
++   也没有 `[r] pipe ret rv=`，但「整进程被别的线程打死时，我们的线程同样看不到 return」⇒「没 return」
++   本身**不能**证明崩在建管线线程里。只有 tid 能判：
++     on_pipe_thread=1 ⇒ H1 崩在建管线线程（驱动内部空引用，链 1/2 方向成立）；
++     on_pipe_thread=0 ⇒ H2 崩在别的线程把进程连带打死，建管线无罪，下一轮要抓线程名。
++   纪律：handler 里**不许 open/read** —— m130a_fault_extra_on() 是 constructor 里读好的 static int
++   （handler 里只是一次 int 读）；gettid 走 syscall（async-signal-safe）；g_m130a_pipe_tid 是 weak extern
++   的 volatile int，只读一次。关态（smo_pso_guard=0）⇒ 这一行**一行都不打**，FAULT 段逐字节同 build #8。 */
++#define M130A_SW_A   "/data/storage/el2/base/files/smo_pso_guard"
++#define M130A_SW_B   "/data/app/el2/100/base/com.vibecc.smo/files/smo_pso_guard"
++/* 与 nvn_vk.c 同属 libgame.so：那边是**非 static 定义**，这边 weak 声明（同本文件 FAULT 段里
++   那些带 __attribute__((weak)) 的 extern 写法 —— 万一没编进来也只是取到 NULL，下面按 NULL 处理，
++   不解引用）。 */
++extern volatile int g_m130a_pipe_tid __attribute__((weak));
++static int g_m130a_fault_extra;   /* 1 = 打 [m130a] guard fault 行；只在 constructor 里读一次文件 */
++
++/* 与 nvn_vk.c:m130a_tid / m68b_tid 同款（musl 下 syscall(__NR_gettid)；非 musl 退 getpid）。 */
++static int m130a_tid(void)
++{
++#ifdef __MUSL__
++    return (int)syscall(__NR_gettid);
++#else
++    return (int)getpid();
++#endif
++}
++
++/* 启动期一次性种文件 + 读值（照 nvn_vk.c:m130a_seed：种 "0\n" + chmod 0666，hdc 只能覆盖已存在的
++   666 文件）。两个 TU 各自幂等地种，避免依赖同 DSO 内 constructor 的相对顺序。 */
++__attribute__((constructor)) static void m130a_fault_seed(void)
++{
++    static const char *const p[2] = { M130A_SW_A, M130A_SW_B };
++    g_m130a_fault_extra = 0;
++    for (int i = 0; i < 2; i++) {
++        int fd = open(p[i], O_RDONLY);
++        if (fd < 0) {
++            fd = open(p[i], O_CREAT | O_WRONLY | O_TRUNC, 0666);
++            if (fd >= 0) { ssize_t wr = write(fd, "0\n", 2); (void)wr; close(fd); chmod(p[i], 0666); }
++            continue;
++        }
++        char b[16]; ssize_t n = read(fd, b, sizeof b - 1); close(fd);
++        if (n <= 0) break;
++        b[n] = 0; g_m130a_fault_extra = atoi(b) != 0; break;
++    }
++}
++static int m130a_fault_extra_on(void) { return g_m130a_fault_extra; }
+ pthread_key_t runtime_keys[8];
+ static uint64_t timer_calls, svc_calls;
+ _Noreturn void runtime_fail(const char *message) { runtime_svc_context_line("[totk] FAIL svc ctx: "); fprintf(stderr,"[totk] FAIL: %s\n",message); fflush(stderr); usleep(50000); exit(1); }   /* round9：FAIL 前先 write(2) 落笔在飞 SVC（runtime_svc+5104 即 svc 0x26 Break→本函数）；usleep：等 stderr→hilog 转发线程把 FAIL 行送出（OHOS）再退 */
+@@ -706,6 +752,16 @@
+     vk_boot_logf_try("[fx] FAULT mod pc=%s+%#llx lr=%s+%#llx",
+       (hp&&dp.dli_fname)?(np?np+1:dp.dli_fname):"?",(unsigned long long)(hp?(mc_img.pc-(uintptr_t)dp.dli_fbase):0),
+       (hl&&dl.dli_fname)?(nl?nl+1:dl.dli_fname):"?",(unsigned long long)(hl?(mc_img.lr-(uintptr_t)dl.dli_fbase):0));}
++   /* M130A（2026-11-14）：H1「驱动内部空引用」vs H2「别的线程打死进程」的唯一开关。
++      pipe_tid=0 且 on_pipe_thread=0 ⇒ 崩溃发生在我们的建管线窗口**之外**（create 已返回或还没进）。
++      handler 里只有 int 读 + syscall(__NR_gettid)，不 open/read、不解引用任何可能为空的指针。 */
++   if(m130a_fault_extra_on()){
++    const volatile int *m130a_pt=&g_m130a_pipe_tid;
++    const int m130a_ptd=m130a_pt?(int)*m130a_pt:0;
++    const int m130a_t=m130a_tid();
++    vk_boot_logf_try("[m130a] guard fault tid=%d pipe_tid=%d on_pipe_thread=%d",
++                     m130a_t,m130a_ptd,(int)(m130a_t==m130a_ptd));
++   }
+   }
+ #ifdef M44B_JITDUMP
+   /* M44B（2026-11-11）：崩溃瞬间把 pc / lr 所在**代码页整页**落盘（诊断专用，只有 -DM44B_JITDUMP=1 才编）。

@@ -1,0 +1,166 @@
+--- entry/src/main/cpp/host/threads.c 2026-10-31 23:52:06
++++ /Users/zpp/VibeCoding/ns-mario-odessy-to-harmony/mario-odessy-harmony/entry/src/main/cpp/host/threads.c 2026-10-31 23:53:46
+@@ -475,12 +475,50 @@
+ void runtime_describe_address(uint64_t a, char *out, size_t n);   // 定义在诊断段（weak），此处前向声明
+ void runtime_watch_add(uintptr_t addr, size_t len, int read);   // gfx_bridge.c：客体地址 READ/WRITE watch（fault 打印 pc/lr/帧链；round3 自旋期取证用）
+ void spin_sampler_start(void);   // threads.c 诊断段：SIGUSR2 pc 链采样器（OHOS 上 mprotect watch 被 DFX 判死后的替代取证）
++
++/* ---------- round6 观测（只计数，dump 时输出；svc 热路径零 I/O——持 G 的 fprintf 即死，round3 四跑实证）----------
++   1) svc 0x34/0x35 裸计数：总数 + per-addr 前几名 + 0x35 调用者句柄。round47 dump 全程「0x35 零命中」
++      （活线程无一个以 0x35 收尾），下一轮 dump 直接给出调用总量 / 地址分布 / 释放者身份。
++      表与计数在两个 svc case 内、全程持 G 更新；dump 尾部放锁后无锁读（与 evlog/线程段同级取证风险）。
++   2) 事件账本 per-handle signal/reset 累计：evlog 环 64 槽被 0x1026（audio_device_handler 事件读端，
++      sdk+0xd3f084 每 5ms 一轮 reset，round3 三分钟 320 万条）淹没，尾部 16 条回放只见它——dump 时按
++      句柄打累计值表，环回放保留作最近时序。计数在 evlog() 内（该函数本就无锁写、竞态可接受）；
++      数组按句柄编号直接索引（与句柄表同为 MAX_H），游戏传入的坏句柄越界防护后不入账；
++      句柄编号会复用（CloseHandle 后同号可给别的事件），长时间运行后同号计数会合并——取证窗口（分钟级）内无碍。 */
++#define SIGADDR_TOP 16
++static struct { uint64_t addr, n34, n35; uint32_t caller; } g_sigaddr[SIGADDR_TOP];
++static unsigned g_sigaddr_n;
++static uint64_t g_ovf34, g_ovf35;
++static _Atomic uint64_t g_n34, g_n34_blk, g_n35, g_n35_woke, g_n35_bad;
++static _Atomic uint64_t g_evcnt[MAX_H][2];   /* [h-0x1000][0]=signal(svc 0x11 + 宿主服务侧) [1]=reset(svc 0x17) */
++/* 3) h=0x1023（round3 dump 画像：prio 28 音频工作线程，wait=4 等 0x101f 事件读端，nsvc ~700k/min）
++      醒来计数——svc 0x18 返回路径打点：0x101f 是否持续把它唤醒。持 G 更新，plain 计数。 */
++static uint64_t g_w1023_calls, g_w1023_wake, g_w1023_wake_101f;
++static void sigaddr_note(int is35, uint64_t addr, uint32_t caller) {   // 调用方持 G
++    if (is35) atomic_fetch_add_explicit(&g_n35, 1, memory_order_relaxed);
++    else      atomic_fetch_add_explicit(&g_n34, 1, memory_order_relaxed);
++    for (unsigned i = 0; i < g_sigaddr_n; i++) if (g_sigaddr[i].addr == addr) {
++        if (is35) { g_sigaddr[i].n35++; if (!g_sigaddr[i].caller) g_sigaddr[i].caller = caller; }   // 首位 0x35 调用者=释放者画像
++        else g_sigaddr[i].n34++;
++        return;
++    }
++    if (g_sigaddr_n < SIGADDR_TOP) {   // 首见地址入表（16 槽后计入溢出桶：客体地址型对象本就寥寥）
++        g_sigaddr[g_sigaddr_n].addr = addr; g_sigaddr[g_sigaddr_n].n34 = !is35; g_sigaddr[g_sigaddr_n].n35 = !!is35;
++        g_sigaddr[g_sigaddr_n].caller = is35 ? caller : 0; g_sigaddr_n++;
++        return;
++    }
++    if (is35) g_ovf35++; else g_ovf34++;
++}
+ static void evlog(uint32_t op, uint32_t h, uint32_t h2, uint64_t lr) {
+     char where[64]; runtime_describe_address(lr, where, sizeof where);
+     evlog_t *e = &g_evlog[g_evlog_head]; e->op = op; e->handle = h; e->extra = h2;
+     size_t k = strlen(where); if (k > sizeof e->who - 1) k = sizeof e->who - 1;
+     memcpy(e->who, where, k); e->who[k] = 0;
+     g_evlog_head = (g_evlog_head + 1) & 63; g_evlog_n++;
++    if (op == EVLOG_SIGNAL || op == EVLOG_RESET) {   // round6 账本：per-handle signal/reset 累计（环回放被 0x1026 洪流淹没后由此给全量分布）
++        unsigned hi = h - 0x1000;
++        if (hi > 0 && hi < MAX_H) atomic_fetch_add_explicit(&g_evcnt[hi][op == EVLOG_RESET], 1, memory_order_relaxed);   // 无符号回绕的坏句柄自然被挡
++    }
+ }
+ 
+ int svc_thread(int num, uint64_t *regs) {
+@@ -625,6 +663,7 @@
+     case 0x34: {  // WaitForAddress(x0 地址, w1 类型, w2 值, x3 超时)：0 小于则等、1 小于则减一再等、2 相等则等 | WaitForAddress(x0 address, w1 type, w2 value, x3 timeout): 0 wait if less than, 1 decrement if less than then wait, 2 wait if equal
+         thr_t *t = cur(); uint64_t addr = regs[0]; int type = (int)regs[1]; int32_t val = (int32_t)regs[2];
+         pthread_mutex_lock(&G);
++        sigaddr_note(0, addr, t->handle);   // round6 观测：0x34 配对计数（总数+per-addr；持 G、零 I/O）
+         int64_t r; uint32_t v = ld32(addr);
+         int ok = type == 2 ? (int32_t)v == val : (int32_t)v < val;
+         if (ok && type == 1) { while (!cas32(addr, &v, v - 1)) if (!((int32_t)v < val)) { ok = 0; break; } }
+@@ -646,6 +685,7 @@
+ #ifndef __MUSL__
+             {static unsigned fi34;if(fi34++<3)fprintf(stderr,"[F-I] WaitAddr block h=%#x addr=%#llx type=%d want=%d cur=%d tmo=%lld\n",t->handle,(unsigned long long)addr,type,val,(int32_t)v,(long long)(int64_t)regs[3]);}
+ #endif
++            atomic_fetch_add_explicit(&g_n34_blk, 1, memory_order_relaxed);   // round6：真挂上等待的 0x34（与总数差=立即 BAD_STATE 返回）
+             r = block(t, 3, (int64_t)regs[3]); }
+         pthread_mutex_unlock(&G);
+         regs[0] = (uint64_t)r; return 1;
+@@ -653,6 +693,7 @@
+     case 0x35: {  // SignalToAddress(x0 地址, w1 类型, w2 值, w3 个数)：0 唤醒、1 相等则加一并唤醒、2 相等则按等待数改值并唤醒 | SignalToAddress(x0 address, w1 type, w2 value, w3 count): 0 wake, 1 increment if equal and wake, 2 if equal modify the value by waiter count and wake
+         uint64_t addr = regs[0]; int type = (int)regs[1]; int32_t val = (int32_t)regs[2]; int cnt = (int)regs[3];
+         pthread_mutex_lock(&G);
++        { thr_t *me = me_or_null(); sigaddr_note(1, addr, me ? me->handle : 0); }   // round6 观测：0x35 裸计数+调用者句柄（释放者画像）
+         int nw = 0; for (thr_t *w = g_wait; w; w = w->next) if (w->wkind == 3 && w->waddr == addr) nw++;
+         int64_t r = 0;
+         if (type != 0) {
+@@ -669,6 +710,8 @@
+         int n = 0;
+         if (!r)
+             for (thr_t *w; (cnt <= 0 || n < cnt) && (w = pick(3, addr)); n++) wake(w, 0);
++        atomic_fetch_add_explicit(&g_n35_woke, (uint64_t)n, memory_order_relaxed);   // round6：累计实际唤醒的等待者数（waiters≠0 而 woke=0=没人等它）
++        if (r) atomic_fetch_add_explicit(&g_n35_bad, 1, memory_order_relaxed);   // round6：CAS 失败（R_BAD_STATE，值不符）
+         /* round48 submit-chain 取证（F-I）配套：屏障释放侧。0x35 全程 0 次出现在 round47 dump 的
+            last_svc 里（活线程无一个以 0x35 收尾）——若下一轮仍 0 命中即证明屏障从未被游戏释放，
+            堵点在「释放者没跑到」而非本宿主 svc 语义；命中则给出 waiters/woke 对照。 */
+@@ -707,6 +750,7 @@
+         if(n<0||n>64||(!hs&&n)){regs[0]=R_BAD_STATE;return 1;}
+         int64_t deadline = ns > 0 ? (dm_detclock_enabled() ? (int64_t)guest_ns() : now_mono_ns()) + ns : 0;
+         pthread_mutex_lock(&G);
++        if (t->handle == 0x1023u) g_w1023_calls++;   // round6 观测（任务3）：0x1023 的 svc 0x18 调用总数
+         t->nwh = n; for (int i = 0; i < n && i < 4; i++) t->wh[i] = hs[i];
+         /* F-H 取证（round48 补齐轮）：等待句柄含 0x1003（装载器 SystemEvent 读端；两轮日志已证恒为它）
+            → 用等待者传入的事件对象地址（=SDK WaitSystemEvent 的句柄数组 hs）反推装载器基址
+@@ -787,6 +831,10 @@
+             if (ns > 0 && left <= 0) { r = R_TIMEOUT; break; }
+             if (block(t, 4, left) == R_TIMEOUT) { r = R_TIMEOUT; break; }
+         }
++        if (t->handle == 0x1023u && idx >= 0) {   // round6 观测（任务3）：0x101f wait 返回路径——0x1023 醒来计数（谁把它唤醒）
++            g_w1023_wake++;
++            if (idx < n && hs && hs[idx] == 0x101fu) g_w1023_wake_101f++;   // 被目标事件 0x101f 唤醒（vs 其它句柄）
++        }
+         pthread_mutex_unlock(&G);
+         regs[0] = (uint64_t)r; regs[1] = idx >= 0 ? (uint64_t)idx : 0; return 1;
+     }
+@@ -1035,8 +1083,60 @@
+         fprintf(stderr, "[totk-dump] ev#%u %s h=%#x", k, opn, e->handle);
+         if (e->extra) fprintf(stderr, " h2=%#x", e->extra);
+         fprintf(stderr, " who=%s\n", e->who);
++      }
++    }
++    /* round6 观测（任务2）：事件账本 per-handle signal/reset 累计表（自启动起全量，每次 dump 都报全量）。
++       上方环回放被 0x1026 洪流淹没（round3：320 万条/3 分钟，尾部 16 条只见它）时，这里给出全量分布：
++       谁在被反复 signal/reset、各多少次。signal 列含宿主服务侧（runtime_event_signal，audio renderer）。
++       选择在本地副本上做，全局计数不清零。 */
++    { struct { uint32_t h; uint64_t s, r; } top[256]; unsigned nt = 0;
++      uint64_t tsig = 0, trst = 0;
++      for (unsigned i = 1; i < MAX_H && nt < 256; i++) {
++          uint64_t s = atomic_load(&g_evcnt[i][0]), rv = atomic_load(&g_evcnt[i][1]);
++          if (s || rv) { tsig += s; trst += rv; top[nt].h = 0x1000 + i; top[nt].s = s; top[nt].r = rv; nt++; }
+       }
++      fprintf(stderr, "[totk-dump] event svc per-handle ledger (cumulative): %u handle(s) signal=%llu reset=%llu%s:\n",
++              nt, (unsigned long long)tsig, (unsigned long long)trst, nt == 256 ? " (capped at 256)" : "");
++      for (int k = 0; k < 8; k++) {
++          int best = -1; uint64_t bv = 0;
++          for (unsigned i = 0; i < nt; i++) { uint64_t v = top[i].s + top[i].r; if (v > bv) { bv = v; best = (int)i; } }
++          if (best < 0) break;
++          fprintf(stderr, "[totk-dump] evc h=%#x signal=%llu reset=%llu\n", top[best].h,
++                  (unsigned long long)top[best].s, (unsigned long long)top[best].r);
++          top[best].s = top[best].r = 0;
++      }
+     }
++    /* round6 观测（任务1）：svc 0x34/0x35 裸计数——总数/真挂起/唤醒数/CAS 失败 + per-addr 前几名
++       （n35 降序、n34 并列）+ 0x35 调用者句柄。round47「0x35 零命中」之后，此表直接回答：
++       屏障有没有被释放过、谁在释放、0x34 的等待有没有配对的 0x35。表在 G 下更新、此处无锁读
++       （与上方线程段/环回放同级取证风险）。 */
++    { fprintf(stderr, "[totk-dump] svc 0x34 WaitForAddress: total=%llu blocked=%llu\n",
++              (unsigned long long)atomic_load(&g_n34), (unsigned long long)atomic_load(&g_n34_blk));
++      fprintf(stderr, "[totk-dump] svc 0x35 SignalToAddress: total=%llu woke=%llu bad-state=%llu\n",
++              (unsigned long long)atomic_load(&g_n35), (unsigned long long)atomic_load(&g_n35_woke),
++              (unsigned long long)atomic_load(&g_n35_bad));
++      unsigned done = 0;
++      for (int k = 0; k < 5; k++) {
++          int best = -1; uint64_t b35 = 0, b34 = 0;
++          for (unsigned i = 0; i < g_sigaddr_n && i < 32; i++) {
++              if ((done >> i) & 1u) continue;
++              uint64_t s35 = g_sigaddr[i].n35, s34 = g_sigaddr[i].n34;
++              if (s35 > b35 || (s35 == b35 && s34 > b34)) { b35 = s35; b34 = s34; best = (int)i; }
++          }
++          if (best < 0 || (!b35 && !b34)) break;
++          done |= 1u << best;
++          fprintf(stderr, "[totk-dump] sigaddr %#llx wait(0x34)=%llu sig(0x35)=%llu caller=h%#x\n",
++                  (unsigned long long)g_sigaddr[best].addr, (unsigned long long)g_sigaddr[best].n34,
++                  (unsigned long long)g_sigaddr[best].n35, g_sigaddr[best].caller);
++      }
++      if (g_ovf34 || g_ovf35)
++          fprintf(stderr, "[totk-dump] sigaddr overflow (beyond %d addrs): wait=%llu sig=%llu\n",
++                  SIGADDR_TOP, (unsigned long long)g_ovf34, (unsigned long long)g_ovf35);
++    }
++    /* round6 观测（任务3）：h=0x1023 的 svc 0x18 醒来计数——calls=进入等待次数，woken=被唤醒返回次数，
++       woken-by-0x101f=其中被目标事件 0x101f 唤醒的（woken 与之恒等差=被别的句柄或超时喂醒）。 */
++    fprintf(stderr, "[totk-dump] svc 0x18 h=0x1023 wakeups: calls=%llu woken=%llu woken-by-0x101f=%llu\n",
++            (unsigned long long)g_w1023_calls, (unsigned long long)g_w1023_wake, (unsigned long long)g_w1023_wake_101f);
+     /* TOTK_DUMP_AT=rva1,rva2,...：静态地址取证通道（round33）——对每个 main 模块 RVA 转储
+        该处 4 个 u64，像指针的值经 describe 符号化。客体数据段有效映射，直读安全。 */
+     {const char *e=getenv("TOTK_DUMP_AT");uint8_t *mb=e?runtime_module_base("main"):NULL;

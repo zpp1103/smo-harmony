@@ -1,0 +1,11 @@
+--- entry/src/main/cpp/host/gfx_bridge.c	2026-10-31 22:51:05
++++ /Users/zpp/VibeCoding/ns-mario-odessy-to-harmony/mario-odessy-harmony/entry/src/main/cpp/host/gfx_bridge.c	2026-10-31 23:28:04
+@@ -490,7 +490,7 @@
+  if(s){sync_h *y=s;y->fenced=3;y->fence=0;}   /* donor :2505：acquire sync"显示不再读该张"=立即成立（fenced bit1=acquire 类标记） */
+  {static unsigned n;if(n<4){n++;fprintf(stderr,"[nvn] WindowAcquireTexture -> idx=%d active=%d sync=%p\n",i,o->active,s);} }return 0;}   /* donor :2471：next%active 轮转、SUCCESS=0；无显示链不等待 */
+ static int nvn_queue_acquire_texture(void *q,void *w,int *idx){(void)q;int r=nvn_window_acquire_texture(w,0,idx);{static unsigned n;if(n<4){n++;fprintf(stderr,"[nvn] QueueAcquireTexture -> idx=%d ret=%d\n",idx?*idx:-1,r);} }return r;}   /* donor :2513（GAME_ODYSSEY 同款）转发窗口获取；此前空桩返 0 但不写 *idx——游戏读未初始化下标 */
+-static void nvn_queue_present_texture(void *q,void *w,int idx){(void)q;(void)w;g_nvn_presents++;{static unsigned n;if(n<4){n++;fprintf(stderr,"[nvn] QueuePresentTexture idx=%d present #%llu (no display; counted for watchdog)\n",idx,(unsigned long long)g_nvn_presents);} }}   /* donor :2909 出图计帧（g_frame++）；本宿主无显示链只记账 */
++static void nvn_queue_present_texture(void *q,void *w,int idx){(void)q;(void)w;g_nvn_presents++;runtime_watch_tick(g_nvn_presents);/* 内容 watch 的 present 打点（此前无调用点=死代码）；OHOS 上 watch_n 恒 0（runtime_watch_add 提前 return 仅留痕），tick 只走 env 初始化，log-only */{static unsigned n;if(n<4){n++;fprintf(stderr,"[nvn] QueuePresentTexture idx=%d present #%llu (no display; counted for watchdog)\n",idx,(unsigned long long)g_nvn_presents);} }}   /* donor :2909 出图计帧（g_frame++）；本宿主无显示链只记账 */
+ /* round48 方向=submit-chain 审计结论：四提交入口首用 0 次 + 全程 stub 普查（round47 dump 35 项）无任何
+    fence/sync/queue 状态查询被调 ⇒ 提交链从未被进入，:439-458 现有桩没有一个是堵点（没人问它们）；
+    堵点在上游装库状态机（F-H 打点对象，threads.c:663-713）。本块只补"链路一旦通电就会被问到"的

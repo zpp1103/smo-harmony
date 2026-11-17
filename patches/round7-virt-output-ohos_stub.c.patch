@@ -1,0 +1,200 @@
+--- entry/src/main/cpp/ohos_compat/ohos_stub.c	2026-10-31 18:10:08
++++ /Users/zpp/VibeCoding/ns-mario-odessy-to-harmony/mario-odessy-harmony/entry/src/main/cpp/ohos_compat/ohos_stub.c	2026-11-01 00:42:31
+@@ -1,4 +1,5 @@
+-// ohos_stub.c —— shim 契约的实现：SHA-256 真实现；AudioQueue/VT/CF 失败返回（周末接 OHOS 原生）
++// ohos_stub.c —— shim 契约的实现：SHA-256 真实现；AudioUnit=虚拟默认输出设备（round7 实装）；
++//                 AudioQueue/VT/CF 失败返回（周末接 OHOS 原生）
+ #include <AudioToolbox/AudioToolbox.h>
+ #include <CommonCrypto/CommonDigest.h>
+ #include <CoreFoundation/CoreFoundation.h>
+@@ -162,35 +163,180 @@
+     (void)pid; (void)flavor; (void)arg; (void)buffer; (void)buffersize; return 0;
+ }
+ 
+-// ---------- AudioUnit / AudioComponent：失败返回，audio_mixer 退化（周末 oh_audio 重写） ----------
++// ---------- AudioUnit / AudioComponent：虚拟默认输出设备（round7 实装，真模拟语义） ----------
++/* 语义：AudioComponentFindNext 对 kAudioUnitType_Output 返回哨兵组件（=设备表枚举到默认输出设备）；
++   AudioComponentInstanceNew 分配实例；AudioUnitSetProperty 记录 StreamFormat（audio_mixer.c:148 的
++   48kHz float 立体声）与 SetRenderCallback（:149 存 {pull,mixer}）；AudioOutputUnitStart 起 host 线程
++   每 512/rate 秒（48k≈10.67ms）以 512 帧立体声调存的回调——这就是虚拟声卡时钟：callback frames
++   心跳、prefill/underrun/主环形缓冲全部真活（pull 在 !playing/prefill/underrun 时本就 memset 静音帧，
++   audio_mixer.c:117/:123/:135，静音走既有路径；audio_mixer.c 设备路径零改动，unit_ok :155 自然置位）。
++   出口两条：有音频 HAL 的设备把帧送 OH_AudioRenderer（NDK libohaudio）——API20 SDK 无 push 式
++   OH_AudioRenderer_Write、只有回调式写端，故 ticker 产帧入二级小环（单生产单消费原子索引，与主环
++   同法）、HAL 写回调消费，饥饿喂零（声卡侧静音，不动 mixer 侧计量）；模拟器/无 HAL 丢弃（null sink）。
++   设备时钟独立于游戏线程、宁可静音不欠采样，与 Ryujinx SoundIoDevice / SDL audio device 同构。 */
++#include <pthread.h>
++#include <stdatomic.h>
++#include <errno.h>
++#include <ohaudio/native_audiostreambuilder.h>
++int pthread_setname_np(pthread_t, const char *);   /* musl _GNU_SOURCE 接口，显式原型防隐式 int（同下方 pthread_getattr_np 注） */
++
++struct OpaqueAudioComponent { unsigned present; };   /* 哨兵组件：默认输出设备存在 */
++static struct OpaqueAudioComponent au_default_output = {1};
++typedef OSStatus (*AURenderCb)(void *, AudioUnitRenderActionFlags *, const AudioTimeStamp *, UInt32, UInt32, AudioBufferList *);
++#define AU_PERIOD_FRAMES 512u
++#define AU_SINK_FRAMES 4096u
++struct OpaqueAudioComponentInstance {
++    AudioStreamBasicDescription fmt; AURenderCallbackStruct cb;   /* shim 布局 {input=回调, proc=ctx}（audio_mixer.c:149 {pull,m}） */
++    pthread_t thread; _Atomic int running; int started;
++    OH_AudioStreamBuilder *builder; OH_AudioRenderer *renderer;
++    _Atomic uint64_t srd, swr; float sink_ring[AU_SINK_FRAMES * 2];
++};
+ AudioComponent AudioComponentFindNext(AudioComponent inRef, const AudioComponentDescription *desc) {
+-    (void)inRef; (void)desc;
+-    fprintf(stderr, "[ohos-shim] AudioComponentFindNext -> not implemented (weekend: oh_audio)\n");
++    (void)inRef;
++    if (desc && desc->componentType == kAudioUnitType_Output) return &au_default_output;
+     return NULL;
+ }
+ OSStatus AudioComponentInstanceNew(AudioComponent comp, AudioComponentInstance *out) {
+-    (void)comp; if (out) *out = NULL; return kAudioComponentErr_InstanceInvalidated;
++    if (!comp || !out) return kAudioComponentErr_InstanceInvalidated;
++    *out = calloc(1, sizeof(struct OpaqueAudioComponentInstance));
++    if (!*out) return kAudioComponentErr_InstanceInvalidated;
++    return noErr;
+ }
+-OSStatus AudioComponentInstanceDispose(AudioComponentInstance inst) { (void)inst; return 0; }
+-OSStatus AudioUnitInitialize(AudioComponentInstance inst) { (void)inst; return kAudioUnitErr_InvalidProperty; }
++OSStatus AudioComponentInstanceDispose(AudioComponentInstance inst) {
++    if (!inst) return 0;
++    AudioOutputUnitStop(inst);
++    free(inst);
++    return 0;
++}
++OSStatus AudioUnitInitialize(AudioComponentInstance inst) { return inst ? noErr : kAudioUnitErr_InvalidProperty; }
+ OSStatus AudioUnitUninitialize(AudioComponentInstance inst) { (void)inst; return 0; }
+ OSStatus AudioUnitSetProperty(AudioComponentInstance inst, unsigned int propID, unsigned int scope,
+                               unsigned int element, const void *data, unsigned int dataSize) {
+-    (void)inst; (void)propID; (void)scope; (void)element; (void)data; (void)dataSize;
+-    return kAudioUnitErr_InvalidProperty;
++    (void)scope; (void)element;
++    struct OpaqueAudioComponentInstance *u = (struct OpaqueAudioComponentInstance *)inst;
++    if (!u || !data) return kAudioUnitErr_InvalidProperty;
++    if (propID == kAudioUnitProperty_StreamFormat && dataSize >= sizeof(AudioStreamBasicDescription)) {
++        u->fmt = *(const AudioStreamBasicDescription *)data; return noErr;
++    }
++    if (propID == kAudioUnitProperty_SetRenderCallback && dataSize >= sizeof(AURenderCallbackStruct)) {
++        u->cb = *(const AURenderCallbackStruct *)data; return noErr;
++    }
++    return noErr;   /* 其余属性 benign 接受（真 CoreAudio 常见成功面），不阻塞 setup 链 */
+ }
+ OSStatus AudioUnitGetProperty(AudioComponentInstance inst, unsigned int propID, unsigned int scope,
+                               unsigned int element, void *data, unsigned int *dataSize) {
+     (void)inst; (void)propID; (void)scope; (void)element; (void)data;
+     if (dataSize) *dataSize = 0;
+     return kAudioUnitErr_InvalidProperty;
++}
++/* ticker → 二级环 → HAL 写回调（null sink 即直接丢弃，mixer 侧计量不受影响） */
++static void au_sink_push(struct OpaqueAudioComponentInstance *u, const float *lr, UInt32 frames) {
++    if (!u->renderer) return;   /* 模拟器/无 HAL：null sink */
++    uint64_t wr = atomic_load_explicit(&u->swr, memory_order_relaxed);
++    uint64_t rd = atomic_load_explicit(&u->srd, memory_order_acquire);
++    if (wr + frames - rd > AU_SINK_FRAMES) { rd = wr + frames - AU_SINK_FRAMES; atomic_store_explicit(&u->srd, rd, memory_order_release); }   /* 溢出丢最旧 */
++    for (UInt32 i = 0; i < frames; i++) { uint64_t k = (wr + i) % AU_SINK_FRAMES; u->sink_ring[2 * k] = lr[2 * i]; u->sink_ring[2 * k + 1] = lr[2 * i + 1]; }
++    atomic_store_explicit(&u->swr, wr + frames, memory_order_release);
++}
++static OH_AudioData_Callback_Result au_hal_write(OH_AudioRenderer *renderer, void *userData,
++                                                 void *audioData, int32_t audioDataSize) {
++    (void)renderer;
++    struct OpaqueAudioComponentInstance *u = userData;
++    float *out = audioData;
++    if (!u || audioDataSize <= 0 || audioDataSize % (int32_t)(2 * sizeof(float))) {
++        memset(audioData, 0, audioDataSize > 0 ? (size_t)audioDataSize : 0);
++        return AUDIO_DATA_CALLBACK_RESULT_INVALID;
++    }
++    int32_t frames = audioDataSize / (int32_t)(2 * sizeof(float));
++    uint64_t rd = atomic_load_explicit(&u->srd, memory_order_acquire);
++    uint64_t wr = atomic_load_explicit(&u->swr, memory_order_acquire);
++    uint64_t have = wr - rd, n = (uint64_t)frames < have ? (uint64_t)frames : have;
++    for (uint64_t i = 0; i < n; i++) { uint64_t k = (rd + i) % AU_SINK_FRAMES; out[2 * i] = u->sink_ring[2 * k]; out[2 * i + 1] = u->sink_ring[2 * k + 1]; }
++    if (n < (uint64_t)frames) memset(out + 2 * n, 0, (size_t)(frames - n) * 2 * sizeof(float));   /* 二级环饥饿：声卡侧静音 */
++    atomic_store_explicit(&u->srd, rd + n, memory_order_release);
++    return AUDIO_DATA_CALLBACK_RESULT_VALID;
+ }
++static void au_sink_open(struct OpaqueAudioComponentInstance *u) {
++    OH_AudioStreamBuilder *b = NULL;
++    if (OH_AudioStreamBuilder_Create(&b, AUDIOSTREAM_TYPE_RENDERER) != AUDIOSTREAM_SUCCESS || !b) goto none;
++    int32_t rate = u->fmt.mSampleRate > 0 ? (int32_t)(u->fmt.mSampleRate + 0.5) : 48000;
++    OH_AudioStreamBuilder_SetSamplingRate(b, rate);
++    OH_AudioStreamBuilder_SetChannelCount(b, 2);   /* 主环/pull 固定立体声（audio_mixer.c:148） */
++    OH_AudioStreamBuilder_SetSampleFormat(b, AUDIOSTREAM_SAMPLE_F32LE);
++    OH_AudioStreamBuilder_SetLatencyMode(b, AUDIOSTREAM_LATENCY_MODE_FAST);
++    OH_AudioStreamBuilder_SetRendererInfo(b, AUDIOSTREAM_USAGE_GAME);
++    if (OH_AudioStreamBuilder_SetRendererWriteDataCallback(b, au_hal_write, u) != AUDIOSTREAM_SUCCESS) { OH_AudioStreamBuilder_Destroy(b); goto none; }
++    OH_AudioRenderer *r = NULL;
++    if (OH_AudioStreamBuilder_GenerateRenderer(b, &r) == AUDIOSTREAM_SUCCESS && r &&
++        OH_AudioRenderer_Start(r) == AUDIOSTREAM_SUCCESS) {
++        u->builder = b; u->renderer = r;
++        fprintf(stderr, "[ohos-audio] OHAudio renderer %d Hz stereo (game/fast)\n", rate);
++        return;
++    }
++    if (r) OH_AudioRenderer_Release(r);
++    OH_AudioStreamBuilder_Destroy(b);
++none:
++    fprintf(stderr, "[ohos-audio] no OHAudio output: null sink (emulator / no audio HAL)\n");
++}
++static void *au_ticker(void *arg) {
++    struct OpaqueAudioComponentInstance *u = arg;
++    pthread_setname_np(pthread_self(), "au-ticker");
++    double rate = u->fmt.mSampleRate > 0 ? u->fmt.mSampleRate : 48000.0;
++    uint64_t irate = rate >= 1 ? (uint64_t)(rate + 0.5) : 48000;
++    float *scratch = malloc(AU_PERIOD_FRAMES * 2 * sizeof(float));
++    if (!scratch) return NULL;
++    AudioBufferList io = {1, {{2, AU_PERIOD_FRAMES * 2 * (UInt32)sizeof(float), scratch}, {0, 0, NULL}}};
++    AURenderCb fn = (AURenderCb)u->cb.input;
++    struct timespec base; clock_gettime(CLOCK_MONOTONIC, &base);
++    uint64_t consumed = 0;   /* 分子=已回调帧数×1e9，有理数时钟：48000 帧精确 1 秒，无长期漂移 */
++    while (atomic_load_explicit(&u->running, memory_order_acquire)) {
++        consumed += (uint64_t)AU_PERIOD_FRAMES * 1000000000ull;
++        uint64_t at = consumed / irate;
++        struct timespec dl = { base.tv_sec + (time_t)(at / 1000000000ull), base.tv_nsec + (long)(at % 1000000000ull) };
++        if (dl.tv_nsec >= 1000000000L) { dl.tv_nsec -= 1000000000L; dl.tv_sec++; }
++        struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
++        if (now.tv_sec > dl.tv_sec || (now.tv_sec == dl.tv_sec && now.tv_nsec > dl.tv_nsec)) {
++            base = now; consumed = 0; continue;   /* 宿主卡顿落后：跳过本周期并重同步，不追赶洪泛 */
++        }
++        while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &dl, NULL) == EINTR) {}
++        if (!atomic_load_explicit(&u->running, memory_order_acquire)) break;
++        AudioTimeStamp ts = {0}; AudioUnitRenderActionFlags flags = 0;
++        if (fn) fn(u->cb.proc, &flags, &ts, 0, AU_PERIOD_FRAMES, &io);   /* =audio_mixer.c:109 的 pull */
++        au_sink_push(u, scratch, AU_PERIOD_FRAMES);
++    }
++    free(scratch);
++    return NULL;
++}
++OSStatus AudioOutputUnitStart(AudioComponentInstance inst) {
++    struct OpaqueAudioComponentInstance *u = (struct OpaqueAudioComponentInstance *)inst;
++    if (!u) return kAudioUnitErr_InvalidProperty;
++    if (u->started) return noErr;
++    au_sink_open(u);
++    atomic_store_explicit(&u->running, 1, memory_order_release);
++    if (pthread_create(&u->thread, NULL, au_ticker, u)) {
++        atomic_store_explicit(&u->running, 0, memory_order_release);
++        return kAudioUnitErr_InvalidProperty;
++    }
++    u->started = 1;
++    return noErr;
++}
++OSStatus AudioOutputUnitStop(AudioComponentInstance inst) {
++    struct OpaqueAudioComponentInstance *u = (struct OpaqueAudioComponentInstance *)inst;
++    if (!u) return kAudioUnitErr_InvalidProperty;
++    if (u->started) {
++        atomic_store_explicit(&u->running, 0, memory_order_release);
++        pthread_join(u->thread, NULL);   /* 周期 ~10.67ms，join 快 */
++        u->started = 0;
++    }
++    if (u->renderer) { OH_AudioRenderer_Stop(u->renderer); OH_AudioRenderer_Release(u->renderer); u->renderer = NULL; }
++    if (u->builder) { OH_AudioStreamBuilder_Destroy(u->builder); u->builder = NULL; }
++    return 0;
++}
+ 
+ // ---------- 二次收口：前端交互层与 NVN 纹理工具的桩（周末实装） ----------
+ CFLocaleRef CFLocaleCopyCurrent(void) { return NULL; }
+ CFStringRef CFLocaleGetValue(CFLocaleRef locale, CFStringRef key) { (void)locale; (void)key; return NULL; }
+-OSStatus AudioOutputUnitStart(AudioComponentInstance inst) { (void)inst; return kAudioUnitErr_InvalidProperty; }
+-OSStatus AudioOutputUnitStop(AudioComponentInstance inst) { (void)inst; return 0; }
++/* AudioOutputUnitStart/Stop 已实装（上方虚拟默认输出设备段），此处旧失败桩删除（round7） */
+ int proc_listallpids(void *buffer, int buffersize) { (void)buffer; (void)buffersize; return 0; }
+ char _mh_execute_header;
+ void dm_gfx_anomdump(void) {}

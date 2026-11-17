@@ -1,0 +1,31 @@
+--- gfx_bridge.c (round13b: nvnDeviceGetTimestampInNanoseconds 对齐 donor —— 定名门的合法修复点)
+    定名=宿主 nvn 方法且返回语义与 donor 不一致 ⇒ 按 fixPlan(1) 分支修返回值：
+    donor hle_nvn.c:2288 = nvn_timestamp_to_ns(c->timestamp)（+8，×625/384，nvn_timestamp.h:7）；
+    原实现忽略 cd 返回 runtime_now_ns()——GetLoadProgress 26k/s 洪流路径的 f(A)-f(B) 退化成
+    两次取钟之差。150s 实测：map pool 行 458→258（-44%），TexturePoolRegister 640→755，零 crash。
+
+--- gfx_bridge.c
++++ gfx_bridge.c
+@@ -730,8 +730,20 @@
+ static uint64_t nvn_device_get_window_origin_mode(const void *d){(void)d;return (uint64_t)g_nvn_origin_mode;}
+ static void nvn_device_set_depth_mode(void *d,int m){(void)d;g_nvn_depth_mode=m;fprintf(stderr,"[nvn] depth mode %s\n",m?"NEAR_IS_ZERO":"NEAR_IS_MINUS_W");}
+ static uint64_t nvn_device_get_depth_mode(const void *d){(void)d;return (uint64_t)g_nvn_depth_mode;}
+-/* —— P1-6 时间戳（donor 无实现；→ 宿主单调钟）—— */
+-static uint64_t nvn_device_get_timestamp_in_nanoseconds(const void *d,const void *cd){(void)d;(void)cd;{static unsigned n;if(n++<1)fprintf(stderr,"[nvn] GetTimestampInNanoseconds -> host monotonic ns\n");}return runtime_now_ns();}
++/* —— P1-6 时间戳 —— round13b 定名门（cell 0x136deb8=GetLoadProgress 双间接第二表）后对齐 donor：
++   原『donor 无实现；→ 宿主单调钟』注释过时——donor hle_nvn.c:2288 有实现：
++   nvnDeviceGetTimestampInNanoseconds = nvn_timestamp_to_ns(c->timestamp)，
++   NVNcounterData={u64 counter; u64 timestamp;}（nvn.h:91-94，timestamp 在 +8），
++   换算 ×625/384（donor nvn_timestamp.h:7，614.4MHz tick）。原先忽略 cd 返回 runtime_now_ns()：
++   游戏装载进度监视 12-34k/s 洪流路径（0x9b9bc4 双间接调用，13b 定名+计数门实测）里的
++   f(A)-f(B) 退化成两次取钟之差——每轮抖动、与池/计数数据完全无关。GetCurrentTimestamp
++   维持宿主钟（donor 也返『当前时刻』，仅时基不同）。 */
++static uint64_t nvn_device_get_timestamp_in_nanoseconds(const void *d,const void *cd){
++  (void)d;
++  if(!cd){static unsigned n;if(n++<1)fprintf(stderr,"[nvn] GetTimestampInNanoseconds(NULL counterData)\n");return 0;}
++  uint64_t ts=((const volatile uint64_t*)cd)[1];   /* +8 = NVNcounterData.timestamp（donor 同款直读） */
++  return (uint64_t)((__uint128_t)ts*625/384);
++}
+ static uint64_t nvn_device_get_current_timestamp_in_nanoseconds(const void *d){(void)d;return runtime_now_ns();}
+ /* —— P1-5 Texels 真搬运（donor :478-510 的 stride 数学 + 池内存直拷；donor 走 mtl_*，本宿主池内存即真值）—— */
+ typedef struct{int xoffset,yoffset,zoffset,width,height,depth;} copy_region_h;   /* =nvn.h NVNcopyRegion */

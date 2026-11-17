@@ -1,0 +1,7 @@
+{
+  "string": [
+    { "name": "module_desc", "value": "游戏主模块" },
+    { "name": "ability_desc", "value": "游戏入口" },
+    { "name": "ability_label", "value": "马里奥奥德赛" }
+  ]
+}

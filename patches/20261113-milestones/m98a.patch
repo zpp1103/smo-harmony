@@ -1,0 +1,490 @@
+--- mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c
++++ mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c
+@@ -25872,21 +25872,50 @@
+ #define M97A_AUTO_B  "/data/app/el2/100/base/com.vibecc.smo/files/smo_present_auto"
+ #define M97A_MAX_LINES   400u
+ #define M97A_AUTO_MAX_SIG 8
+-static int          g_m97a_src = -1;    /* 直选源 texid（>0 = 开） */
++static int          g_m97a_src = -1;    /* M98A 起语义 = **槽号**（>0 = 开；0 = 关；见下） */
+ static int          g_m97a_auto = -1;   /* 自动选源（1 = 开） */
+ static unsigned long long g_m97a_lastread;
+ static unsigned     g_m97a_lines, g_m97a_lim_note;
+ static unsigned     g_m97a_nlive;       /* 最近一次找源时活槽总数（给 miss 行） */
+ static unsigned long long g_m97a_src_swaps, g_m97a_src_miss, g_m97a_auto_pick_n, g_m97a_auto_none_n;
+ 
++/* ===== M98A（2026-11-13）：选源改「按槽 + 内容优先」，并加上一帧内容帧兜底 =====
++   为什么改（M97A 实证，本单前提）：①直选 `slot13/texid1949` 上过真场景 62 s ⇒ 选源→上屏整条链可用；
++   ②该槽随后被 2884 笔写入烧成 flat 白并被弃用；③present 源 `texid3359` 是空纹理（dwf=0、整 boot 500 笔、
++   签名恒 0）却被每帧 present；④**texid 会漂**（同槽 1949→3127→4132）⇒ 选源不能写死 texid；
++   ⑤M97A 的 auto 旧判据（nz 高者胜）在 present 时刻只选到洋红占位/近黑 ⇒ 70 次 none。
++   本块只做三件事，**不动**任何渲染/提交/拷贝语义（下游 barrier → CopyImageToBuffer → win_fill 一行不改）：
++     1. `smo_present_src` 语义由 texid 改成**槽号**（M98A 起；`smo_present_texid` 保留 texid 直选做调试）；
++     2. auto = 「本帧写入最多 + 内容三门（spread>0 且 colored>5% 且 非过曝白）的 800×450 颜色 RT」；
++     3. 兜底：本帧池子全黑/全白/没写过 ⇒ 回退到最近一张通过内容三门的帧（最多 2 s，槽与 img 身份都要对得上）。
++   三个 knob 全部活读（每 40 次 present 重读一次）、缺省 0 ⇒ 关态行为与旧链逐字相同。 */
++#define M98A_TID_A   "/data/storage/el2/base/files/smo_present_texid"
++#define M98A_TID_B   "/data/app/el2/100/base/com.vibecc.smo/files/smo_present_texid"
++#define M98A_MAX_LINES   2600u   /* [m98a] src 行预算：present ≈1.3 次/s × 20 min ≈ 1560 行 */
++#define M98A_FB_NS   2000000000ull
++static int          g_m98a_tid = -1;         /* 可选调试：按 texid 直选（>0 = 开） */
++static unsigned     g_m98a_lines, g_m98a_lim_note;
++static int          g_m98a_last_sel = -1;    /* 上一次送屏的槽（连续同槽帧数统计） */
++static unsigned long long g_m98a_same_n, g_m98a_max_same;
++static unsigned long long g_m98a_n_auto, g_m98a_n_weak, g_m98a_n_fb, g_m98a_n_none, g_m98a_n_slot;
++static int          g_m98a_fb_slot = -1;     /* 兜底：最近一张通过内容三门的帧 */
++static VkImage      g_m98a_fb_img;
++static unsigned     g_m98a_fb_w, g_m98a_fb_h;
++static VkImageLayout g_m98a_fb_lay;
++static struct timespec g_m98a_fb_ts;
++/* 前置声明（M98A 的选源块插在 M97A 的 budget/usable 之前，C99 起不允许隐式声明） */
++static int  m97a_budget(void);
++static int  m97a_usable(h_rt_slot *s);
++
+ /* hdc 只能覆盖已有文件 ⇒ 由 app 先种子（值 0，不是 -1：缺省必须 = 完全旧行为）。 */
+ static void m97a_seed(void)
+ {
+     static int done;
+     if (done) return;
+     done = 1;
+-    const char *paths[2][2] = { { M97A_SRC_A, M97A_SRC_B }, { M97A_AUTO_A, M97A_AUTO_B } };
+-    for (int k = 0; k < 2; k++) {
++    const char *paths[3][2] = { { M97A_SRC_A, M97A_SRC_B }, { M97A_AUTO_A, M97A_AUTO_B },
++                                { M98A_TID_A, M98A_TID_B } };
++    for (int k = 0; k < 3; k++) {
+         int have = 0;
+         for (int i = 0; i < 2; i++) { FILE *f = fopen(paths[k][i], "r"); if (f) { have = 1; fclose(f); break; } }
+         if (have) continue;
+@@ -25897,24 +25926,198 @@
+     }
+ }
+ 
+-/* knob 活读：每 40 次 present（≈25 s）重读一次；值变化打一行（A/B 两段就靠它切）。 */
+-static void m97a_poll(unsigned long long call)
++/* knob 活读（M98A：三个 knob）：每 40 次 present（≈25 s）重读一次；值变化打一行（A/B 两段就靠它切）。
++   为什么 40：hdc 写文件后 ~25 s 内生效，够做「auto=1 → auto=0 + src=<槽>」的同 boot 对照。 */
++static void m98a_poll(unsigned long long call)
+ {
+     if (g_m97a_src < 0) {
+         m97a_seed();
+         g_m97a_src = p_file_int(M97A_SRC_A, M97A_SRC_B, 0);
+         g_m97a_auto = p_file_int(M97A_AUTO_A, M97A_AUTO_B, 0);
++        g_m98a_tid = p_file_int(M98A_TID_A, M98A_TID_B, 0);
+         g_m97a_lastread = call;
+-        vk_boot_logf("[m97a] init src=%d auto=%d file=%s", g_m97a_src, g_m97a_auto, M97A_SRC_B);
++        vk_boot_logf("[m98a] init src=slot%d auto=%d texid=%d file=%s (M98A：smo_present_src = 槽号)",
++                     g_m97a_src, g_m97a_auto, g_m98a_tid, M97A_SRC_B);
+         return;
+     }
+     if (call - g_m97a_lastread < 40) return;
+     g_m97a_lastread = call;
+-    { const int os = g_m97a_src, oa = g_m97a_auto;
++    { const int os = g_m97a_src, oa = g_m97a_auto, ot = g_m98a_tid;
+       g_m97a_src = p_file_int(M97A_SRC_A, M97A_SRC_B, g_m97a_src);
+       g_m97a_auto = p_file_int(M97A_AUTO_A, M97A_AUTO_B, g_m97a_auto);
+-      if (os != g_m97a_src || oa != g_m97a_auto)
+-          vk_boot_logf("[m97a] knob src=%d->%d auto=%d->%d call=%llu", os, g_m97a_src, oa, g_m97a_auto, call); }
++      g_m98a_tid = p_file_int(M98A_TID_A, M98A_TID_B, g_m98a_tid);
++      if (os != g_m97a_src || oa != g_m97a_auto || ot != g_m98a_tid)
++          vk_boot_logf("[m98a] knob slot=%d->%d auto=%d->%d texid=%d->%d call=%llu",
++                       os, g_m97a_src, oa, g_m97a_auto, ot, g_m98a_tid, call); }
++}
++
++/* [m98a] src 行自己的预算（与 M97A 的 400 行普查预算分开，互不饿死）。 */
++static int m98a_budget(void)
++{
++    if (g_m98a_lines < M98A_MAX_LINES) { g_m98a_lines++; return 1; }
++    if (!g_m98a_lim_note) {
++        g_m98a_lim_note = 1;
++        vk_boot_logf("[m98a] probe limit (%u lines) reached — 后续 [m98a] src 静默", M98A_MAX_LINES);
++    }
++    return 0;
++}
++
++/* 一个候选槽的内容签名：走 r_tex_signature（16 条横带 × 16 列 = 256 采样点，≈1/28 幅面 + 一次 submit），
++   与 `[wp] rt` / M97A census 同一条路、同一口径。colored% = 100 − 主色占比（M96A/M97A 同口径）。 */
++typedef struct {
++    int      slot, ok;
++    unsigned w, h, dwf;
++    unsigned long long dwa, mean[3], mx[3], mn[3];
++    int      spread;        /* 三通道 (max−min) 的最大值；0 = 常量图（flat 白/纯黑都是 0） */
++    double   cvd;           /* colored% = 100 − 主色占比 */
++    double   nzb;           /* 非黑像素%（c_stat_t.colored 口径，只做参考） */
++} m98a_c_t;
++
++static int m98a_sig(int slot, m98a_c_t *o)
++{
++    memset(o, 0, sizeof *o);
++    o->slot = slot;
++    h_rt_slot *s = &g_rt_tab[slot];
++    if (!m97a_usable(s)) return 0;
++    r_sig_t sg; memset(&sg, 0, sizeof sg);
++    if (!r_tex_signature(s->img, p_slot_layout(s), s->w, s->h, 4, &sg) || !sg.npx) return 0;
++    const double np = (double)sg.npx;
++    o->w = s->w; o->h = s->h;
++    o->dwf = g_slot_dw_prev[slot];
++    o->dwa = g_slot_dw_all[slot];
++    for (int c = 0; c < 3; c++) {
++        o->mean[c] = (unsigned long long)((double)sg.sum[c] / np);
++        o->mx[c] = sg.mx[c]; o->mn[c] = sg.mn[c];
++        const unsigned long long d = (sg.mx[c] > sg.mn[c]) ? (sg.mx[c] - sg.mn[c]) : 0ull;
++        if ((int)d > o->spread) o->spread = (int)d;
++    }
++    int dom = 0;
++    for (int i = 1; i < sg.nt; i++) if (sg.tn[i] > sg.tn[dom]) dom = i;
++    const unsigned long long dsh = sg.nt ? sg.tn[dom] : 0ull;
++    o->cvd = 100.0 * (np - (double)dsh) / np;
++    o->nzb = 100.0 * (double)sg.nz / (4.0 * np);
++    o->ok = 1;
++    return 1;
++}
++
++/* 过曝白：三通道均值都 ≥250。M97A 的 flat 白 spread=0 已被 spread 门挡掉，这条挡「大面积 255 + 少量 250」。 */
++static int m98a_over_white(const m98a_c_t *c)
++{ return c->ok && c->mean[0] >= 250 && c->mean[1] >= 250 && c->mean[2] >= 250; }
++
++/* 内容三门（判据①③）：spread>0 且 colored>5% 且 非过曝白。 */
++static int m98a_is_content(const m98a_c_t *c)
++{ return c->ok && c->spread > 0 && c->cvd > 5.0 && !m98a_over_white(c); }
++
++/* 兜底缓存：记住最近一张**通过内容三门**的帧（槽号 + img 身份 + 时刻）。 */
++static void m98a_fb_arm(const m98a_c_t *c)
++{
++    if (!c->ok) return;
++    h_rt_slot *s = &g_rt_tab[c->slot];
++    if (!s->img) return;
++    g_m98a_fb_slot = c->slot; g_m98a_fb_img = s->img;
++    g_m98a_fb_w = s->w; g_m98a_fb_h = s->h; g_m98a_fb_lay = p_slot_layout(s);
++    clock_gettime(CLOCK_MONOTONIC, &g_m98a_fb_ts);
++}
++/* 兜底还能用吗：槽还活着 + img 身份没换 + 距上次通过判据 ≤2 s。 */
++static int m98a_fb_ok(void)
++{
++    if (g_m98a_fb_slot < 0 || g_m98a_fb_slot >= H_RT_SLOTS) return 0;
++    h_rt_slot *s = &g_rt_tab[g_m98a_fb_slot];
++    if (!m97a_usable(s) || s->img != g_m98a_fb_img) return 0;
++    struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
++    const long long d = (long long)(now.tv_sec - g_m98a_fb_ts.tv_sec) * 1000000000LL
++                      + (long long)(now.tv_nsec - g_m98a_fb_ts.tv_nsec);
++    return d >= 0 && (unsigned long long)d <= M98A_FB_NS;
++}
++
++/* M98A 自动选源：返回槽号（-1 = 没选到），tier 说明这一帧凭什么：
++   1 = 内容三门（spread>0 且 colored>5% 且 非过曝白）的 800×450 颜色 RT，取「本帧写入最多」的第一个；
++   3 = 本帧池子全黑/全白/没写过 ⇒ 上一帧通过判据那张（≤2 s）；
++   2 = 弱档：spread>0 且非过曝白，但 colored ≤5%（例如黑底 + 少量亮点），如实上屏并标 weak。 */
++static int m98a_pick(unsigned rw, unsigned rh, int *tier, m98a_c_t *best, char *list, int cap)
++{
++    const int ns = (int)(sizeof g_rt_tab / sizeof *g_rt_tab);
++    int ord[H_RT_SLOTS], i800[H_RT_SLOTS];
++    int nall = 0, n800 = 0;
++    *tier = 0; memset(best, 0, sizeof *best);
++    if (list && cap > 0) list[0] = 0;
++
++    /* 1. 「本帧真被 draw 写过」的活槽（g_slot_dw_prev 是 submit 边界快照：present 时 g_slot_dw 已清零） */
++    for (int i = 0; i < ns; i++) {
++        if (!m97a_usable(&g_rt_tab[i])) continue;
++        if (g_slot_dw_prev[i]) ord[nall++] = i;
++    }
++    /* 2. 按「本帧写入 → 整 boot 写入」降序 */
++    for (int a = 0; a < nall; a++)
++        for (int b = a + 1; b < nall; b++) {
++            const unsigned da = g_slot_dw_prev[ord[a]], db = g_slot_dw_prev[ord[b]];
++            const unsigned long long aa = g_slot_dw_all[ord[a]], ab = g_slot_dw_all[ord[b]];
++            if (db > da || (db == da && ab > aa)) { const int t = ord[a]; ord[a] = ord[b]; ord[b] = t; }
++        }
++    /* 3. present 源同尺寸（本机 = 800×450）的颜色 RT 子集，保持上面的写入序 */
++    for (int a = 0; a < nall; a++) {
++        const h_rt_slot *s = &g_rt_tab[ord[a]];
++        if (s->w != rw || s->h != rh) continue;
++        const VkImageLayout lay = p_slot_layout((h_rt_slot *)s);
++        if (lay != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL &&
++            lay != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) continue;
++        i800[n800++] = ord[a];
++    }
++    /* 4. 签名：先签 800×450 子集前 4（判据要的），再补 top-4 写入槽（探针要的），去重，总上限 8 */
++    m98a_c_t sig[16]; int nsig = 0;
++    for (int pass = 0; pass < 2; pass++) {
++        const int lim = (pass == 0) ? n800 : nall;
++        for (int a = 0; a < lim && a < 4 && nsig < 8; a++) {
++            const int sl = (pass == 0) ? i800[a] : ord[a];
++            int dup = 0;
++            for (int k = 0; k < nsig; k++) if (sig[k].slot == sl) { dup = 1; break; }
++            if (dup) continue;
++            if (m98a_sig(sl, &sig[nsig])) nsig++;
++        }
++    }
++    /* 5. 判据（sig[] 前半段 = 800×450 且按本帧写入降序 ⇒ 第一个命中的就是「写入最多且过判据」） */
++    int b1 = -1, b2 = -1;
++    for (int a = 0; a < nsig; a++) {
++        const m98a_c_t *c = &sig[a];
++        if (c->w != rw || c->h != rh || c->dwf == 0) continue;
++        if (b1 < 0 && m98a_is_content(c)) { b1 = a; continue; }
++        if (b2 < 0 && c->spread > 0 && !m98a_over_white(c)) b2 = a;
++    }
++    int pick = -1;
++    if (b1 >= 0) {
++        *tier = 1; *best = sig[b1]; pick = sig[b1].slot; m98a_fb_arm(&sig[b1]);
++    } else if (m98a_fb_ok()) {
++        h_rt_slot *fs = &g_rt_tab[g_m98a_fb_slot];
++        *tier = 3; pick = g_m98a_fb_slot;
++        memset(best, 0, sizeof *best);
++        best->slot = pick; best->ok = 1; best->w = fs->w; best->h = fs->h;
++        best->dwf = g_slot_dw_prev[pick]; best->dwa = g_slot_dw_all[pick];
++        best->spread = -1; best->cvd = -1.0;      /* 本帧没重签（省一次回读）；上一帧签过的值见 [m98a] src 历史 */
++    } else if (b2 >= 0) {
++        *tier = 2; *best = sig[b2]; pick = sig[b2].slot;
++    }
++    /* 6. 探针：本帧 top-4 写入槽 slot:texid:dwf:colored */
++    if (list && cap > 0) {
++        int o = 0;
++        for (int a = 0; a < nall && a < 4 && o < cap - 48; a++) {
++            const int sl = ord[a];
++            double cv = -1.0;
++            for (int k = 0; k < nsig; k++) if (sig[k].slot == sl) { cv = sig[k].cvd; break; }
++            o += snprintf(list + o, (size_t)(cap - o), "%s%d:%d:%u:%.0f",
++                          a ? " " : "", sl, (int)g_rt_tab[sl].tex_id,
++                          g_slot_dw_prev[sl], cv);
++        }
++        if (!nall) snprintf(list, (size_t)cap, "none");
++    }
++    {   /* 每 30 次 present 打一行候选面（不必每帧都打） */
++        static unsigned long long lastc;
++        if (m97a_budget() && (lastc == 0 || g_p_calls - lastc >= 30)) {
++            lastc = g_p_calls;
++            vk_boot_logf("[m98a] cands nall=%d n800=%d sig=%d tier=%d pick=%d ext=%ux%u top4=%s",
++                         nall, n800, nsig, *tier, pick, rw, rh, (list && list[0]) ? list : "<none>");
++        }
++    }
++    return pick;
+ }
+ 
+ /* 1 = 还能打一行（硬上限 400 行/次运行；超限只提示一次）。 */
+@@ -25931,7 +26134,18 @@
+ /* 槽是否「活着且可拷」（与 p_src_copyable 同口径）。 */
+ static int m97a_usable(h_rt_slot *s) { return s && p_src_copyable(s); }
+ 
+-/* 直选：按 texid 找活槽；先要精确尺寸 rw x rh，退而求其次「≥ 拷贝下限」。返回 -1 = 找不到。 */
++/* 直选（M98A：**按槽**）：smo_present_src = 槽号。槽不在/不可拷 ⇒ -1（保持原源，不硬指、不猜）。
++   尺寸不匹配也照送：下游 CopyImageToBuffer 用的是该槽自己的 w/h，win_fill 会等比 letterbox。 */
++static int m98a_find_slot(int slot)
++{
++    g_m97a_nlive = 0;
++    const int ns = (int)(sizeof g_rt_tab / sizeof *g_rt_tab);
++    for (int i = 0; i < ns; i++) if (g_rt_tab[i].img) g_m97a_nlive++;
++    if (slot < 0 || slot >= ns) return -1;
++    return m97a_usable(&g_rt_tab[slot]) ? slot : -1;
++}
++
++/* 直选（可选调试，smo_present_texid）：按 texid 找活槽；先要精确尺寸 rw x rh，退而求其次「≥ 拷贝下限」。 */
+ static int m97a_find_texid(int tid, unsigned rw, unsigned rh)
+ {
+     int hit = -1, soft = -1;
+@@ -25946,54 +26160,6 @@
+         if (soft < 0) soft = i;
+     }
+     return hit >= 0 ? hit : soft;
+-}
+-
+-/* 自动选源：枚举全部活着的、尺寸 == rw x rh 的颜色 RT，按「本帧写入笔数 → 整 boot 笔数」降序，
+-   最多签 8 个，取 nz 最高且非纯色（nt>1、nz>1%）的一个。返回槽号，-1 = 没有可用内容。 */
+-static int m97a_auto_pick(unsigned rw, unsigned rh, double *nz_o, unsigned *mr_o, unsigned *mg_o,
+-                          unsigned *mb_o, int *nsig_o)
+-{
+-    const int ns = (int)(sizeof g_rt_tab / sizeof *g_rt_tab);
+-    int idx[64]; int n = 0;
+-    for (int i = 0; i < ns && n < 64; i++) {
+-        h_rt_slot *s = &g_rt_tab[i];
+-        if (!m97a_usable(s) || s->w != rw || s->h != rh) continue;
+-        const VkImageLayout lay = p_slot_layout(s);
+-        if (lay != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL &&
+-            lay != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) continue;   /* 签名只认这两态 */
+-        idx[n++] = i;
+-    }
+-    for (int a = 0; a < n; a++)
+-        for (int b = a + 1; b < n; b++) {
+-            const unsigned da = g_slot_dw_prev[idx[a]], db = g_slot_dw_prev[idx[b]];
+-            const unsigned long long aa = g_slot_dw_all[idx[a]], ab = g_slot_dw_all[idx[b]];
+-            if (db > da || (db == da && ab > aa)) { int t = idx[a]; idx[a] = idx[b]; idx[b] = t; }
+-        }
+-    int best = -1, nsig = 0; double bnz = -1.0; unsigned bmr = 0, bmg = 0, bmb = 0;
+-    char list[240]; int lo = 0; list[0] = 0;
+-    for (int a = 0; a < n && nsig < M97A_AUTO_MAX_SIG; a++) {
+-        h_rt_slot *s = &g_rt_tab[idx[a]];
+-        r_sig_t sg; memset(&sg, 0, sizeof sg);
+-        if (!r_tex_signature(s->img, p_slot_layout(s), s->w, s->h, 4, &sg)) continue;
+-        nsig++;
+-        const double np = (double)(sg.npx ? sg.npx : 1);
+-        const double nzp = 100.0 * (double)sg.nz / (4.0 * np);
+-        if (lo < (int)sizeof list - 40)
+-            lo += snprintf(list + lo, sizeof list - (size_t)lo, " %d:%d:%.0f%%:%u",
+-                           idx[a], (int)s->tex_id, nzp, g_slot_dw_prev[idx[a]]);
+-        if (sg.nt > 1 && nzp > 1.0 && nzp > bnz) {
+-            bnz = nzp; best = idx[a];
+-            bmr = (unsigned)(sg.sum[0] / np); bmg = (unsigned)(sg.sum[1] / np); bmb = (unsigned)(sg.sum[2] / np);
+-        }
+-    }
+-    if (m97a_budget())
+-        vk_boot_logf("[m97a] auto cands n=%d sig=%d%s", n, nsig, lo ? list : " <none>");
+-    if (nz_o) *nz_o = bnz < 0 ? 0.0 : bnz;
+-    if (mr_o) *mr_o = bmr;
+-    if (mg_o) *mg_o = bmg;
+-    if (mb_o) *mb_o = bmb;
+-    if (nsig_o) *nsig_o = nsig;
+-    return best;
+ }
+ 
+ /* present 时刻普查：原源身份 + 本帧/整 boot 写入笔数 + 签名；再一行全 800x450 活 RT 精简清单。 */
+@@ -29280,61 +29446,101 @@
+         }
+         if ((m80a_bits() & 4) && call >= 20) m80a_dump_slots(call);
+     }
+-    /* ===== M97A（2026-11-13）：present 直选源 / 自动选源 + present 时刻全 RT 普查 =====
++    /* ===== M98A（2026-11-13）：选源 = 按槽 + 内容优先（+ 上一帧内容帧兜底） =====
+        位置：所有选源分支（tex/ours/snap/worldRT/gpres/M38H/M39A/M40AT/M42F/M80A）之后、台账与拷贝之前
+-       ⇒ 只替换「最终送屏的那张图」，下面的 barrier → CopyImageToBuffer → win_fill 拷贝链一行不改；
+-       两个 knob 都缺省 0 ⇒ 除新增探针行外行为与旧链逐字相同（M97A 不允许绕开拷贝链）。 */
+-    int m97a_sel = -1;
++       ⇒ 只替换「最终送屏的那张图」，下面的 barrier → CopyImageToBuffer → win_fill 拷贝链一行不改。
++       knob（全部活读、缺省 0）：
++         smo_present_auto=1 ⇒ M98A 策略（本帧写入最多 + 内容三门 + 2 s 兜底）；
++         smo_present_src=<槽号>（M98A 起是**槽**；M97A 曾是 texid；>0 才生效）；
++         smo_present_texid=<texid>（可选调试直选）。
++       每 present 打一行 `[m98a] src`：present 原源（slot/texid/dwf/dwall/签名）+ 本帧 top-4 写入槽
++       ⇒ 回答「游戏那帧画面到底写进了哪个槽」。 */
++    int m98a_sel = -1;
+     {
+         /* 「present 原源」= 关掉本块时本来会送屏的那张（tex 路径记它的槽号，非 tex 路径记 -1）。 */
+         const int org_slot = (m80a_sel >= 0) ? m80a_sel
+                            : (m38h_sel >= 0) ? m38h_sel
+                            : (pslot && !snap_used) ? pslot_i : -1;
+-        const char *m97a_osrc = srcname;
+-        const unsigned m97a_osw = sw, m97a_osh = sh;
+-        m97a_poll(call);
+-        m97a_census(call, m97a_osrc, org_slot, simg, slay, sw, sh);
++        const char *osrc = srcname;
++        const unsigned osw = sw, osh = sh;
++        const VkImage oimg = simg; const VkImageLayout olay = slay;
++        /* 原源的签名（判据①⑤的「present 源之谜」直接读数；每 4 次 present 签一次，省回读） */
++        int o_spread = -1; double o_cvd = -1.0; unsigned o_mean[3] = {0, 0, 0};
++        int osig = 0;
++        m98a_poll(call);
++        if (org_slot >= 0 && (call & 3ull) == 0ull) {
++            m98a_c_t oc;
++            if (m98a_sig(org_slot, &oc)) {
++                osig = 1; o_spread = oc.spread; o_cvd = oc.cvd;
++                o_mean[0] = (unsigned)oc.mean[0]; o_mean[1] = (unsigned)oc.mean[1]; o_mean[2] = (unsigned)oc.mean[2];
++            }
++        }
++        m97a_census(call, osrc, org_slot, oimg, olay, osw, osh);   /* 保留 M97A 普查（全 800×450 RT 清单） */
++
++        const int any_on = (g_m97a_auto == 1) || (g_m97a_src > 0) || (g_m98a_tid > 0);
++        int tier = 0; m98a_c_t best; memset(&best, 0, sizeof best);
++        char top4[300]; top4[0] = 0;
+         if (g_m97a_auto == 1) {
+-            double nzp = 0.0; unsigned mr = 0, mg = 0, mb = 0; int nsig = 0;
+-            const int ai = m97a_auto_pick(sw, sh, &nzp, &mr, &mg, &mb, &nsig);
+-            if (ai >= 0) {
+-                h_rt_slot *as = &g_rt_tab[ai];
+-                simg = as->img; sw = as->w; sh = as->h; slay = p_slot_layout(as);
+-                srcname = "m97a-auto"; snap_used = 0; m97a_sel = ai;
+-                g_m97a_auto_pick_n++;
+-                if (m97a_budget())
+-                    vk_boot_logf("[m97a] auto pick=texid=%d/slot=%d nz=%.1f%% mean=%u/%u/%u sig=%d "
+-                                 "dwf=%u dwall=%llu was=%s/%ux%u n=%llu call=%llu",
+-                                 (int)as->tex_id, ai, nzp, mr, mg, mb, nsig,
+-                                 g_slot_dw_prev[ai], g_slot_dw_all[ai],
+-                                 m97a_osrc, m97a_osw, m97a_osh, g_m97a_auto_pick_n, call);
++            const int pi = m98a_pick(osw, osh, &tier, &best, top4, sizeof top4);
++            if (pi >= 0) {
++                h_rt_slot *ps = &g_rt_tab[pi];
++                simg = ps->img; sw = ps->w; sh = ps->h; slay = p_slot_layout(ps);
++                srcname = (tier == 1) ? "m98a-auto" : (tier == 3) ? "m98a-fb" : "m98a-weak";
++                snap_used = 0; m98a_sel = pi;
++                if (tier == 1) g_m98a_n_auto++;
++                else if (tier == 3) g_m98a_n_fb++;
++                else g_m98a_n_weak++;
+             } else {
+-                g_m97a_auto_none_n++;
+-                if (m97a_budget())
+-                    vk_boot_logf("[m97a] auto none sig=%d was=%s/%ux%u n=%llu call=%llu "
+-                                 "(候选全黑/纯色 ⇒ 保持原源)", nsig, m97a_osrc, m97a_osw, m97a_osh,
+-                                 g_m97a_auto_none_n, call);
++                g_m98a_n_none++;
+             }
+-        } else if (g_m97a_src > 0) {
+-            const int si = m97a_find_texid(g_m97a_src, sw, sh);
++        } else if (g_m97a_src > 0) {          /* 直选：按**槽号** */
++            const int si = m98a_find_slot(g_m97a_src);
+             if (si >= 0) {
+                 h_rt_slot *ss = &g_rt_tab[si];
+                 simg = ss->img; sw = ss->w; sh = ss->h; slay = p_slot_layout(ss);
+-                srcname = "m97a-src"; snap_used = 0; m97a_sel = si;
+-                g_m97a_src_swaps++;
+-                if (m97a_budget())
+-                    vk_boot_logf("[m97a] src want=%d slot=%d texid=%d ext=%ux%u lay=%d dwf=%u dwall=%llu "
+-                                 "fmt=%u was=%s/%ux%u n=%llu call=%llu",
+-                                 g_m97a_src, si, (int)ss->tex_id, (unsigned)ss->w, (unsigned)ss->h,
+-                                 (int)slay, g_slot_dw_prev[si], g_slot_dw_all[si], (unsigned)ss->fmt,
+-                                 m97a_osrc, m97a_osw, m97a_osh, g_m97a_src_swaps, call);
++                srcname = "m98a-slot"; snap_used = 0; m98a_sel = si; tier = 4;
++                g_m97a_src_swaps++; g_m98a_n_slot++;
++                m98a_c_t sc;
++                if (m98a_sig(si, &sc) && m98a_is_content(&sc)) m98a_fb_arm(&sc);
+             } else {
+                 g_m97a_src_miss++;
+                 if ((g_m97a_src_miss <= 6 || (g_m97a_src_miss % 100) == 0) && m97a_budget())
+-                    vk_boot_logf("[m97a] src miss want=%d live=%u ext=%ux%u (保持原源 %s) n=%llu call=%llu",
+-                                 g_m97a_src, g_m97a_nlive, sw, sh, m97a_osrc, g_m97a_src_miss, call);
++                    vk_boot_logf("[m98a] slot miss want=%d live=%u (保持原源 %s) n=%llu call=%llu",
++                                 g_m97a_src, g_m97a_nlive, osrc, g_m97a_src_miss, call);
+             }
++        } else if (g_m98a_tid > 0) {          /* 可选调试：按 texid */
++            const int si = m97a_find_texid(g_m98a_tid, osw, osh);
++            if (si >= 0) {
++                h_rt_slot *ss = &g_rt_tab[si];
++                simg = ss->img; sw = ss->w; sh = ss->h; slay = p_slot_layout(ss);
++                srcname = "m98a-tid"; snap_used = 0; m98a_sel = si; tier = 5;
++            }
+         }
++        /* 连续同槽帧计数（判据②「选源稳不稳」：连续 ≥300 帧指同一/同族槽） */
++        if (m98a_sel >= 0) {
++            if (m98a_sel == g_m98a_last_sel) g_m98a_same_n++;
++            else { g_m98a_last_sel = m98a_sel; g_m98a_same_n = 1; }
++            if (g_m98a_same_n > g_m98a_max_same) g_m98a_max_same = g_m98a_same_n;
++        } else {
++            g_m98a_last_sel = -1; g_m98a_same_n = 0;
++        }
++        /* ---- 每 present 一行：present 源 + 本帧 top-4 写入槽（判据①③⑤的唯一读数） ---- */
++        if (any_on && m98a_budget())
++            vk_boot_logf("[m98a] src call=%llu c=%llu tier=%d sel_slot=%d sel_tid=%d ext=%ux%u dwf=%u dwall=%llu "
++                         "spr=%d cvd=%.0f%% mean=%llu/%llu/%llu | osrc=%s oslot=%d otid=%d odwf=%u odwall=%llu "
++                         "oext=%ux%u ofmt=%u osig=%d ospr=%d ocvd=%.0f%% omean=%u/%u/%u | top4=%s same=%llu",
++                         call, g_p_calls, tier, m98a_sel,
++                         (m98a_sel >= 0) ? (int)g_rt_tab[m98a_sel].tex_id : -1, sw, sh,
++                         (m98a_sel >= 0) ? g_slot_dw_prev[m98a_sel] : 0u,
++                         (m98a_sel >= 0) ? g_slot_dw_all[m98a_sel] : 0ull,
++                         best.spread, best.cvd, best.mean[0], best.mean[1], best.mean[2],
++                         osrc, org_slot,
++                         (org_slot >= 0) ? (int)g_rt_tab[org_slot].tex_id : (int)g_p_tex_id,
++                         (org_slot >= 0) ? g_slot_dw_prev[org_slot] : 0u,
++                         (org_slot >= 0) ? g_slot_dw_all[org_slot] : 0ull,
++                         osw, osh, (org_slot >= 0) ? (unsigned)g_rt_tab[org_slot].fmt : 0u,
++                         osig, o_spread, o_cvd, o_mean[0], o_mean[1], o_mean[2],
++                         top4[0] ? top4 : "<none>", g_m98a_same_n);
+     }
+     /* M4al P2：台账按**最终**选中的源记（快照会覆盖上面 pslot 已写下的 tex 选择）。 */
+     g_p_last_src = srcname; g_p_last_slot = snap_used ? -1 : pslot_i;
+@@ -29349,11 +29555,11 @@
+     if (!strcmp(srcname, "au-pick")) g_p_last_slot = g_au_pres_slot;   /* M40AU：台账记 post-draw 记账的那个槽 */
+     if (!strcmp(srcname, "comp")) g_p_last_slot = g_m42f_slot;   /* M42F：台账记真正供帧的那个槽 */
+     if (m80a_sel >= 0) g_p_last_slot = m80a_sel;   /* M80A：同上（否则 [p] 行 slot/ext 对不上） */
+-    if (m97a_sel >= 0) g_p_last_slot = m97a_sel;   /* M97A：直选/自动选源的槽（否则台账 slot/ext 对不上） */
++    if (m98a_sel >= 0) g_p_last_slot = m98a_sel;   /* M98A：直选/自动选源的槽（否则台账 slot/ext 对不上） */
+     g_p_last_w = sw; g_p_last_h = sh;
+     /* M4ak P3：本帧选源身份（[p] sig 行会带出去配对）。快照不是槽 ⇒ sel_slot=-1（修掉 M4ak 记的标注 bug）。 */
+     g_p_sel_call = call;
+-    g_p_sel_slot = (m97a_sel >= 0) ? m97a_sel : (m80a_sel >= 0) ? m80a_sel : (m38h_sel >= 0) ? m38h_sel : (m39a_sel >= 0) ? m39a_sel
++    g_p_sel_slot = (m98a_sel >= 0) ? m98a_sel : (m80a_sel >= 0) ? m80a_sel : (m38h_sel >= 0) ? m38h_sel : (m39a_sel >= 0) ? m39a_sel
+                  : (snap_used ? -1 : (!strcmp(srcname, "au-pick") ? g_au_pres_slot : pslot_i));
+     g_p_sel_why = srcname;
+     /* M39N（2026-11-09）：把「真正要拷去上屏的那张图」在指定 draws 门槛上 dump 一次。

@@ -1,0 +1,23 @@
+# NOTICE
+
+本仓库的移植层代码以 MIT 许可发布（见 `LICENSE`）。其中若干部分是第三方开源代码的
+派生或参考实现，各自的版权与许可声明保留在
+`mario-odessy-harmony/entry/src/main/cpp/third_party/` 下（`nxnative-ohos/template/` 中有同样一份副本）：
+
+| 部分 | 来源 | 许可 |
+|---|---|---|
+| `third_party/d2r/`、`third_party/d2r_gfx/` | d2r-mobile（jhaizhou）：NVN 宿主与图形层 | MIT，见 `third_party/d2r/LICENSE`、`third_party/d2r_gfx/LICENSE` |
+| `third_party/licenses/nxnative.txt` | nxnative（jhaizhou）：HLE 宿主层 | MIT（Copyright (c) 2026 jhaizhou） |
+| `third_party/smaa/` | SMAA（Jorge Jimenez 等） | 见 `third_party/smaa/LICENSE.txt` |
+| `third_party/d2r_gfx/third_party/bcdec/` | bcdec | 双许可（MIT / public domain），见其 LICENSE |
+| `third_party/licenses/AMD-FidelityFX-MIT.txt` | AMD FidelityFX | MIT |
+
+## 不含游戏内容
+
+本仓库**不包含**任何游戏程序、美术、音频、文本、数据表、着色器二进制或密钥。
+所有游戏内容都必须由使用者在自己的机器上、从自己拥有的游戏副本中生成
+（见各工程 README 与 `PROJECT_ENV.md`）。仓库中保留的“派生接口信息”
+（重定位表、补丁偏移、资源路径等）性质见 `docs/DERIVED.md`。
+
+《超级马里奥 奥德赛》为任天堂的作品；Nintendo Switch 是任天堂的商标。
+本项目与任天堂无任何关联，也不获其认可或支持。请勿用于侵犯版权。

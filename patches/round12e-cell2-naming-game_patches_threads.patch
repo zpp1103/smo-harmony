@@ -1,0 +1,34 @@
+--- game_patches.c + threads.c (round12e: cell 0x136deb8 运行时定名打点；as-applied 记录，未构建部署)
+    背景：round12-handoff.md「未定名项：GetLoadProgress 里 f() 的第二表调用（cell 0x136deb8）」。
+    机制：新观测门 SMO_OBS_CELL2 挂 main+0x9b9bc4（f() 内 cell 0x136deb8 的 adrp/ldr/ldr/blr 四条），
+    首命中快照两条 cell→table→fn 链（0x1363dc8=Map 作链条验证位），dump 侧用 runtime_module_offset 定名。
+
+--- game_patches.c
++++ game_patches.c
+@@ -1,7 +1,12 @@
+-enum { SMO_OBS_E1 = 0, SMO_OBS_DRAIN_A = 1, SMO_OBS_DRAIN_B = 2, SMO_OBS_N = 3 };
++enum { SMO_OBS_E1 = 0, SMO_OBS_DRAIN_A = 1, SMO_OBS_DRAIN_B = 2, SMO_OBS_CELL2 = 3, SMO_OBS_N = 4 };
+ typedef struct { uint32_t off, gate; uint32_t word[4]; } smo_obs_site_t;
+ static const smo_obs_site_t smo_obs_site[] = {
+     {0x57f950, SMO_OBS_E1,      {0xa9be4ff4, 0xa9017bfd, 0x910043fd, 0xf9400408}},   /* stp x20,x19; stp x29,x30; add x29,sp,#0x10; ldr x8,[x0,#8] */
+     {0x8aef34, SMO_OBS_DRAIN_A, {0xa9057bfd, 0x910143fd, 0x394c0008, 0xaa0103f5}},   /* stp x29,x30,[sp,#0x50]; add x29,sp,#0x50; ldrb w8,[x0,#0x300]; mov x21,x1 */
+     {0x8af418, SMO_OBS_DRAIN_B, {0xa9027bfd, 0x910083fd, 0x2a0103f3, 0xaa0003f4}},   /* stp x29,x30,[sp,#0x20]; add x29,sp,#0x20; mov w19,w1; mov x20,x0 */
++    /* round12e 定名打点：GetLoadProgress 的 f()（main+0x9b9b80）第二表双间接调用。
++       0x9b9bc4 起四条 = adrp x8,0x136d000; ldr x8,[x8,#0xeb8] (=cell 0x136deb8); ldr x8,[x8]; blr x8。
++       loader.c round12d 已证两 cell 均非直接 reloc 目标（双间接指针表），静态无法定名——
++       此门借 26k/s 的既有洪流在首个命中处快照 cell→table→fn 链，dump 时符号化。 */
++    {0x9b9bc4, SMO_OBS_CELL2,   {0x90004da8, 0xf9475d08, 0xf9400108, 0xd63f0100}},
+ };
+
+--- 其余 as-applied 增块（非 diff 格式，人工记录） ---
+game_patches.c:
+  static _Atomic uint64_t g_obs_hits[... 行后新增:
+    static _Atomic uint64_t g_cell2[6]; static _Atomic unsigned g_cell2_set;
+    static uint64_t g_obs_main_base;   /* 安装期写好（main 基址），观察器只读 */
+  smo_obs_observer() 内 `if (gate != SMO_OBS_E1) return;` 替换为 CELL2 首命中快照块
+    （读 main+0x1363dc8 / main+0x136deb8 及其 [cell]/[[cell]]，护栏 >2^32，一次性写 g_cell2+g_cell2_set）
+    并在通用计数后加 (void)g_cell2;(void)g_cell2_set;(void)g_obs_main_base; 防未用告警
+  smo_obs_gates_install() 开头（strcmp main 之后）: g_obs_main_base = (uint64_t)(uintptr_t)m->base;
+  smo_obs_hits/last_x0 旁新增访问器 smo_obs_cell2_snapshot(uint64_t out[6])
+threads.c:
+  dump 段 E2 drain 0x8af418 行后新增 cell2 快照打印（runtime_module_offset 定名 cell/table/fn ×2）

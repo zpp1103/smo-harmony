@@ -1,0 +1,28 @@
+--- a/entry/src/main/cpp/host/audio_mixer.c
++++ b/entry/src/main/cpp/host/audio_mixer.c
+@@ -749,12 +749,19 @@
+     case 5: { int32_t n = 2; IPC_OUT(rs, n); return; }                                               /* GetActiveChannelCount */
+     case 13: { IpcBuffer b = out_buffer(rq, &pointer); put_name(&b, rs, pointer); return; }          /* GetActiveAudioOutputDeviceName [13.0.0+] */
+     case 14: { IpcBuffer b = out_buffer(rq, &pointer); int32_t n = b.size >= 0x100 ? 1 : 0; if (n) put_name(&b, rs, pointer); IPC_OUT(rs, n); return; }   /* ListAudioOutputDeviceName [13.0.0+] */
+-    /* device change events: 首次 Query 创建共享事件后立即 signal 一次 =「设备表枚举完成，默认输出设备
+-       AudioTvOutput 可用」（List/GetActive 上方各 case 已返回它）——对齐 Ryujinx AudioDevice.cs 构造函数
+-       _systemEvent.ReadableEvent.Signal()：三命令共用一事件、构造时 signal 一次，是行业模拟器行为而非盲
+-       signal；signal 发生在句柄交给游戏之前，与 0x1026 复位自旋无竞态（自旋在 Query 返回后才启动）。
+-       后续仅真变更再 signal（接 OHAudio 路由回调时），不做周期性 signal；不碰 0x1003（renderer 事件）。 */
+-    case 4: case 11: case 12: { static uint32_t ev; if (!ev) { ev = runtime_event_new(); runtime_event_signal(ev); } rs->copy[rs->ncopy++] = runtime_event_readable(ev); return; }
++    /* device change events: 每会话一事件、构造（audren cmd2/4 建会话，audio_renderer.c）时 signal 一次
++       =设备枚举完成/默认输出可用——对齐 Ryujinx AudioDevice ctor 的 Signal（发生在游戏拿到任何句柄之前，
++       天然无竞态；最终版 Ryujinx 的三条 Query 均无 Signal，本 case 只回读端，不再 signal）。
++       重 signal 只留 OHOS 路由真变更回调（未来），绝不周期盲发；不碰 0x1003/0x101f（renderer 事件）。 */
++    case 4: case 11: case 12: {
++        AudioDeviceState *d = s->state;
++        if (!d->queried) { d->queried = 1; fprintf(stderr, "[totk-audio] IAudioDevice QueryEvent cmd=%u shared_ev=%#x\n", rq->cmd, d->ev); }   /* 每会话至多一次，零热路径成本 */
++        rs->copy[rs->ncopy++] = runtime_event_readable(d->ev); return; }
+     default: ipc_unimplemented(s, rq);
+     }
+ }
++void audio_device_close(void *p) {   /* session free hook: release the writable end (readable copies own their refs), then the state */
++    AudioDeviceState *d = p;
++    if (d->ev) runtime_event_close(d->ev);
++    free(d);
++}

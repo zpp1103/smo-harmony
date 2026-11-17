@@ -1,0 +1,105 @@
+--- entry/src/main/cpp/host/threads.c	2026-11-01 01:35:01
++++ /Users/zpp/VibeCoding/ns-mario-odessy-to-harmony/mario-odessy-harmony/entry/src/main/cpp/host/threads.c	2026-11-01 02:30:40
+@@ -509,6 +509,31 @@
+         return;
+     }
+     if (is35) g_ovf35++; else g_ovf34++;
++}
++/* ---------- round9 观测（条件变量 SVC）：svc 0x1C/0x1D per-key 计数表（照上方 sigaddr 范式：
++   {key,n1c,n1d} 前 16 槽 + 溢出桶，dump 时打）。0x1C 记等待次数、0x1D 记 signal 次数与首位调用者
++   句柄（释放者画像）；唤醒总数 g_n1d_woke 对照 total（total≫woke=发信号没人等）。dump 侧连同
++   该 key 当前等待者数一并打（现场数 g_wait 的 wkind==2）——等待有没有配对的 signal 一表可读。
++   两个 svc case 内全程持 G 更新，dump 尾部无锁读（与 sigaddr 同级取证风险）。 */
++#define PKEY_TOP 16
++static struct { uint64_t key, n1c, n1d; uint32_t caller; } g_pkey[PKEY_TOP];
++static unsigned g_pkey_n;
++static uint64_t g_ovf1c, g_ovf1d;
++static _Atomic uint64_t g_n1c, g_n1d, g_n1d_woke;
++static void pkey_note(int is1d, uint64_t key, uint32_t caller) {   // 调用方持 G
++    if (is1d) atomic_fetch_add_explicit(&g_n1d, 1, memory_order_relaxed);
++    else      atomic_fetch_add_explicit(&g_n1c, 1, memory_order_relaxed);
++    for (unsigned i = 0; i < g_pkey_n; i++) if (g_pkey[i].key == key) {
++        if (is1d) { g_pkey[i].n1d++; if (!g_pkey[i].caller) g_pkey[i].caller = caller; }   // 首位 0x1D 调用者=发信号者画像
++        else g_pkey[i].n1c++;
++        return;
++    }
++    if (g_pkey_n < PKEY_TOP) {   // 首见 key 入表（16 槽后计入溢出桶）
++        g_pkey[g_pkey_n].key = key; g_pkey[g_pkey_n].n1c = !is1d; g_pkey[g_pkey_n].n1d = !!is1d;
++        g_pkey[g_pkey_n].caller = is1d ? caller : 0; g_pkey_n++;
++        return;
++    }
++    if (is1d) g_ovf1d++; else g_ovf1c++;
+ }
+ static void evlog(uint32_t op, uint32_t h, uint32_t h2, uint64_t lr) {
+     /* round6 账本 + round8 归因：per-handle signal/reset 累计与首见裸 LR（0x1024 的 signal 源=宿主构造侧、
+@@ -634,6 +659,7 @@
+     case 0x1C: {  // WaitProcessWideKeyAtomic(x0 锁地址, x1 条件键, w2 标签, x3 超时) | WaitProcessWideKeyAtomic(x0 lock address, x1 condition key, w2 tag, x3 timeout)
+         thr_t *t = cur(); uint64_t addr = regs[0], key = regs[1];
+         pthread_mutex_lock(&G);
++        pkey_note(0, key, t->handle);   // round9 观测：条件等待 per-key 计数（持 G、零 I/O）
+         // 顺序要紧：先置条件键 = 1，再放互斥锁。SDK 的 InternalConditionVariable::Signal 在用户态先读条件键、为 0 就不发 svc 0x1D；
+         // 用户态抢互斥锁也不经过 G。原先先 lock_handoff 后置键：放锁后、置键前，别的线程可在用户态抢到锁、改完条件、读到键 0 就不唤醒，
+         // 本线程随后挂上去永远等不到（并行负载下资源表读写锁 main+0x320e5e0 卡死：读者计数 0、锁空闲、写者条件键 1、写者仍在等）。
+@@ -663,7 +689,9 @@
+     case 0x1D: {  // SignalProcessWideKey(x0 条件键, w1 个数，<=0 全部) | SignalProcessWideKey(x0 condition key, w1 count, <=0 all)
+         uint64_t key = regs[0]; int cnt = (int)regs[1], n = 0;
+         pthread_mutex_lock(&G);
+-        for (thr_t *w; (cnt <= 0 || n < cnt) && (w = pick(2, key)); n++) lock_acquire_for(w, w->waddr, w->wtag);   // 按内核顺序；转为锁等待或被唤醒后不再是 kind 2 | In kernel order; once turned into a lock wait or woken it is no longer kind 2
++        { thr_t *me = me_or_null(); pkey_note(1, key, me ? me->handle : 0); }   // round9 观测：signal per-key 计数+首位调用者（sigaddr 0x35 同范式）
++        for (thr_t *w; (cnt <= 0 || n < cnt) && (w = pick(2, key)); n++) lock_acquire_for(w, w->waddr, w->wtag);   // 按内核顺序；转为锁等待或被唤醒后不再是 kind 2
++        atomic_fetch_add_explicit(&g_n1d_woke, (uint64_t)n, memory_order_relaxed);   // round9 观测：实际转醒的等待者数（signal 有没有人接） | In kernel order; once turned into a lock wait or woken it is no longer kind 2
+         int left = 0; for (thr_t *w = g_wait; w; w = w->next) if (w->wkind == 2 && w->wkey == key) { left = 1; break; }
+         if (!left) st32(key, 0);
+         pthread_mutex_unlock(&G);
+@@ -1032,6 +1060,18 @@
+     int locked = 0; for (int i = 0; i < 100 && !(locked = pthread_mutex_trylock(&G) == 0); i++) usleep(10000);
+     fprintf(stderr, "[totk-dump] global thread lock %s\n", locked ? "acquired" : "HELD BY ANOTHER THREAD (dumping without it)");
+     fprintf(stderr, "[totk-dump] guest threads after %u s\n", secs);
++    {   /* round9 观测：模块基址头行（每次 dump 带头）。宿主 libgame.so（dladdr 自身函数取装载基址——
++           OHOS linker 完成 relocate 后 dladdr 即可查）+ 客体三模块（宿主 loader relocate 完成时另打
++           [loader-base] 一份）。evlog/evc 的 who=0x7f81… 裸 LR（宿主侧 __builtin_return_address，
++           runtime_describe_address 不落客体模块时打原值）用本行基址减去即得 offset，离线拿 obj 副本
++           （带 debug_info）符号化。 */
++        Dl_info di;
++        uint64_t host_base = dladdr((void *)(uintptr_t)&dump_threads, &di) ? (uint64_t)(uintptr_t)di.dli_fbase : 0;
++        uint8_t *bmain = runtime_module_base("main"), *bsdk = runtime_module_base("sdk"), *bsub = runtime_module_base("subsdk0");
++        fprintf(stderr, "[totk-dump] bases: host-libgame=%#llx main=%#llx sdk=%#llx subsdk0=%#llx\n",
++                (unsigned long long)host_base, (unsigned long long)(uintptr_t)bmain,
++                (unsigned long long)(uintptr_t)bsdk, (unsigned long long)(uintptr_t)bsub);
++    }
+     { fprintf(stderr, "[totk-dump] account lock owner host tid %llu\n", (unsigned long long)runtime_account_lock_owner()); }
+     for (int c = 0; c < NCORE; c++) fprintf(stderr, "[totk-dump] core %d owner %#x for %.1f ms\n", c, g_core_owner[c] ? g_core_owner[c]->handle : 0,
+                                             g_core_owner[c] ? (now_ns() - g_core_owner[c]->core_since) / 1e6 : 0.0);
+@@ -1166,6 +1206,32 @@
+           fprintf(stderr, "[totk-dump] sigaddr overflow (beyond %d addrs): wait=%llu sig=%llu\n",
+                   SIGADDR_TOP, (unsigned long long)g_ovf34, (unsigned long long)g_ovf35);
+     }
++    /* round9 观测（条件变量 SVC）：svc 0x1C/0x1D per-key 表（sigaddr 范式）——总数/唤醒数 +
++       前 8 名 key 的 wait(0x1C)/sig(0x1D)/当前等待者数（现场数 g_wait 的 wkind==2）/首位 signal
++       调用者句柄 + 溢出桶。等待无配对 signal（唤醒丢失嫌疑）/signal 无人接在此一表可读。 */
++    { fprintf(stderr, "[totk-dump] svc 0x1C WaitProcessWideKey: total=%llu\n",
++              (unsigned long long)atomic_load(&g_n1c));
++      fprintf(stderr, "[totk-dump] svc 0x1D SignalProcessWideKey: total=%llu woken=%llu\n",
++              (unsigned long long)atomic_load(&g_n1d), (unsigned long long)atomic_load(&g_n1d_woke));
++      unsigned done = 0;
++      for (int k = 0; k < 8; k++) {
++          int best = -1; uint64_t bd = 0, bc = 0;
++          for (unsigned i = 0; i < g_pkey_n && i < 32; i++) {
++              if ((done >> i) & 1u) continue;
++              uint64_t sd = g_pkey[i].n1d, sc = g_pkey[i].n1c;
++              if (sd > bd || (sd == bd && sc > bc)) { bd = sd; bc = sc; best = (int)i; }
++          }
++          if (best < 0 || (!bd && !bc)) break;
++          done |= 1u << best;
++          int nw = 0; for (thr_t *w = g_wait; w; w = w->next) if (w->wkind == 2 && w->wkey == g_pkey[best].key) nw++;
++          fprintf(stderr, "[totk-dump] pkey %#llx wait(0x1C)=%llu sig(0x1D)=%llu waiters=%d sig-caller=h%#x\n",
++                  (unsigned long long)g_pkey[best].key, (unsigned long long)g_pkey[best].n1c,
++                  (unsigned long long)g_pkey[best].n1d, nw, g_pkey[best].caller);
++      }
++      if (g_ovf1c || g_ovf1d)
++          fprintf(stderr, "[totk-dump] pkey overflow (beyond %d keys): wait=%llu sig=%llu\n",
++                  PKEY_TOP, (unsigned long long)g_ovf1c, (unsigned long long)g_ovf1d);
++    }
+     /* round6 观测（任务3）：h=0x1023 的 svc 0x18 醒来计数——calls=进入等待次数，woken=被唤醒返回次数，
+        woken-by-0x101f=其中被目标事件 0x101f 唤醒的（woken 与之恒等差=被别的句柄或超时喂醒）。 */
+     fprintf(stderr, "[totk-dump] svc 0x18 h=0x1023 wakeups: calls=%llu woken=%llu woken-by-0x101f=%llu\n",

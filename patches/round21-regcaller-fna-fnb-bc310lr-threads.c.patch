@@ -1,0 +1,300 @@
+diff --git a/mario-odessy-harmony/entry/src/main/cpp/host/threads.c b/mario-odessy-harmony/entry/src/main/cpp/host/threads.c
+--- a/mario-odessy-harmony/entry/src/main/cpp/host/threads.c
++++ b/mario-odessy-harmony/entry/src/main/cpp/host/threads.c
+@@ -1423,20 +1423,12 @@
+         fprintf(stderr, "[totk-dump] ct last reject entry=%#llx arg=%#llx prio=%d core=%d ret=%#x\n",
+                 (unsigned long long)g_ct_last_reject.entry, (unsigned long long)g_ct_last_reject.arg,
+                 g_ct_last_reject.prio, g_ct_last_reject.core, g_ct_last_reject.ret);
+-    /* ---------- round9b E1/E2 观测门 + E4 两族合流检验（放锁后；spin_read16 是 EFAULT 安全读）----------
+-       E1（main+0x57f950 元素数组门，game_patches.c）：末次快照 {el, this}，this+0x58 即发 key 表达式；
+-       E4：等 key-0x78=worker 对象、发 key-0x58=池对象，两族交集=0 时唯一可能相等的绑定
+-       [el+0x10]==worker+0x20（=wkey-0x58）在此直接判出。 */
++    /* ---------- round9b 观测门 dump（round21 集合收敛：E1/E2a/E2b/CELL2/DRAIN_ENTER/
++       DRAIN_LOOP/KICKVT/KICKBR/MQ_RET/MQ_ADV 十门退役；E4 两族合流检验保留——等侧
++       wkind==2 账本与 pkey 表仍打印，E1 绑定侧随门退役恒 0）。 ---------- */
+     {
+       extern uint64_t smo_obs_hits(int);
+       extern uint64_t smo_obs_last_x0(int);
+-      extern unsigned smo_obs_e1_snapshot(uint64_t *, uint64_t *, unsigned, uint64_t *, uint64_t *, unsigned *);
+-      fprintf(stderr, "[totk-dump] obs E1 0x57f950 hits=%llu last_x0=%#llx\n",
+-              (unsigned long long)smo_obs_hits(0), (unsigned long long)smo_obs_last_x0(0));
+-      fprintf(stderr, "[totk-dump] obs E2 drain 0x8aef34 hits=%llu last_x0=%#llx\n",
+-              (unsigned long long)smo_obs_hits(1), (unsigned long long)smo_obs_last_x0(1));
+-      fprintf(stderr, "[totk-dump] obs E2 drain 0x8af418 hits=%llu last_x0=%#llx\n",
+-              (unsigned long long)smo_obs_hits(2), (unsigned long long)smo_obs_last_x0(2));
+       /* round13 fixPlan(2)：kick 断链指令级计数（donor 0x8ad1f0 族预期 ≈920+410+舞台数，与 wait#921/920/410 对账）。
+          kick1=派发函数全部入口（含 al 尾调）；al-kick=al 层调用（0x587ea8 单字门，仅过 NULL 检查的真实调用）；
+          kick3=三参变体合流点 0x8ad318（单字门）。kick1≈0 ⇒ kick 从未运行（断链在注册上游，走 fixPlan(4)）。 */
+@@ -1446,25 +1438,14 @@
+               (unsigned long long)smo_obs_hits(5), (unsigned long long)smo_obs_last_x0(5));
+       fprintf(stderr, "[totk-dump] obs kick3 0x8ad318 hits=%llu last_x0=%#llx\n",
+               (unsigned long long)smo_obs_hits(6), (unsigned long long)smo_obs_last_x0(6));
+-      /* round15 排空路径门：ENTER=0 → 排空函数从未被调（两调用源均未到达）；
+-         ENTER>0 ∧ kick1=0 → 每次进排空都走空表捷径（完成包从未入队）；ENTER>0 ∧ kick1>0 → kick 已派发。 */
+-      fprintf(stderr, "[totk-dump] obs drain-enter 0x8abf70 hits=%llu last_x0=%#llx\n",
+-              (unsigned long long)smo_obs_hits(7), (unsigned long long)smo_obs_last_x0(7));
+-      /* round16b 排空循环块门（循环头 0x8abf94，bl 0x8ad1f0 所在块入口）：LOOP>0 ⇒ 每次
+-         命中必执行 bl（块内无分支）＝kick 直接调用路径实跑；KICK1−ALKICK−LOOP=其它直接调用源。
+-         首见快照=kick 三条件值（w1 / [this+0xf9] / [this+0x20]，this=节点 x8-0x1c0——
+-         kick 0x8ad200 cmp w1,#1 / 0x8ad208 ldrb [x19,#0xf9] / 0x8ad278 ldr x0,[x19,#0x20]）。 */
+-      fprintf(stderr, "[totk-dump] obs drain-loop 0x8abf94 hits=%llu last_x0=%#llx\n",
+-              (unsigned long long)smo_obs_hits(8), (unsigned long long)smo_obs_last_x0(8));
+-      {
+-      extern int smo_obs_dl_snapshot(uint64_t *, uint64_t *, uint64_t *, uint64_t *, uint64_t *, uint64_t *, int *);
+-      uint64_t dn, dth, dw1, df9, do20, dts; int draw = 0;
+-      if (smo_obs_dl_snapshot(&dn, &dth, &dw1, &df9, &do20, &dts, &draw))
+-          fprintf(stderr, "[totk-dump] drain-loop first-hit: node(x8)=%#llx kick-this=%#llx w1=%llu [this+0xf9]=%#llx [this+0x20]=%#llx at %s%llu\n",
+-                  (unsigned long long)dn, (unsigned long long)dth, (unsigned long long)dw1,
+-                  (unsigned long long)df9, (unsigned long long)do20, draw ? "tick " : "+", (unsigned long long)dts);
+-      else fprintf(stderr, "[totk-dump] drain-loop first-hit: none (gate never hit)\n");
+-      }
++      /* round21 注册调用者两门（FN_A=0x8b65e0 含 0x8b6688/0x8b6708 两循环、FN_B=0x8b6920
++         含 0x8b6990——三条 bl 实属两函数，反汇编实证见 game_patches.c round21 注）：与
++         REG230 hits 对账=「进调用者函数的次数」vs「注册动作次数」（FN_A 两循环每节点一次
++         REG230+0x8ae1e0；FN_B 每桶每节点一对）。首见见下方 fs[] 段。 */
++      fprintf(stderr, "[totk-dump] obs fn_a 0x8b65e0 (bl 0x8b6688+0x8b6708) hits=%llu last_x0=%#llx\n",
++              (unsigned long long)smo_obs_hits(18), (unsigned long long)smo_obs_last_x0(18));
++      fprintf(stderr, "[totk-dump] obs fn_b 0x8b6920 (bl 0x8b6990) hits=%llu last_x0=%#llx\n",
++              (unsigned long long)smo_obs_hits(19), (unsigned long long)smo_obs_last_x0(19));
+       /* round17 ①：KICK1 三条件快照（DRAIN-LOOP 门随排空函数 0 次进入而永不命中，改挂
+          kick 真入口 0x8ad1f4——this=x0、w1=原 x1）：三分支交叉分布直接回答「216 次真 kick
+          为何派不到 worker」（w1<1 与 w1>=1∧f9==2 走 0x8ad214 直虚调；w1>=1∧f9!=2 走
+@@ -1506,7 +1487,10 @@
+ #endif
+       /* round17 ②：BC310 广播调用点（donor main+0x954310，CreateThread→StartThread→svc0x1d
+          广播序列现场 x3 恒=该入口值，且全镜像无直接分支落此＝只经指针调用）。emu hits>0 ⇒
+-         emu main 执行了同一 boot 广播链；first/last x0=该函数收的对象（InitSystem 收件箱归属）。 */
++         emu main 执行了同一 boot 广播链；first/last x0=该函数收的对象（InitSystem 收件箱归属）。
++         round21 增调用者 LR 读数：blr 调用⇒LR=调用点+4、br 尾跳⇒LR=更上层返回地址；首 64
++         采样环分布（符号化）=外层循环调用点定位的主读数；末见 {x1,ts}=45807 次后循环耗尽
++         时的末次现场（循环头/退出分支门待 LR 定位调用者后下轮装）。 */
+       {
+       extern int smo_obs_bc_snapshot(uint64_t *, uint64_t *, uint64_t *);
+       uint64_t bfx0 = 0, bfx1 = 0, bfts = 0;
+@@ -1516,50 +1500,26 @@
+               bchit ? "" : "0/", bchit ? (unsigned long long)bfx1 : 0ULL,
+               (unsigned long long)bfts, (unsigned long long)smo_obs_last_x0(9));
+       }
+-      /* round17 ③：KICKVT 虚调目标分布（0x8ad214 取数点：vt=[this]、tgt=[vt+0x20]＝
+-         0x8ad228 br x1 的目标）。tgt 符号化（runtime_module_offset）：指向 main 内偏移或
+-         HLE thunk 表即虚路径分叉点实锤，与 donor 的 kick 入数对账。 */
+       {
+-      extern int smo_obs_kickvt_dist(uint64_t[8], uint64_t[8], uint64_t *, uint64_t *, uint64_t[2], uint64_t *);
+-      uint64_t vv[8], vc[8], vover = 0, vzero = 0, vf[2], vlast = 0;
+-      if (smo_obs_kickvt_dist(vv, vc, &vover, &vzero, vf, &vlast)) {
++      extern int smo_obs_bc_caller(uint64_t *, uint64_t *, uint64_t *, uint64_t *, int *, uint64_t[64], uint64_t *);
++      uint64_t flr = 0, llr = 0, lx1 = 0, lts = 0, lrv[64], ltot = 0; int lraw = 0;
++      if (smo_obs_bc_caller(&flr, &llr, &lx1, &lts, &lraw, lrv, &ltot)) {
+           const char *nm; uint64_t off;
+-          fprintf(stderr, "[totk-dump] obs kickvt 0x8ad214 hits=%llu zero=%llu over=%llu first vt=%#llx tgt=%#llx last_tgt=%#llx\n",
+-                  (unsigned long long)smo_obs_hits(10), (unsigned long long)vzero, (unsigned long long)vover,
+-                  (unsigned long long)vf[0], (unsigned long long)vf[1], (unsigned long long)vlast);
+-          for (int i = 0; i < 8; i++) {
+-              if (!vv[i]) continue;
+-              fprintf(stderr, "[totk-dump] kickvt dist[%d]: tgt=%#llx cnt=%llu", i, (unsigned long long)vv[i], (unsigned long long)vc[i]);
+-              if (runtime_module_offset(vv[i], &nm, &off)) fprintf(stderr, " -> %s+%#llx", nm, (unsigned long long)off);
++          fprintf(stderr, "[totk-dump] bc310 caller: first_lr=%#llx", (unsigned long long)flr);
++          if (runtime_module_offset(flr, &nm, &off)) fprintf(stderr, " -> %s+%#llx", nm, (unsigned long long)off);
++          fprintf(stderr, " | last_lr=%#llx", (unsigned long long)llr);
++          if (runtime_module_offset(llr, &nm, &off)) fprintf(stderr, " -> %s+%#llx", nm, (unsigned long long)off);
++          fprintf(stderr, " | last x1=%#llx at %s%llu | lr-samples=%llu/64\n",
++                  (unsigned long long)lx1, lraw ? "tick " : "+", (unsigned long long)lts, (unsigned long long)ltot);
++          for (unsigned i = 0; i < 64 && i < ltot; i++) {
++              if (!lrv[i]) continue;
++              fprintf(stderr, "[totk-dump] bc310 lr[%u]=%#llx", i, (unsigned long long)lrv[i]);
++              if (runtime_module_offset(lrv[i], &nm, &off)) fprintf(stderr, " -> %s+%#llx", nm, (unsigned long long)off);
+               fputc('\n', stderr);
+           }
+-          if (vf[0] && runtime_module_offset(vf[0], &nm, &off))
+-              fprintf(stderr, "[totk-dump] kickvt first-vt: %s+%#llx (this 的 vtable)\n", nm, (unsigned long long)off);
+-      } else fprintf(stderr, "[totk-dump] obs kickvt 0x8ad214 hits=%llu (gate never hit)\n",
+-                     (unsigned long long)smo_obs_hits(10));
++      } else fprintf(stderr, "[totk-dump] bc310 caller: none (gate never hit)\n");
+       }
+-      /* round18 ③：KICKBR（0x8ad228 br x1 本尊，单字尾门）——x1 寄存器真值 32 槽分布，
+-         每槽符号化（runtime_module_offset）出模块+偏移；与 kickvt 的内存推导值
+-         （vt=[this]、[vt+0x20]）互证：两值不一致即取数链/寄存器被改道的直接证据，
+-         emu tgt 指向 HLE thunk 表或错误槽=虚路径分叉实锤。 */
+-      {
+-      extern int smo_obs_kickbr_dist(uint64_t[32], uint64_t[32], uint64_t *, uint64_t *, uint64_t[2], uint64_t *);
+-      uint64_t kbv[32], kbc[32], kbover = 0, kbzero = 0, kbf[2], kblast = 0;
+-      if (smo_obs_kickbr_dist(kbv, kbc, &kbover, &kbzero, kbf, &kblast)) {
+-          const char *nm; uint64_t off;
+-          fprintf(stderr, "[totk-dump] obs kickbr 0x8ad228 hits=%llu zero=%llu over=%llu first this=%#llx tgt(x1)=%#llx last_tgt=%#llx\n",
+-                  (unsigned long long)smo_obs_hits(11), (unsigned long long)kbzero, (unsigned long long)kbover,
+-                  (unsigned long long)kbf[0], (unsigned long long)kbf[1], (unsigned long long)kblast);
+-          for (int i = 0; i < 32; i++) {
+-              if (!kbv[i]) continue;
+-              fprintf(stderr, "[totk-dump] kickbr dist[%d]: x1=%#llx cnt=%llu", i,
+-                      (unsigned long long)kbv[i], (unsigned long long)kbc[i]);
+-              if (runtime_module_offset(kbv[i], &nm, &off)) fprintf(stderr, " -> %s+%#llx", nm, (unsigned long long)off);
+-              fputc('\n', stderr);
+-          }
+-      } else fprintf(stderr, "[totk-dump] obs kickbr 0x8ad228 hits=%llu (gate never hit)\n",
+-                     (unsigned long long)smo_obs_hits(11));
+-      }
++      /* round21：kickvt/kickbr 两段随门退役删除（round17/18 的虚路径分叉问题已闭环）。 */
+       /* round19 ①②：al thunk 双门×2（thunk1=0x587ea0 两参 kick 蹦床、thunk2=0x587eb0
+          三参变体蹦床）。入口门装在唯一进入分支（0x587da4/0x587db4 的 b，全镜像扫描
+          唯一落点+门址零落点）计全部进入；NULL 出口门装在 cbz 早退落点（0x587eac/
+@@ -1570,19 +1530,18 @@
+       fprintf(stderr, "[totk-dump] thunk gates: thunk1 in(0x587da4)=%llu null(0x587eac)=%llu | thunk2 in(0x587db4)=%llu null(0x587ec4)=%llu\n",
+               (unsigned long long)smo_obs_hits(12), (unsigned long long)smo_obs_hits(13),
+               (unsigned long long)smo_obs_hits(14), (unsigned long long)smo_obs_hits(15));
+-      /* round20 注册三门 + mq walker 双尾门（game_patches.c 门 id 16-19）：
++      /* round20 注册两门 + round21 调用者两门（game_patches.c 门 id 16/17/18/19）：
+          entry(0x8ae230)=注册函数（str x1,[x0] 写句柄入槽）全部进入；done(0x8ae258)=注册体
+          跑到尾声（str 与回指针写都在其上游线性路径上；全镜像扫描 23c/240/244 零落点 ⇒
+          str 执行 ⇔ entry 命中）；entry==done ⇔ 每次进入都完整注册，entry>done=中途异常。
+-         mq680 ret+adv=版本比较 walker 全部进入（终结+前进四路径穷尽，合成环头计数）。
+-         首见 {x0,x1,ts}：x1=被注册句柄(entry)/版本比较字(mq)；REG230 与 MQ 门首见 ts
+-         相减=注册 vs 消费侧首跑时序（注册时序假说的主读数）。 */
+-      fprintf(stderr, "[totk-dump] reg gates: entry(0x8ae230)=%llu done(0x8ae258)=%llu | mq680 walker: ret(0x9646a4)=%llu adv(0x9646ac)=%llu\n",
+-              (unsigned long long)smo_obs_hits(16), (unsigned long long)smo_obs_hits(17),
+-              (unsigned long long)smo_obs_hits(18), (unsigned long long)smo_obs_hits(19));
++         mq walker 双尾门（18/19）round21 退役，id 改派 FN_A/FN_B（上方 fn_a/fn_b 行）。
++         首见 {x0,x1,ts}：REG230 x1=被注册句柄；FN_A x1=版本容器；FN_B x0=容器本体——
++         与 REG230 首见 ts 相减=调用者函数 vs 注册动作时序。 */
++      fprintf(stderr, "[totk-dump] reg gates: entry(0x8ae230)=%llu done(0x8ae258)=%llu\n",
++              (unsigned long long)smo_obs_hits(16), (unsigned long long)smo_obs_hits(17));
+       {
+       extern int smo_obs_fs_snapshot(int, uint64_t *, uint64_t *, uint64_t *);
+-      static const char *fsn[3] = { "reg-entry 0x8ae230 (x0=slot x1=handler)", "mq680-ret 0x9646a4 (x0=node x1=ver)", "mq680-adv 0x9646ac (x0=next x1=ver)" };
++      static const char *fsn[3] = { "reg-entry 0x8ae230 (x0=slot x1=handler)", "fn_a 0x8b65e0 (x0=timebase x1=ver-container)", "fn_b 0x8b6920 (x0=container x1=arg2)" };
+       for (int k = 0; k < 3; k++) {
+           uint64_t fx0 = 0, fx1 = 0, fts = 0;
+           if (smo_obs_fs_snapshot(k, &fx0, &fx1, &fts))
+@@ -1610,33 +1569,8 @@
+ #else
+       fprintf(stderr, "[totk-dump] bc310 first16 x0: probe OFF this build (round20 minimal-perturbation; SMO_OBS_HEAVY=0)\n");
+ #endif
+-      /* round16b E2b 归属：上轮 E2a this=0x7f76fcdaf8 与 h1020/h1023 arg 同 0x7f76fc 邻域。
+-         对 E2 this 做池反查（宿主 NVN 池账本 gfx_bridge nvn_pool_ledger，±0x4000 页距容差）
+-         + CreateThread 账本同 64K 邻域 arg 对照，一行打归属推断依据（谁的对象）。
+-         64K 而非 4K：实测两跑 this 与 arg 恒隔一页（0x7f76dc1af8 vs 0x7f76dc27a8 /
+-         0x7f76fcdaf8 vs 0x7f76fc2xxx），4K 页匹配会漏掉全部证据。 */
+-      {
+-      extern int runtime_nvn_pool_hit(uint64_t, uint64_t *, uint64_t *, unsigned *);
+-      uint64_t e2a = smo_obs_last_x0(1), e2b = smo_obs_last_x0(2), probe = e2a ? e2a : e2b;
+-      if (probe > 0x100000000ULL) {
+-          uint64_t lo = 0, hi = 0; unsigned pfl = 0;
+-          int hit = runtime_nvn_pool_hit(probe, &lo, &hi, &pfl);
+-          fprintf(stderr, "[totk-dump] E2 pool attribution: E2a this=%#llx E2b this=%#llx page=%#llx nvn-pool=%s",
+-                  (unsigned long long)e2a, (unsigned long long)e2b, (unsigned long long)(probe & ~0xfffull),
+-                  hit ? "HIT" : "miss");
+-          if (hit) fprintf(stderr, " [mem=%#llx +%#llx flags=%#x]", (unsigned long long)lo,
+-                           (unsigned long long)(hi - lo), pfl);
+-          int near = 0;
+-          for (unsigned i = 0; i < g_ct_n; i++)
+-              if (g_ct[i].arg > 0x100000000ULL && (g_ct[i].arg & ~0xfffffull) == (probe & ~0xfffffull))
+-                  fprintf(stderr, "%s h=%#x arg=%#llx Δ=%+lld", near++ ? "" : " | same-64K ct-arg:",
+-                          g_ct[i].handle, (unsigned long long)g_ct[i].arg, (long long)(g_ct[i].arg - probe));
+-          fprintf(stderr, " -> %s\n",
+-                  hit ? "host NVN 池对象（nvn_pool_ledger 命中，flags 见上）"
+-                  : near ? "非 NVN 池；同 64K 邻域存在 CreateThread arg → 游戏堆上交给线程的工作/队列对象邻域"
+-                  : "非已知池且无同 64K 线程 arg：归属未定（可 TOTK_DUMP_AT 静态取证该页）");
+-      } else fprintf(stderr, "[totk-dump] E2 pool attribution: E2a/E2b this 均 0（门未命中），无页可归属\n");
+-      }
++      /* round21：E2 池归属段随 E2a/E2b 门退役删除；cell2/E1 snapshot/E1 变迁史三段随门退役
++         删除（问题均已闭环）。 */
+       /* round15b 回执写入门（gfx_bridge 回执环）：writes=退休时真实落内存次数（emu14 遗留①验收位：
+          writes>0=回执落地）；recorded 分 kind 对照未退休 pending；unknown_handle=重录后旧句柄再提交。 */
+       {
+@@ -1647,76 +1581,9 @@
+               (unsigned long long)dm_nvn_receipt_stat(4), (unsigned long long)dm_nvn_receipt_stat(5),
+               (unsigned long long)dm_nvn_receipt_stat(6), (unsigned long long)dm_nvn_receipt_stat(7));
+       }
+-      /* round12e 定名：GetLoadProgress f() 的两条双间接 cell 链（0x1363dc8 已知=Map 作验证位，0x136deb8 待定名） */
+-      {
+-      extern int smo_obs_cell2_snapshot(uint64_t[6]);
+-      uint64_t c2[6];
+-      if (smo_obs_cell2_snapshot(c2)) {
+-          const char *nm; uint64_t off;
+-          /* round13b 实测：游戏 0x9b9bc4-0x9b9bd0 的双间接是 cell→[cell]=目标（blr 的就是它），
+-             [cell] 落在宿主 HLE thunk 表（hle_stack.S runtime_hle_thunks，索引=包装注册序）——
+-             上方打印的 fn= 是对 thunk 再解引用读到的头两条指令字（13b 实测 cell1 的 fn 低字
+-             0xd2801b91 恰为『mov x17,#0xdc』的编码字，自证）。此处按 thunk 索引直接定名。 */
+-          extern char runtime_hle_thunks[];
+-          for (int k = 0; k < 2; k++) {
+-              uint64_t t = c2[k * 3 + 1], base = (uint64_t)(uintptr_t)runtime_hle_thunks;
+-              if (t >= base && t < base + 65536ULL * 16) {
+-                  char hn[256]; runtime_hle_describe((unsigned)((t - base) / 16), hn, sizeof hn);
+-                  fprintf(stderr, "[totk-dump] cell2 %s: call target %#llx = HLE thunk #%u -> %s\n",
+-                          k ? "0x136deb8" : "0x1363dc8", (unsigned long long)t, (unsigned)((t - base) / 16), hn);
+-              }
+-          }
+-          fprintf(stderr, "[totk-dump] cell2 0x1363dc8: cell=%#llx table=%#llx fn=%#llx",
+-                  (unsigned long long)c2[0], (unsigned long long)c2[1], (unsigned long long)c2[2]);
+-          if (runtime_module_offset(c2[2], &nm, &off)) fprintf(stderr, " -> %s+%#llx", nm, (unsigned long long)off);
+-          fputc('\n', stderr);
+-          fprintf(stderr, "[totk-dump] cell2 0x136deb8: cell=%#llx table=%#llx fn=%#llx",
+-                  (unsigned long long)c2[3], (unsigned long long)c2[4], (unsigned long long)c2[5]);
+-          if (runtime_module_offset(c2[5], &nm, &off)) fprintf(stderr, " -> %s+%#llx", nm, (unsigned long long)off);
+-          fputc('\n', stderr);
+-      } else fprintf(stderr, "[totk-dump] cell2 snapshot: not set (gate 0x9b9bc4 未命中或安装失败)\n");
+-      }
+-      static uint64_t e1el[128], e1th[128];
+-      uint64_t obj = 0, arr = 0; unsigned trunc = 0;
+-      unsigned n = smo_obs_e1_snapshot(e1el, e1th, 128, &obj, &arr, &trunc);
+-      fprintf(stderr, "[totk-dump] E1 snapshot: obj=%#llx arr=%#llx count=%u%s\n",
+-              (unsigned long long)obj, (unsigned long long)arr, n, trunc ? " (TRUNCATED, see trunc count)" : "");
+-      if (trunc) fprintf(stderr, "[totk-dump] E1 truncated count=%u (cap 128)\n", trunc);
+-      for (unsigned i = 0; i < n; i++) {
+-          uint64_t th = e1th[i];
+-          fprintf(stderr, "[totk-dump] E1 el[%u]=%#llx this=[el+0x10]=%#llx sig-key(this+0x58)=%#llx",
+-                  i, (unsigned long long)e1el[i], (unsigned long long)th, (unsigned long long)(th + 0x58));
+-          uint64_t mq2[2];
+-          if (th > 0x100000000ULL && spin_read16(th + 0x10, mq2)) {   /* +0x10/+0x18 一并取；发 key=MQ+0x40 模型对账 */
+-              uint64_t mq = mq2[1];
+-              fprintf(stderr, " [this+0x18]=MQ=%#llx mq-key(MQ+0x40)=%#llx", (unsigned long long)mq, (unsigned long long)(mq + 0x40));
+-          }
+-          fputc('\n', stderr);
+-      }
+-      /* round15/16b：E1 count 变迁史（环 32 条 {at-hits,count,arr,ts}）——count 曾否>2 与
+-         N→2 缩点时刻：环内逐条 + 单调汇总标量（max_cnt/shrink 不受环覆盖影响）。ts 为自
+-         obs 门安装起的 ns（raw=1 时 timer 不可用，退化为裸 CNTVCT tick）。 */
+-      {
+-      extern unsigned smo_obs_e1_hist(uint64_t *, uint32_t *, uint64_t *, uint64_t *, unsigned, unsigned *, int *);
+-      extern void smo_obs_e1_summary(uint32_t *, uint64_t *, uint32_t *, uint32_t *, uint64_t *, uint32_t *, int *);
+-      uint64_t hh[32], ha[32], ht[32]; uint32_t hc[32]; unsigned total = 0; int raw = 0;
+-      unsigned hn = smo_obs_e1_hist(hh, hc, ha, ht, 32, &total, &raw);
+-      fprintf(stderr, "[totk-dump] E1 count history: %u transition(s) (total=%u%s, ts %s)\n",
+-              hn, total, total > 32 ? ", ring wrapped" : "",
+-              raw ? "raw ticks" : "ns, CLOCK_MONOTONIC_RAW 刻度（门安装时刻起可比，差值即耗时）");
+-      for (unsigned i = 0; i < hn; i++)
+-          fprintf(stderr, "[totk-dump] E1 hist[%u] at-E1-hits=%llu count=%u arr=%#llx ts=%llu\n",
+-                  i, (unsigned long long)hh[i], hc[i], (unsigned long long)ha[i], (unsigned long long)ht[i]);
+-      uint32_t mc = 0, sf = 0, st = 0, sh = 0; uint64_t mns = 0, sns = 0; int sraw = 0;
+-      smo_obs_e1_summary(&mc, &mns, &sf, &st, &sns, &sh, &sraw);
+-      fprintf(stderr, "[totk-dump] E1 summary: max-count-ever=%u (at %s%llu)%s",
+-              mc, sraw ? "tick " : "+", (unsigned long long)mns,
+-              mc > 2 ? "  ⇒ count 曾>2" : "  ⇒ count 从未>2");
+-      if (sh) fprintf(stderr, "; shrink %u→%u at %s%llu (count 首次跌回≤2 的变迁=缩点时刻)",
+-                      sf, st, sraw ? "tick " : "+", (unsigned long long)sns);
+-      fputc('\n', stderr);
+-      }
+-      /* E4：两族推导表 + 交集判定（worker=key-0x78；池对象=key-0x58；绑定=[el+0x10]==wkey-0x58）。 */
++      /* E4：等侧两族推导表 + 交集判定（worker=key-0x78；池对象=key-0x58）。
++         round21：E1 绑定侧（[el+0x10]==wkey-0x58）随 E1 门退役恒 0——round17 已实证
++         confluence=1/e1-binding=0，保留等侧账本供对账。 */
+       int confluence = 0, binding = 0;
+       for (thr_t *w = g_wait; w; w = w->next) if (w->wkind == 2) {
+           uint64_t worker = w->wkey - 0x78;
+@@ -1735,16 +1602,7 @@
+               for (thr_t *w = g_wait; w; w = w->next) if (w->wkind == 2 && w->wkey == key) confluence = 1;
+           }
+       }
+-      /* 绑定判定独立小循环（可读性优先）：[el+0x10] == 任一停泊 worker 的 wkey-0x58 */
+-      for (unsigned j = 0; j < n; j++) {
+-          if (!e1th[j]) continue;
+-          for (thr_t *w = g_wait; w; w = w->next) if (w->wkind == 2 && e1th[j] == w->wkey - 0x58) {
+-              binding++;
+-              fprintf(stderr, "[totk-dump] E4 BINDING: E1 this %#llx == worker+0x20 of waiter h=%#x (wkey=%#llx)\n",
+-                      (unsigned long long)e1th[j], w->handle, (unsigned long long)w->wkey);
+-          }
+-      }
+-      fprintf(stderr, "[totk-dump] E4 verdict: key-confluence(sig-key==wait-key)=%d e1-binding(this==worker+0x20)=%d\n",
++      fprintf(stderr, "[totk-dump] E4 verdict: key-confluence(sig-key==wait-key)=%d e1-binding(this==worker+0x20)=%d (E1 retired round21)\n",
+               confluence, binding);
+     }
+     /* round6 观测（任务3）：h=0x1023 的 svc 0x18 醒来计数——calls=进入等待次数，woken=被唤醒返回次数，

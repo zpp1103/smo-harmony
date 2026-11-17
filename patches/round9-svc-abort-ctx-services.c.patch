@@ -1,0 +1,45 @@
+--- entry/src/main/cpp/host/services.c	2026-10-31 18:10:08
++++ /Users/zpp/VibeCoding/ns-mario-odessy-to-harmony/mario-odessy-harmony/entry/src/main/cpp/host/services.c	2026-11-01 02:31:15
+@@ -437,7 +437,42 @@
+  for(unsigned i=0;i<60;i++)svc_break_hex(b,&n,w[i]);
+  b[n++]='\n';write(2,b,n);
+ }
++/* round9 观测（偶发 SIGABRT 定位）：装机崩溃 backtrace 落宿主 libgame.so 的 runtime_svc+5104——
++   arm64 obj 符号化定谳为 svc 0x26 guest Break 致命路的 runtime_fail("original SDK Break")
++   （services.c:529）。abort 时不知在处理哪个 SVC：入口把 {num,x0..x3,fp,lr,module,offset} 存进
++   全局槽（纯 store、无锁无 I/O，num 最后写=提交位），正常返回清零；runtime_fail 与 SIGABRT 的
++   abort_report（loader.c）各打一行 write(2) 落笔（垂死路径缓冲 stdio 会丢，svc_break_window 同款）。 */
++static struct { const char *module; uint64_t offset, x[4], fp, lr; unsigned num; } g_svc_ctx;
++void runtime_svc_context_line(const char *tag) {
++ char b[512]; size_t n = 0;
++ while (*tag && n < sizeof b - 160) b[n++] = *tag++;
++ unsigned num = g_svc_ctx.num;   /* 快照：可能与并发写竞争，取证可接受 */
++ if (!num) { const char *s = "svc=none (between SVCs)\n"; while (*s) b[n++] = *s++; write(2, b, n); return; }
++ const char *s = "svc=0x"; while (*s) b[n++] = *s++;
++ for (int i = 28; i >= 0; i -= 4) b[n++] = "0123456789abcdef"[(num >> i) & 15];
++ if (g_svc_ctx.module) { s = " at "; while (*s) b[n++] = *s++;
++  for (const char *m = g_svc_ctx.module; *m && n < sizeof b - 160; ) b[n++] = *m++;
++  s = "+0x"; while (*s) b[n++] = *s++;
++  for (int i = 60; i >= 0; i -= 4) b[n++] = "0123456789abcdef"[(unsigned)((g_svc_ctx.offset >> i) & 15)]; }
++ static const char *const names[4] = {" x0=", " x1=", " x2=", " x3="};
++ for (int k = 0; k < 4; k++) { s = names[k]; while (*s) b[n++] = *s++;
++  for (int i = 60; i >= 0; i -= 4) b[n++] = "0123456789abcdef"[(unsigned)((g_svc_ctx.x[k] >> i) & 15)]; }
++ s = " fp="; while (*s) b[n++] = *s++;
++ for (int i = 60; i >= 0; i -= 4) b[n++] = "0123456789abcdef"[(unsigned)((g_svc_ctx.fp >> i) & 15)];
++ s = " lr="; while (*s) b[n++] = *s++;
++ for (int i = 60; i >= 0; i -= 4) b[n++] = "0123456789abcdef"[(unsigned)((g_svc_ctx.lr >> i) & 15)];
++ b[n++] = '\n'; write(2, b, n);
++}
++static uint64_t runtime_svc_dispatch(unsigned num,uint64_t *r,const char *module,uint64_t offset);
+ uint64_t runtime_svc(unsigned num,uint64_t *r,const char *module,uint64_t offset) {
++ g_svc_ctx.module = module; g_svc_ctx.offset = offset; g_svc_ctx.fp = r[29]; g_svc_ctx.lr = r[30];
++ for (int i = 0; i < 4; i++) g_svc_ctx.x[i] = r[i];
++ g_svc_ctx.num = num;   /* 提交位最后写：读到 num>0 时其余字段已就位（abort 竞态下至多看到半旧值，取证可接受） */
++ uint64_t res = runtime_svc_dispatch(num,r,module,offset);
++ g_svc_ctx.num = 0;   /* 已返回：此后 abort 落在 SVC 间隙 */
++ return res;
++}
++static uint64_t runtime_svc_dispatch(unsigned num,uint64_t *r,const char *module,uint64_t offset) {
+  runtime_core_checkpoint();
+  // Successful SVCs occur several times per frame. Keep the detailed trace available
+  // for diagnostics without formatting and writing every call during normal play.

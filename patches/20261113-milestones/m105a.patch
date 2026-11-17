@@ -1,0 +1,336 @@
+--- mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c
++++ mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c
+@@ -23224,8 +23224,136 @@
+                  g_m40z_redraw, g_m40z_syn, g_m40z_skip, g_m40z_lookup_fail,
+                  g_r_pipe_dvar_ok, g_r_draws_depth);
+     lfr = fr; lt = t; ldraw = g_m40z_redraw;
++}
++
++/* ================= M105A（2026-11-13）：最终可见 RT 的帧内写入时序 + 「最后覆盖」判定 =================
++   派活单唯一判断题：带贴图 pass 是不是**先**写了最终可见 RT（present 默认选源那张 800×450 窗口纹理），
++   随后被常量色 pass（fs=0a25edc7 / 905cc547 族，ntex_decl=0）覆盖？
++   ① 记账（只读）：每笔颜色 draw 落一条 {本帧序号, draw 序号, pass 句柄(管线+渲染通道), fs 键,
++      ntex_decl, 动态 ntex_real, dvar} 到环形表；present 当帧边界 ⇒ `[m105a] f` 一行 judge +
++      `[m105a] w` 时序行（≤16 行/帧，只在前 10 帧 + 之后每 60 帧、全 boot ≤64 帧）。
++   ② knob `smo_m105a`（app 启动自种，缺省 0=关）：
++      0/-1 = 关（记账函数第一句即返回，零输出）；
++      2    = 只时序 + judge（不改渲染）；
++      3    = 时序 + 跳过常量色 pass（只跳「present 学到的窗口槽 ∧ 本帧已被带贴图笔写过 ∧
++             fs 与上一帧末笔同族 ∧ ntex_decl==0」的那一笔 —— 不全局禁 renderpass、不动 pass 顺序）。
++   ③ 安全闸：只对窗口槽生效；dvar>=3（纯深度）一律不跳；ntex_decl>0 一律不跳。 */
++#define M105A_A P_SLOT_DIR_A "/smo_m105a"
++#define M105A_B P_SLOT_DIR_B "/smo_m105a"
++#define M105A_RING 2048u
++#define M105A_FRAME_MAX 64u
++
++typedef struct {
++    unsigned long long seq, dr, pso, rp;   /* 本表单调序号 / g_r_draws / 管线 / 渲染通道 */
++    unsigned slot, nv, cnt;
++    unsigned char decl, real, dv, sk;
++    char fs[17];
++} m105a_ent;
++
++static m105a_ent g_m105a_ring[M105A_RING];
++static unsigned long long g_m105a_w, g_m105a_rd, g_m105a_seq;
++static int g_m105a_v = -2;
++static double g_m105a_kt, g_m105a_klog;
++static unsigned long long g_m105a_skip_n;
++static unsigned long long g_m105a_texmask[4];        /* 本帧被「带贴图笔」写过的槽位图 */
++static unsigned char g_m105a_win[H_RT_SLOTS];        /* present 学到的窗口槽集合 */
++static char g_m105a_lastfs[H_RT_SLOTS][17];          /* 每槽上一帧末笔 fs（skip 只跳这一族） */
++static unsigned long long g_m105a_fno, g_m105a_pf;
++static unsigned long long g_m105a_yes, g_m105a_no, g_m105a_empty;
++
++/* 开关文件必须由 app 自己先创建（hdc 在沙箱里建不出新文件）：缺省写 0 = 关。
++   每 2 s 重读；值变化立刻打 `sw knob -> val=`，未变化也每 10 s 打一行同格式心跳
++   （M104A 教训：knob 未生效被当成实验结果 ⇒ 必须能在 30 s 内从日志看到生效）。 */
++static int m105a_knob(void)
++{
++    const double t = r_now_ms();
++    if (g_m105a_v == -2) {
++        const char *p[2] = { M105A_A, M105A_B };
++        int have = 0, i;
++        for (i = 0; i < 2 && !have; i++) { FILE *f = fopen(p[i], "r"); if (f) { fclose(f); have = 1; } }
++        for (i = 0; i < 2 && !have; i++) {
++            FILE *f = fopen(p[i], "w");
++            if (f) { fputs("0\n", f); fclose(f); have = 1; }
++        }
++        g_m105a_v = p_file_int(M105A_A, M105A_B, 0);
++        g_m105a_kt = t; g_m105a_klog = t;
++        vk_boot_logf("[m105a] sw knob -> val=%d (seed)", g_m105a_v);
++        return g_m105a_v;
++    }
++    if (t - g_m105a_kt >= 2000.0) {
++        const int v = p_file_int(M105A_A, M105A_B, 0);
++        g_m105a_kt = t;
++        if (v != g_m105a_v) {
++            g_m105a_v = v; g_m105a_klog = t;
++            vk_boot_logf("[m105a] sw knob -> val=%d", g_m105a_v);
++        } else if (t - g_m105a_klog >= 10000.0) {
++            g_m105a_klog = t;
++            vk_boot_logf("[m105a] sw knob -> val=%d", g_m105a_v);
++        }
++    }
++    return g_m105a_v;
++}
++
++/* 本笔的 ntex 口径与 M102B 完全一致：decl = kf 声明的槽数，real = 其中拿到真 view 的槽数。 */
++static void m105a_ntex(const R_Key *kf, int *decl, int *real)
++{
++    int ntex, i, r = 0;
++    *decl = 0; *real = 0;
++    if (!kf) return;
++    ntex = kf->ntex < NVN_TX_SLOTS ? kf->ntex : NVN_TX_SLOTS;
++    *decl = ntex;
++    for (i = 0; i < ntex; i++) {
++        const int u = r_unit_of(kf, i);
++        if (u >= 0 && u < NVN_TX_SLOTS && g_r_tx_view[u] != VK_NULL_HANDLE) r++;
++    }
++    *real = r;
++}
++
++/* 记一笔（knob<2 时第一句即返回；写游标用 release 发布，present 侧 acquire 读）。 */
++static void m105a_rec(const R_Key *kf, int slot, int dvar, unsigned nverts, int count,
++                      unsigned long long pso, unsigned long long rp, int sk)
++{
++    int decl = 0, real = 0;
++    m105a_ent *e;
++    if (g_m105a_v == -2) (void)m105a_knob();
++    if (g_m105a_v < 2 || slot < 0 || slot >= H_RT_SLOTS) return;
++    m105a_ntex(kf, &decl, &real);
++    e = &g_m105a_ring[(unsigned)(g_m105a_w % (unsigned long long)M105A_RING)];
++    memset(e, 0, sizeof *e);
++    e->seq = ++g_m105a_seq;
++    e->dr  = (unsigned long long)g_r_draws;
++    e->pso = pso; e->rp = rp;
++    e->slot = (unsigned)slot;
++    e->nv = nverts;
++    e->cnt = (unsigned)(count > 0 ? count : 0);
++    e->decl = (unsigned char)(decl > 255 ? 255 : decl);
++    e->real = (unsigned char)(real > 255 ? 255 : real);
++    e->dv = (unsigned char)(dvar < 0 ? 0 : (dvar > 255 ? 255 : dvar));
++    e->sk = (unsigned char)(sk ? 1 : 0);
++    if (kf && kf->key[0]) { memcpy(e->fs, kf->key, 16); e->fs[16] = 0; }
++    if (!sk && real > 0) g_m105a_texmask[slot >> 6] |= (1ull << (slot & 63));
++    __atomic_store_n(&g_m105a_w, g_m105a_w + 1ull, __ATOMIC_RELEASE);
+ }
+ 
++/* skip 判定（knob>=3 才可能返 1）：只跳「常量色笔覆盖已有着色内容」这一种，别的笔一律照常下发。 */
++static int m105a_skip_draw(const R_Key *kf, int dvar)
++{
++    int decl = 0, real = 0, si;
++    if (g_m105a_v < 3) { if (g_m105a_v == -2) (void)m105a_knob(); return 0; }
++    if (!kf || dvar >= 3 || !g_rt_cur || !g_h_img) return 0;
++    si = (int)(g_rt_cur - g_rt_tab);
++    if (si < 0 || si >= H_RT_SLOTS) return 0;
++    if (!g_m105a_win[si]) return 0;                       /* 只对 present 学到的窗口槽生效 */
++    m105a_ntex(kf, &decl, &real);
++    (void)real;
++    if (decl != 0) return 0;                             /* 只跳「无贴图声明」的常量色笔 */
++    if (!g_m105a_lastfs[si][0]) return 0;                /* 还没有上一帧末笔记录 ⇒ 不跳 */
++    if (memcmp(kf->key, g_m105a_lastfs[si], 16) != 0) return 0;   /* 只跳「末笔那族 fs」 */
++    if (!(g_m105a_texmask[si >> 6] & (1ull << (si & 63)))) return 0;  /* 本帧必须已有带贴图笔写过它 */
++    g_m105a_skip_n++;
++    return 1;
++}
++
+ int nvn_vk_draw_elements(int mode, int type, int count, uint64_t idx, int base_vertex, int base_instance,
+                          int instances, int dclass)
+ {
+@@ -23999,7 +24127,15 @@
+        （gl_InstanceIndex 从 baseInstance 起算，shader 用 0x2F8 instance-id 时这条必须对）。
+        M5q C'：展开路径上实例已进顶点流/索引，这里必须 instanceCount=1、firstInstance=0
+        （否则会把已展开的几何再乘一遍）；代价是 gl_InstanceIndex 恒 0，见报告 P3 诚实说明。 */
+-    if (inst_unroll > 1)
++    /* M105A：knob>=3 时跳过「本帧已被带贴图笔写过的窗口槽 + 末笔同族 fs + ntex_decl==0」的那一笔
++       （= 不覆盖已有内容；不动 pass 顺序、不全局禁 renderpass）。knob<3 ⇒ m105a_skp 恒 0。 */
++    const int m105a_skp = m105a_skip_draw(kf, dvar);
++    if (m105a_skp) {
++        if (g_m105a_skip_n <= 8ull)
++            vk_boot_logf("[m105a] skip slot=%d fs=%s seq=%llu cnt=%d",
++                         (int)(g_rt_cur ? (g_rt_cur - g_rt_tab) : -1),
++                         (kf && kf->key[0]) ? kf->key : "-", g_m105a_seq, count);
++    } else if (inst_unroll > 1)
+         vkCmdDrawIndexed(g_r_cb, (uint32_t)count * (uint32_t)inst_unroll, 1u, 0u, 0u, 0u);
+     else
+         vkCmdDrawIndexed(g_r_cb, (uint32_t)count, (uint32_t)(inst_submit > 0 ? inst_submit : 1),
+@@ -24011,7 +24147,7 @@
+     if (dvar) g_d_drw_since_clear++;   /* M4bl P1：深度/带深度 draw 计数，供 lastclear_after_draw */
+     /* M4x P1：记账「本帧最后一笔颜色 draw 落在哪张图」= 上屏源候选（深度通道不参与）。
+        只存身份快照，present 侧再校验槽没被 retire/reuse 过；不额外建对象、不改录制。 */
+-    if (dvar < 3 && g_rt_cur && g_h_img) {
++    if (dvar < 3 && g_rt_cur && g_h_img && !m105a_skp) {
+         g_p_cand_slot = g_rt_cur;
+         g_p_cand_img = g_h_img;
+         g_p_cand_w = g_rt_w;
+@@ -24025,7 +24161,7 @@
+         snprintf(g_p_wrote[g_p_wrote_i].fs, sizeof g_p_wrote[0].fs, "%s", kf->key);
+         g_p_wrote_i = (g_p_wrote_i + 1) % P_WROTE_RING;
+     }
+-    if (g_h_img) {   /* M4bj P1：世界 RT 口径 = 被 verts>=512 的大几何写过（按 img+ext，不按槽号） */
++    if (g_h_img && !m105a_skp) {   /* M4bj P1：世界 RT 口径 = 被 verts>=512 的大几何写过（按 img+ext，不按槽号） */
+         k_img_t *ke = k_img_slot(g_h_img, (unsigned)g_rt_w, (unsigned)g_rt_h,
+                                  g_rt_cur ? (unsigned long long)g_rt_cur->key : 0ull);
+         if (ke) { ke->draws++; if (nverts >= 512) ke->big++; }
+@@ -24051,6 +24187,12 @@
+     else g_m42e_p_other++;
+     g_m42e_p_draws++;
+     m42e_tick();
++    /* M105A：被跳过的那笔也记进时序（sk=1），judge 只用未跳过的笔。 */
++    if (m105a_skp && g_rt_cur && dvar < 3) {
++        const int m105a_si0 = (int)(g_rt_cur - g_rt_tab);
++        m105a_rec(kf, m105a_si0, dvar, (unsigned)nverts, (int)count,
++                  (unsigned long long)(uintptr_t)ps, (unsigned long long)(uintptr_t)g_r_pass_rp, 1);
++    }
+     if (g_r_cur_incall) g_r_incall_ok++;   /* M4ao P1：CALL 体内真正画成的笔数（与 g_r_incall_seen 对账） */
+     g_r_batch_draws++;   /* M4h P1：本批次（=本次 flush 前）真实录进 CB 的 draw 数 */
+     hb_note(kv->key, kf->key, nverts, count, kf->instr);   /* M5w P0：在飞批次成分（[hang] 行用；M5x 带 instr） */
+@@ -24065,6 +24207,9 @@
+                       (unsigned)nverts, (int)count, (int)topo);
+             /* M102B（只读，默认关）：pass→槽 表 + ntex_real/up0 动态绑定（M102A 判据 1/2）。 */
+             if (m102b_on()) m102b_draw(kv, kf, si, dvar, (unsigned)nverts, (int)count, (int)topo);
++            /* M105A（只读，knob<2 立即返回）：帧内写入时序记账 —— pass 句柄 + fs 键 + decl/real + 序号。 */
++            m105a_rec(kf, si, dvar, (unsigned)nverts, (int)count,
++                      (unsigned long long)(uintptr_t)ps, (unsigned long long)(uintptr_t)g_r_pass_rp, 0);
+             /* M40AU ①（只读记账，au=0 一个分支都不进）：本帧「最后一笔颜色 draw」落到哪个槽。
+                这是 present 取源的**唯一**来源 —— 记在绘制之后，present 只读不重算（M40AT 已证
+                present 时刻再取源时 RT 已被清屏）。零额外开销：只搬 3 个标量。 */
+@@ -29715,6 +29860,130 @@
+     else
+         o += snprintf(buf + o, sizeof buf - (size_t)o, " | win 台账不可用(符号缺)");
+     if (o > 0 && o < (int)sizeof buf) vk_boot_logf("%s", buf);
++}
++
++/* ================= M105A（present 侧）：帧切分 + judge + 内容签名 + 窗口槽学习 =================
++   present = 帧边界：把「上次 present 之后」的所有写该槽的 draw 按发生顺序切出来判一次。
++   judge（派活单 §2 的算法逐字实现）：
++     tex_first = 本帧第一条 real>=1 的写该槽 draw 的下标（-1 = 本帧没有带贴图笔写过它）；
++     last_fs/last_decl = 本帧末笔（未跳过）写该槽的 fs 键 / ntex_decl；
++     ovr = (tex_first>=0 && last_decl==0)；
++     yes = ovr && last_fs ∈ {0a25edc7…, 905cc547…} ⇒ 「最后覆盖 = YES」；
++     tex_first<0 ⇒ NO（带贴图 pass 根本不写最终 RT）。
++   内容签名直接引 M99A 的同一口径（spread>=8 && colored>=5% && mean<250 且非洋红）⇒ 判据③不另造指标。 */
++static void m105a_learn(int sel_slot)
++{
++    int i;
++    if (sel_slot >= 0 && sel_slot < H_RT_SLOTS) g_m105a_win[sel_slot] = 1;
++    for (i = 0; i < 4; i++) {
++        h_rt_slot *s = NULL;
++        const int si = g_win_key[i] ? p_slot_by_key(g_win_key[i], &s) : -1;
++        if (si >= 0 && si < H_RT_SLOTS) g_m105a_win[si] = 1;
++    }
++}
++
++static void m105a_frame(unsigned long long call, const char *srcname, int sel_slot, int ok)
++{
++    const int on = m105a_knob() >= 2;
++    const unsigned long long w = __atomic_load_n(&g_m105a_w, __ATOMIC_ACQUIRE);
++    unsigned long long r = g_m105a_rd, i, n, trunc = 0;
++    int nsel = 0, ntex = 0, tex_first = -1, last_decl = -1, ovr = 0, yes = 0;
++    char lastfs[17];
++    m105a_learn(sel_slot);
++    lastfs[0] = 0;
++    if (!on) {   /* 关态：只把游标推平，零输出（本帧 texmask 也要清，否则 knob 一开就带着旧位） */
++        g_m105a_rd = w;
++        memset(g_m105a_texmask, 0, sizeof g_m105a_texmask);
++        return;
++    }
++    if (w - r > (unsigned long long)M105A_RING) { trunc = (w - r) - (unsigned long long)M105A_RING; r = w - (unsigned long long)M105A_RING; }
++    n = w - r;
++    for (i = r; i < w; i++) {
++        const m105a_ent *e = &g_m105a_ring[(unsigned)(i % (unsigned long long)M105A_RING)];
++        if (e->sk) continue;
++        if ((int)e->slot == sel_slot) {
++            if (e->real >= 1 && tex_first < 0) tex_first = nsel;
++            nsel++;
++        }
++        if (e->real >= 1) ntex++;
++    }
++    for (i = w; i > r; i--) {   /* 末笔 = 最后一个写该槽的未跳过笔 */
++        const m105a_ent *e = &g_m105a_ring[(unsigned)((i - 1ull) % (unsigned long long)M105A_RING)];
++        if (e->sk || (int)e->slot != sel_slot) continue;
++        last_decl = (int)e->decl;
++        memcpy(lastfs, e->fs, sizeof lastfs);
++        break;
++    }
++    ovr = (tex_first >= 0 && last_decl == 0) ? 1 : 0;
++    yes = (ovr && (!strncmp(lastfs, "0a25edc7", 8) || !strncmp(lastfs, "905cc547", 8))) ? 1 : 0;
++    g_m105a_fno++;
++    if (yes) g_m105a_yes++;
++    else if (tex_first < 0) g_m105a_no++;
++    else g_m105a_empty++;
++    if (g_m105a_pf < M105A_FRAME_MAX && (g_m105a_fno <= 10ull || (g_m105a_fno % 60ull) == 0ull)) {
++        g_m105a_pf++;
++        vk_boot_logf("[m105a] f call=%llu src=%s sel=%d n=%llu nsel=%d ntex=%d tex_first=%d "
++                     "last_fs=%s last_decl=%d ovr=%d yes=%d trunc=%llu sk=%llu ok=%d",
++                     call, srcname ? srcname : "-", sel_slot, n, nsel, ntex, tex_first,
++                     lastfs[0] ? lastfs : "-", last_decl, ovr, yes, trunc, g_m105a_skip_n, ok);
++        {   /* 该槽的写入序列：≤16 行（>16 条时取前 8 + 后 8，另打一行 gap） */
++            m105a_ent head[8], tail[8];
++            int nh = 0, nt = 0, k, pos = 0;
++            int xs[8]; unsigned xc[8], xr[8]; char xf[8][17]; int nx = 0;
++            for (i = r; i < w; i++) {
++                const m105a_ent *e = &g_m105a_ring[(unsigned)(i % (unsigned long long)M105A_RING)];
++                if (e->sk) continue;
++                if ((int)e->slot != sel_slot) {
++                    if (e->real < 1) continue;
++                    for (k = 0; k < nx; k++) if (xs[k] == (int)e->slot) break;
++                    if (k == nx) { if (nx >= 8) continue; xs[nx] = (int)e->slot; xc[nx] = 0; xr[nx] = 0; xf[nx][0] = 0; nx++; }
++                    xc[k]++;
++                    if ((unsigned)e->real > xr[k]) xr[k] = (unsigned)e->real;
++                    if (!xf[k][0]) memcpy(xf[k], e->fs, sizeof xf[k]);
++                    continue;
++                }
++                if (nh < 8) head[nh++] = *e;
++                else { tail[nt % 8] = *e; nt++; }
++            }
++            for (k = 0; k < nh; k++) {
++                const m105a_ent *e = &head[k];
++                vk_boot_logf("[m105a] w i=%d seq=%llu dr=%llu p=%llx rp=%llx fs=%s decl=%d real=%d dv=%d "
++                             "nv=%u cnt=%u sk=%d",
++                             pos++, e->seq, e->dr, e->pso, e->rp, e->fs[0] ? e->fs : "-",
++                             (int)e->decl, (int)e->real, (int)e->dv, e->nv, e->cnt, (int)e->sk);
++            }
++            if (nt > 0) {
++                const int st = (nt > 8) ? (nt % 8) : 0, cn = (nt > 8) ? 8 : nt;
++                vk_boot_logf("[m105a] g nsel=%d shown=%d gap=%d (first8+last8)", nsel, nh + cn, nsel - nh - cn);
++                for (k = 0; k < cn; k++) {
++                    const m105a_ent *e = &tail[(st + k) % 8];
++                    vk_boot_logf("[m105a] w i=%d seq=%llu dr=%llu p=%llx rp=%llx fs=%s decl=%d real=%d dv=%d "
++                                 "nv=%u cnt=%u sk=%d",
++                                 nsel - cn + k, e->seq, e->dr, e->pso, e->rp, e->fs[0] ? e->fs : "-",
++                                 (int)e->decl, (int)e->real, (int)e->dv, e->nv, e->cnt, (int)e->sk);
++                }
++            }
++            for (k = 0; k < nx && k < 4; k++)   /* 带贴图笔的**真实目标槽**（NO 分支要的改法依据） */
++                vk_boot_logf("[m105a] x slot=%d n=%u maxreal=%u fs=%s", xs[k], xc[k], xr[k],
++                             xf[k][0] ? xf[k] : "-");
++            {   /* 判据③同一口径：最终 RT 自己的内容签名（不是 staging，是源 RT 本体） */
++                m98a_c_t c;
++                memset(&c, 0, sizeof c);
++                if (sel_slot >= 0 && sel_slot < H_RT_SLOTS && m99a_sig(sel_slot, &c)) {
++                    const unsigned cvd10 = (unsigned)(c.cvd * 10.0);
++                    vk_boot_logf("[m105a] c slot=%d ok=%d content=%d spread=%d colored=%u.%u%% "
++                                 "mean=%llu/%llu/%llu wh=%ux%u",
++                                 sel_slot, c.ok, m99a_is_content(&c), c.spread, cvd10 / 10u, cvd10 % 10u,
++                                 c.mean[0], c.mean[1], c.mean[2], c.w, c.h);
++                } else {
++                    vk_boot_logf("[m105a] c slot=%d ok=0 content=0 (签名读不出)", sel_slot);
++                }
++            }
++        }
++    }
++    if (lastfs[0] && sel_slot >= 0 && sel_slot < H_RT_SLOTS) memcpy(g_m105a_lastfs[sel_slot], lastfs, sizeof lastfs);
++    g_m105a_rd = w;
++    memset(g_m105a_texmask, 0, sizeof g_m105a_texmask);
+ }
+ 
+ /* 返 1 = 本帧屏幕内容归我们管（已上屏，或按降采样主动跳过——两种情况都不要再走纯色兜底）；
+@@ -30900,6 +31169,7 @@
+            与 `[p] dump slot=N` 用同一张 g_rt_tab ⇒ 按 slot/texid 直接对齐。
+            函数自带「≤8 行 / 相邻 ≥30 s」的预算，菜单段与 3D 段都会各落几行。*/
+         m103a_proof_line(call, srcname, g_p_sel_slot, simg, sw, sh, (int)slay, ok);
++        m105a_frame(call, srcname, g_p_sel_slot, ok);   /* M105A：帧内写入时序 + judge + 内容签名 */
+         if (psig_want)
+             p_sig_line(call, srcname, simg, sw, sh, crox, croy, ok, psig_verbose || g_p_m4ak_sig_pair);
+         g_p_m4ak_sig_pair = 0;

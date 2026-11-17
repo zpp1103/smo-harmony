@@ -1,0 +1,163 @@
+diff --git a/mario-odessy-harmony/entry/src/main/cpp/host/game_patches.c b/mario-odessy-harmony/entry/src/main/cpp/host/game_patches.c
+index cf3add0..f1a8327 100644
+--- a/mario-odessy-harmony/entry/src/main/cpp/host/game_patches.c
++++ b/mario-odessy-harmony/entry/src/main/cpp/host/game_patches.c
+@@ -291,13 +291,45 @@ static void scene_log(void) {
+  *   KICK3(0x8ad310 族) 路径的 thunk 层计数，THUNK2_NULL=三参路径 NULL 早退。
+  * ③ BC310（0x954310）加 first-16 唯一 x0 环：g_bc 16 槽 CAS 占位去重（g_br 范式）
+  *   枚举首 16 个唯一收件对象+各计数，x0==0/溢出各计数——45807 hits 的对象分布一屏可读。
+- * 门容量：尾部页 0x4000，16 门×104B+0x100 头部=1764B，余量充足。 */
++ * 门容量：尾部页 0x4000，16 门×104B+0x100 头部=1764B，余量充足。
++ * round20 最小扰动+注册三门（只观测零行为改动；测注册时序假说：round16 注册发生过、
++ *   后续 boot 注册不再发生若是宿主插桩扰动所致即为最简约解释——本轮先剥扰动再定时序）：
++ * 【编译关闭的重探针】SMO_OBS_HEAVY=0（game_patches.h，threads.c 共用）：
++ *   ① KICK1 门挂的 kick 三条件快照（观察器内 [x0+0xf9]/[x0+0x20] 双读+三分支交叉+
++ *      首 16 环+六边际——本轮 KICK1 退化为纯计数门 hits/last_x0）；
++ *   ② BC310 first-16 唯一 x0 环（CAS 去重循环编译掉；保留首见 {x0,x1}+hits+xzero）；
++ *   ③ threads.c early1d_note（boot 前 10s 持全局锁 G 的 0x1D 键全录，锁内 256 槽线性扫）。
++ *   保留：kick1/thunk1 双门（thunk2 双门 0 命中零成本同留）/E1/E2/pkey+ct 账本。
++ * 【注册三门】0x8ae230 注册函数（字实测自 main.patched.bin：str x19,[sp,#-0x20]!;
++ *   stp x29,x30,[sp,#0x10]; add x29,sp,#0x10; mov x19,x0; str x1,[x0]@+0x10——把句柄 x1
++ *   写进容器槽 *x0，再 bl 0x8ad1c0(条件性 bl 0x8ad1d0)，末把 this 写回 [[x19]+0x18]；
++ *   三个 bl 调用点 0x8b6688/0x8b6708/0x8b6990 均以 x0=栈槽 sp+8、x1=节点-0x1c0 调它）：
++ *   REG230=入口四字门（全寄存器/立即数字，全镜像扫描窗内仅首字有落点=3 个 bl），
++ *   hits=注册函数全部真实执行；首见 {x0=槽, x1=被注册句柄, tick}=注册时序主证据。
++ *   STR240 预验证不可装：0x8ae240 四字窗第 4 字 0x8ae24c tbz(imm14 ±32KiB，stub 页距
++ *   ~12-21MiB) 无法重定位；邻近安全位 0x8ae23c 又与 REG230 的 16B veneer（覆盖
++ *   0x8ae230..0x8ae23f）重叠。改装 REG258=0x8ae258 完成块四字门（epilogue：ldr x8,[x19];
++ *   str x19,[x8,#0x18]; ldp; ldr x19,[sp],#0x20——全寄存器字，tbz 0x8ae24c 落点=窗首字）：
++ *   hits(258)=注册体跑到尾声的次数（str x1,[x0] 与回指针写都在其上游线性路径上）。
++ *   联读：hits(230)==hits(258) ⇔ 每次进入都完整注册；230>258=中途异常。全镜像扫描
++ *   0x8ae23c/240/244 零直接落点 ⇒ str 执行 ⇔ 230 门命中+尾声到达，无需在 240 重复装门。
++ * 【mq 版本比较 walker】0x964680（cbz x1→ret0；[x0+0xd4]∈[3,5]→ret0；[x0+0xc8]==x1
++ *   →ret0；不等→x0+=0x38 尾跳 0x9644b0 走下一节点。全镜像零直接落点=仅指针调用）。
++ *   本体四字窗首字 cbz(imm19 ±1MiB) 不可门，且 684/688/68c/690/694/698 各窗均含
++ *   b.cond/cbz——拆双尾门合成环头计数：MQ_RET=0x9646a4（ret 重放变体，计全部终结
++ *   路径：x1==0/版本越界/匹配命中，x0/x1 未写=原节点+版本字）；MQ_ADV=0x9646ac
++ *   （b 0x9644b0 重放，计 [x0+0xc8]!=x1 的链前进，x0 已 +0x38=后继节点）。四路径穷尽
++ *   （cbz→6a0、b.lo→6a0、匹配→6a0、不等→6a8），hits(RET)+hits(ADV)=0x964680 全部进入。
++ *   消费侧时序证据：RET/ADV 首见 tick vs REG230 首见 tick——注册先于/后于 walker 首跑。
++ * 门容量：尾部页 0x4000，20 门×104B+0x100 头部=2208B，余量充足。 */
+ enum { SMO_OBS_E1 = 0, SMO_OBS_DRAIN_A = 1, SMO_OBS_DRAIN_B = 2, SMO_OBS_CELL2 = 3,
+        SMO_OBS_KICK1 = 4, SMO_OBS_ALKICK = 5, SMO_OBS_KICK3 = 6,
+        SMO_OBS_DRAIN_ENTER = 7, SMO_OBS_DRAIN_LOOP = 8,
+        SMO_OBS_BC310 = 9, SMO_OBS_KICKVT = 10, SMO_OBS_KICKBR = 11,
+        SMO_OBS_THUNK1_IN = 12, SMO_OBS_THUNK1_NULL = 13,
+-       SMO_OBS_THUNK2_IN = 14, SMO_OBS_THUNK2_NULL = 15, SMO_OBS_N = 16 };
++       SMO_OBS_THUNK2_IN = 14, SMO_OBS_THUNK2_NULL = 15,
++       SMO_OBS_REG230 = 16, SMO_OBS_REG258 = 17,
++       SMO_OBS_MQ_RET = 18, SMO_OBS_MQ_ADV = 19, SMO_OBS_N = 20 };
+ typedef struct { uint32_t off, gate, tail; uint32_t word[4]; } smo_obs_site_t;
+ static const smo_obs_site_t smo_obs_site[] = {
+     {0x57f950, SMO_OBS_E1,      0, {0xa9be4ff4, 0xa9017bfd, 0x910043fd, 0xf9400408}},   /* stp x20,x19; stp x29,x30; add x29,sp,#0x10; ldr x8,[x0,#8] */
+@@ -332,6 +364,13 @@ static const smo_obs_site_t smo_obs_site[] = {
+     {0x587eac, SMO_OBS_THUNK1_NULL, 1, {0xd65f03c0, 0xf9400000, 0, 0}},                 /* ret（thunk1 [x0]==NULL 早退；后继=thunk2 入口） */
+     {0x587db4, SMO_OBS_THUNK2_IN,   1, {0x1400003f, 0x00000000, 0, 0}},                 /* b 0x587eb0（thunk2 全部进入） */
+     {0x587ec4, SMO_OBS_THUNK2_NULL, 1, {0xd65f03c0, 0x00000000, 0, 0}},                 /* ret（thunk2 [x0]==NULL 早退） */
++    /* round20 注册三门 + mq walker 双尾门（字实测自 main.patched.bin；预验证记录见上方注释）：
++       REG230 入口四字窗全寄存器/立即数字、窗内仅首字有落点（3×bl）；REG258 完成块四字窗
++       同全寄存器字、tbz 落点=窗首字；MQ_RET=ret 重放、MQ_ADV=b 0x9644b0 重放（word[1]=后继原字）。 */
++    {0x8ae230, SMO_OBS_REG230, 0, {0xf81e0ff3, 0xa9017bfd, 0x910043fd, 0xaa0003f3}},   /* str x19,[sp,#-0x20]!; stp x29,x30,[sp,#0x10]; add x29,sp,#0x10; mov x19,x0 */
++    {0x8ae258, SMO_OBS_REG258, 0, {0xf9400268, 0xf9000d13, 0xa9417bfd, 0xf84207f3}},   /* ldr x8,[x19]; str x19,[x8,#0x18]; ldp x29,x30,[sp,#0x10]; ldr x19,[sp],#0x20 */
++    {0x9646a4, SMO_OBS_MQ_RET, 1, {0xd65f03c0, 0x9100e000, 0, 0}},                     /* ret（后继 0x9646a8 add x0,x0,#0x38） */
++    {0x9646ac, SMO_OBS_MQ_ADV, 1, {0x17ffff81, 0xb940d408, 0, 0}},                     /* b 0x9644b0（后继 0x9646b0 ldr w8,[x0,#0xd4]） */
+ };
+ #define SMO_OBS_E1_CAP 128
+ static struct {
+@@ -408,6 +447,11 @@ static struct {
+     _Atomic uint64_t over, n_zero, first_this, first_tgt, last_tgt;
+     _Atomic unsigned set;
+ } g_br;
++/* round20 三门首见记录（REG230/MQ_RET/MQ_ADV 各一槽）：{x0, x1(观察器参4=门点原 x1),
++   tick}。REG230：x0=容器槽（调用点 sp+8 栈槽）、x1=被注册句柄（节点-0x1c0 族）；
++   MQ_RET：x0=终结节点、x1=版本比较字；MQ_ADV：x0=前进后继节点(+0x38 已加)、x1=版本字。
++   两 MQ 门与 REG230 的首见 tick 相减（dump 侧换算 ns）＝注册 vs walker 首跑时序。 */
++static struct { _Atomic unsigned set; uint64_t x0, x1, tick; } g_fs[3];
+ static _Atomic uint64_t g_obs_hits[SMO_OBS_N], g_obs_x0[SMO_OBS_N];
+ /* round12e cell 链一次性快照（SMO_OBS_CELL2）：{cell1,table1,fn1, cell2,table2,fn2}
+    对应 cell 0x1363dc8（=Map，验证链条读法）与 cell 0x136deb8（待定名）。 */
+@@ -442,6 +486,17 @@ static void smo_obs_observer(uint64_t x0, uint64_t gate, uint64_t x2, uint64_t x
+             }
+             atomic_store_explicit(&g_cell2_set, 1, memory_order_relaxed);
+         }
++        /* round20 注册三门首见：REG230 {x0=槽, x1=被注册句柄}；MQ_RET/MQ_ADV {x0=节点,
++           x1=版本比较字}。观察器参4=门点原 x1（prologue w8 在 movz 覆盖 x1 前抄走）。
++           首见一次定格（幂等竞争良性覆盖，观测用途）；纯原子+定长写，红线不破。 */
++        if (gate == SMO_OBS_REG230 || gate == SMO_OBS_MQ_RET || gate == SMO_OBS_MQ_ADV) {
++            int k = gate == SMO_OBS_REG230 ? 0 : gate == SMO_OBS_MQ_RET ? 1 : 2;
++            if (!atomic_load_explicit(&g_fs[k].set, memory_order_relaxed)) {
++                g_fs[k].x0 = x0; g_fs[k].x1 = x3; g_fs[k].tick = smo_obs_tick();
++                atomic_store_explicit(&g_fs[k].set, 1, memory_order_relaxed);
++            }
++            return;
++        }
+         /* round16b DRAIN-LOOP 首见快照：kick 三条件值。this=x8-0x1c0（0x8abf98 sub 的原义），
+            字段护栏同全局范式（<2^32 拒读）；[this+0xf9] 1 字节 + [this+0x20] 8 字节——
+            kick 0x8ad208/0x8ad278 就要读的字段，首见一次定格。 */
+@@ -454,9 +509,12 @@ static void smo_obs_observer(uint64_t x0, uint64_t gate, uint64_t x2, uint64_t x
+             }
+             atomic_store_explicit(&g_dl.set, 1, memory_order_relaxed);
+         }
++#if SMO_OBS_HEAVY
+         /* round17 ①：KICK1 门每次命中记 kick 三条件（this=x0、w1=x3）＋三分支交叉分布。
+            首见一次定格，末见逐字段原子覆盖。kick 可多线程并发（thunk 路径多调用方）：
+-           标量全原子，首见 set 检查非原子但幂等（良性覆盖，观测用途）。 */
++           标量全原子，首见 set 检查非原子但幂等（良性覆盖，观测用途）。
++           round20：整段随 SMO_OBS_HEAVY=0 编译关闭（最小扰动构建）——KICK1 退化为
++           纯计数门（上方 hits/last_x0），dump 侧打 off 标记。 */
+         if (gate == SMO_OBS_KICK1) {
+             uint64_t f9 = 0, o20 = 0;
+             int rd = x0 > 0x100000000ULL && x0 < 0x800000000000ULL;
+@@ -489,16 +547,20 @@ static void smo_obs_observer(uint64_t x0, uint64_t gate, uint64_t x2, uint64_t x
+             atomic_store_explicit(&g_k1.last_f9, f9, memory_order_relaxed);
+             atomic_store_explicit(&g_k1.last_o20, o20, memory_order_relaxed);
+         }
++#endif   /* SMO_OBS_HEAVY：KICK1 三条件快照（round17/18），round20 编译关闭 */
+         /* round17 ②（round18 补 x1）：BC310 首见 {x0, x1, tick}（末见 x0 走 g_obs_x0[gate]；
+            x1=观察器参4=门点原 x1，该函数第二实参）。
+            round19 ③：first-16 唯一 x0 环——45807 hits 的收件对象分布（g_br 16 槽范式：
+-           命中即计数，空槽 CAS 占位，满则 over；x0==0 只计 xzero 不入表）。 */
++           命中即计数，空槽 CAS 占位，满则 over；x0==0 只计 xzero 不入表）。
++           round20：x0 环随 SMO_OBS_HEAVY=0 编译关闭（45807 hits×CAS 是 boot 期扰动源
++           之一）；首见+xzero+hits 计数保留。 */
+         if (gate == SMO_OBS_BC310) {
+             if (!atomic_load_explicit(&g_bc.set, memory_order_relaxed)) {
+                 g_bc.x0 = x0; g_bc.x1 = x3; g_bc.tick = smo_obs_tick();
+                 atomic_store_explicit(&g_bc.set, 1, memory_order_relaxed);
+             }
+             if (x0 == 0) { atomic_fetch_add_explicit(&g_bc.xzero, 1, memory_order_relaxed); return; }
++#if SMO_OBS_HEAVY
+             for (int i = 0; i < 16; i++) {
+                 uint64_t v = atomic_load_explicit(&g_bc.xv[i], memory_order_relaxed);
+                 if (v == x0) { atomic_fetch_add_explicit(&g_bc.xc[i], 1, memory_order_relaxed); return; }
+@@ -511,6 +573,7 @@ static void smo_obs_observer(uint64_t x0, uint64_t gate, uint64_t x2, uint64_t x
+                 }
+             }
+             atomic_fetch_add_explicit(&g_bc.xover, 1, memory_order_relaxed);
++#endif
+             return;
+         }
+         /* round17 ③：KICKVT 虚调目标分布——vt=[x0]（=kick this 的 vtable，游戏 0x8ad214
+@@ -1004,6 +1067,22 @@ int smo_obs_kickbr_dist(uint64_t vals[32], uint64_t cnts[32], uint64_t *over, ui
+     *last_tgt = atomic_load_explicit(&g_br.last_tgt, memory_order_relaxed);
+     return 1;
+ }
++/* round20（dump 侧）：三门首见 {x0, x1, tsns}。which：0=REG230（x0=槽/x1=被注册句柄）、
++   1=MQ_RET（终结节点/版本字）、2=MQ_ADV（前进后继节点/版本字）。ts 同 bc_snapshot 的
++   tick→ns 两点内插（raw=1 时给裸 tick）。返回 set（0=门未命中）。 */
++int smo_obs_fs_snapshot(int which, uint64_t *x0, uint64_t *x1, uint64_t *ts_ns) {
++    extern uint64_t runtime_now_ns(void);
++    if (which < 0 || which > 2 || !atomic_load_explicit(&g_fs[which].set, memory_order_relaxed)) return 0;
++    *x0 = g_fs[which].x0; *x1 = g_fs[which].x1;
++    int is_raw = 0; double npt = 0;
++    if (g_obs_tick0_set) {
++        uint64_t t1 = smo_obs_tick(), ns1 = runtime_now_ns();
++        if (t1 > g_obs_tick0) npt = (double)(ns1 - g_obs_ns0) / (double)(t1 - g_obs_tick0);
++        else is_raw = 1;
++    } else is_raw = 1;
++    *ts_ns = is_raw ? g_fs[which].tick : g_obs_ns0 + (uint64_t)((double)(g_fs[which].tick - g_obs_tick0) * npt + 0.5);
++    return 1;
++}
+ 
+ void runtime_game_patches(Module *main_module) {
+     patch_render_res(main_module);

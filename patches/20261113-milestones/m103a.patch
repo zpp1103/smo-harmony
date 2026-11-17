@@ -1,0 +1,644 @@
+diff --git mario-odessy-harmony/entry/src/main/cpp/platform/gfx_bridge.c mario-odessy-harmony/entry/src/main/cpp/platform/gfx_bridge.c
+--- mario-odessy-harmony/entry/src/main/cpp/platform/gfx_bridge.c
++++ mario-odessy-harmony/entry/src/main/cpp/platform/gfx_bridge.c
+@@ -1128,12 +1128,57 @@
+  static const char *const p[4]={M40AG_SW_A,M40AG_CAP_A,M40AG_SW_B,M40AG_CAP_B};
+  for(int i=0;i<4;i++){
+   if(access(p[i],F_OK)==0){chmod(p[i],0666);continue;}
+   int fd=open(p[i],O_CREAT|O_WRONLY|O_TRUNC,0666);
+   if(fd>=0){ssize_t w=write(fd,"0\n",2);(void)w;close(fd);chmod(p[i],0666);}
+  }}
++/* ================= M103A (2026-11-13)：D1 修复 —— id 图名额 384→4096 + 活体字节硬顶 512 MiB ======
++   已定谳（M102C，logs/m102c/report.md §3–§5；本单不重验）：
++     · `[m7k] ph` 全 boot 80/80 行 why=-31，唯一触发 = `g_t_idimg>=k_id_img_max && nvn_vk_is_up()`；
++       3D 段每行 `idimg=384/384`，菜单段 310 s 才 29/384 ⇒ **384 是 3D 段顶满的**，不是全程顶满。
++     · 让位在跑（3D 段 ≥16 次真换出 512 B–702 KiB 小图），但被「每 submit ≤8 张」配额挡下。
++     · 后果：3D 段要贴图的 id 拿不到 VkImage ⇒ 槽绑 1×1 白（ds 末组 kind=4 占 67.5%：id 2952/2953/
++       2954，1280×160 fmt=0x25）⇒ 画面仍是「纯黑底 + 纯黄几何」（15.89%）。
++   本开关三件事（**缺省开**；写 0 = 秒级回退到 M102C 口径：名额 384 / 每 submit ≤8 / 不判字节顶）：
++     ① 名额 384 → 4096（M103A_CAP）。VkImage 仍**按需建**（唯一建图点 = g_rp_bind_tex 里的
++        `nvn_vk_tex_create`，不是开机预分配 4096 张）⇒ 名额只是「缓存容量」，不预占显存。
++     ② 活体字节硬顶 M103A_BYTES_MAX = 512 MiB。账 = `g_t_bytes_live`（上送成功 +=bytes、让位换出
++        -=vkbytes，M5z P1 起就是这个口径）。越顶 ⇒ 走同一条 LRU 让位（只换「本帧没有任何采样槽
++        引用」的图，优先 小图 → 低 binds → 最老）；换不动 ⇒ 拒建图并记 why=-36（g_m103a_deny_bytes）。
++        **不允许无上限增长**：上界 = min(4096 张, 512 MiB / 单张)，单张另有 32 MB 上送门兜底。
++     ③ 每 submit 让位配额 8 → 64（M103A_EVICT_PER_SUB），并且**只在真压顶时消耗配额**。
++        旧代码无条件求值 `ev_sm_ok = ev_small && t_evict_slot_small();` ⇒ 每笔小图 bind 都吃掉一次
++        配额，deny_s 涨的是记账假象（M102C 的 16 次真换出 vs deny_s +90 是同一现象的两面）。
++   读法：文件 2 s 重读（构造期自种 0666），写 0/1 秒级生效，不用重装。
++   与历史旋钮的关系：M30A(384→1024)/M40O(384→1536)/M40AG(cap 覆盖) 是同一根旋钮的旧版本；
++   本开关**优先级最高**，关态才回落到那条旧链（逐字不改）。 */
++#define M103A_SW_A "/data/storage/el2/base/files/smo_m103a"
++#define M103A_SW_B "/data/app/el2/100/base/com.vibecc.smo/files/smo_m103a"
++#define M103A_CAP 4096u
++#define M103A_BYTES_MAX (512ull<<20)
++#define M103A_EVICT_PER_SUB 64u
++#define M103A_RECLAIM_PER_SUB 8u   /* 回收 tick：每次 bind 最多再换出几张（建图判决处那一次另算） */
++static int m103a_on(void)
++{
++ static int cached=-1;static long last;long now=(long)time(NULL);
++ if(cached>=0&&now<last+2)return cached;
++ last=now;cached=0;
++ {const char *paths[2]={M103A_SW_B,M103A_SW_A};   /* B=/data/app/…（hdc 唯一可写视图）优先，A 兜底 */
++  for(int i=0;i<2;i++){FILE *f=fopen(paths[i],"r");
++   if(f){char b[16];size_t n=fread(b,1,sizeof b-1,f);fclose(f);if(n>0){b[n]=0;cached=atoi(b);}break;}}}
++ return cached&1;
++}
++__attribute__((constructor)) static void m103a_seed(void)
++{
++ /* 只能在 A 视图建（构造期 app 在 B 视图 O_CREAT 被拒，M40AG b0' 实证）；缺省 1 = 本单要的修复态。 */
++ static const char *const p[2]={M103A_SW_A,M103A_SW_B};
++ for(int i=0;i<2;i++){
++  if(access(p[i],F_OK)==0){chmod(p[i],0666);continue;}
++  int fd=open(p[i],O_CREAT|O_WRONLY|O_TRUNC,0666);
++  if(fd>=0){ssize_t w=write(fd,"1\n",2);(void)w;close(fd);chmod(p[i],0666);}
++ }}
+ /* 缓存查找：同存储 + 同描述符（含 levels/flags/target/samples）才算同一张图 ⇒ 别名安全。 */
+ static int m40ae_find(unsigned long long mem,const nvn_texdesc *d)
+ {
+  if(!mem||!d)return -1;
+  for(int i=0;i<M40AE_EN;i++){
+   m40ae_img *e=&g_m40ae_img[i];
+@@ -1244,60 +1289,77 @@
+ /* M7k P1（2026-11-07）：小图让位直通。开关 M7K_SMALL_EVICT_ON 定义在 nvn_vk/nvn_vk.h（共享头，
+    nvn_vk.c 的回读行同源）。M7j boot 实测场景族贴图（id12074/12081 f5 256x256 等）
+    t≈200s 才首绑，此时 idimg=384/384 满，让位门槛 binds>=8 对首绑(bind=1)恒拒 ⇒ why=-31 恒 PH
+    （miss-class cap_idimg=558908 占空槽 97.5%，budget=0 upfail=0 nosnap=0 unres=0）。
+    小图（≤1MB，与 M4bk P2 热度豁免同阈值）建图+上送成本微不足道，不应被 binds 门槛挡在门外；
+    驱逐对象仍受约束①（无槽引用）/②（每 submit ≤8 次）保护。 */
++/* M103A（2026-11-13）：`g_t_idbinds` 提到这里声明 —— 让位优先序（小图 → 低 binds → 最老）
++   要用它，而它的原声明在下方 M40Q 段（:2890 一带）。两处都留会变重复暂定定义，故只保留这一处。 */
++static unsigned g_t_idbinds[TEXREG_N];    /* 每 id 被绑次数（M40Q 起用于「一次性 id」判据） */
+ static uint32_t g_id_lru[TEXREG_N];       /* 每 id 最近一次被绑的序号（LRU 判据） */
+ static uint32_t g_id_lru_seq;
+ static unsigned long long g_t_bytes_live; /* 活体纹理字节（驱逐会减；g_t_bytes 仍是累计口径） */
+ static unsigned long long g_z_evict, g_z_evict_bytes, g_z_evict_noslot, g_z_evict_deny;
+ static unsigned long long g_z_evict_small;   /* M7k：走小图直通换来的让位次数 */
+ static unsigned long long g_z_evict_deny_s;  /* M7k：小图独立配额用尽次数 */
+ static unsigned long g_z_ev_sub; static unsigned g_z_ev_in_sub;
+ static unsigned g_z_ev_in_sub_s;   /* M7k P2：小图独立配额的每 submit 计数 */
++/* M103A P2：每 submit 让位配额。关态 = M5Z 历史值 8；开态 = 64（派活单要求 ≥64）。
++   只改上界，不改「谁可以被换出」（那是 t_evict_one / t_evict_one_shared 的候选约束）。 */
++static unsigned t_evict_quota(void){ return m103a_on()?M103A_EVICT_PER_SUB:M5Z_EVICT_PER_SUB; }
+ static unsigned t_evict_slot(void)
+ {
+  unsigned long sub=(unsigned long)atomic_load_explicit(&g_beat_nvn_submit,memory_order_relaxed);
+  if(sub!=g_z_ev_sub){g_z_ev_sub=sub;g_z_ev_in_sub=0;g_z_ev_in_sub_s=0;}
+- if(g_z_ev_in_sub>=M5Z_EVICT_PER_SUB){g_z_evict_deny++;return 0;}
++ if(g_z_ev_in_sub>=t_evict_quota()){g_z_evict_deny++;return 0;}
+  g_z_ev_in_sub++;
+  return 1;
+ }
+ /* M7k P2（boot2）：小图让位用独立的每 submit 配额。boot1 实测场景首绘窗口 deny=2575——
+    8 次/submit 的共享配额被重入洪水（此前被逐出的热 id 回来）吃光，场景小图在同一窗口
+    输掉竞速（td 采样 PH，而邻居 id12087/12090 在前 30ms 进来）。小图 ≤1MB，单独 8 次/submit
+    只把最坏情况从 8 张大图变成 8 大 + 8 小，仍是硬上界。随 M7K_SMALL_EVICT_ON 一起回退。 */
+ static unsigned t_evict_slot_small(void)
+ {
+  unsigned long sub=(unsigned long)atomic_load_explicit(&g_beat_nvn_submit,memory_order_relaxed);
+  if(sub!=g_z_ev_sub){g_z_ev_sub=sub;g_z_ev_in_sub=0;g_z_ev_in_sub_s=0;}
+- if(g_z_ev_in_sub_s>=M5Z_EVICT_PER_SUB){g_z_evict_deny_s++;return 0;}
++ if(g_z_ev_in_sub_s>=t_evict_quota()){g_z_evict_deny_s++;return 0;}
+  g_z_ev_in_sub_s++;
+  return 1;
+ }
+ /* M40AE ②：共享图的淘汰必须**按图**做 —— 只清一个别名 id 腾不出名额（同一张图还被别人引用），
+    所以先按「图」聚合：该图的所有别名 id 都不在槽里引用才允许整张销毁，销毁后清零全部别名 id。
+    O(TEXREG_N + M40AE_EN)，不随别名数膨胀。返回 1 = 真的换掉了一张图。 */
+ static int t_evict_one_shared(int want_id)
+ {
+  static unsigned char s_used[M40AE_EN],s_have[M40AE_EN]; static uint32_t s_lru[M40AE_EN];
+- int best=-1;uint32_t bestlru=0;
++ static unsigned long long s_binds[M40AE_EN];   /* M103A：图级 binds = 该图所有别名 id 的最大 binds */
++ int best=-1;uint32_t bestlru=0;int best_small=1;unsigned long long best_binds=~0ull;
+  memset(s_used,0,sizeof s_used);memset(s_have,0,sizeof s_have);
++ memset(s_binds,0,sizeof s_binds);
+  for(int i=0;i<M40AE_EN;i++)s_lru[i]=~0u;
+  for(int id=0;id<TEXREG_N;id++){
+   int ei=g_m40ae_eid[id];
+   if(ei<0||ei>=M40AE_EN||!g_idvk[id])continue;
+   s_have[ei]=1;
+   if(id==want_id||nvn_vk_tex_id_in_use(id))s_used[ei]=1;   /* 约束①：任一别名还在槽里引用 ⇒ 整张不动 */
+   if(g_id_lru[id]<s_lru[ei])s_lru[ei]=g_id_lru[id];
++  if(g_t_idbinds[id]>s_binds[ei])s_binds[ei]=g_t_idbinds[id];
+  }
+  for(int i=0;i<M40AE_EN;i++){
+   m40ae_img *e=&g_m40ae_img[i];
+   if(!e->vk||!e->refs||!s_have[i]||s_used[i])continue;
+-  if(best<0||s_lru[i]<bestlru){best=i;bestlru=s_lru[i];}
++  /* M103A P2：换出对象优先序 = 小图（≤1 MB）→ 低 binds → 最老 LRU。
++     小图建图/上送成本最低，先换它们对吞吐最划算；关态退回纯 LRU（逐字 = 旧行为）。 */
++  if(m103a_on()){
++   int sm=(e->bytes&&e->bytes<=(1ull<<20))?0:1;
++   unsigned long long bd=s_binds[i];
++   if(best<0||sm<best_small||
++      (sm==best_small&&(bd<best_binds||(bd==best_binds&&s_lru[i]<bestlru)))){
++    best=i;bestlru=s_lru[i];best_small=sm;best_binds=bd;}
++  } else if(best<0||s_lru[i]<bestlru){best=i;bestlru=s_lru[i];}
+  }
+  if(best<0)return 0;
+  {m40ae_img *e=&g_m40ae_img[best];
+   unsigned long long by=nvn_vk_tex_vkbytes(e->vk);
+   nvn_vk_texture_forget(e->vk);
+   nvn_vk_tex_destroy_deferred(e->vk);
+@@ -1310,18 +1372,27 @@
+  return 1;
+ }
+ /* 原逐 id 淘汰：开关关态逐字节原行为；开态只处理**未登记**的老图（切开关前就已建好的），
+    已登记的共享图一律由 t_evict_one_shared 整张处理，避免拆散别名留下悬垂引用。 */
+ static void t_evict_one_legacy(int want_id)
+ {
+- int best_id=-1;uint32_t best=0;
++ int best_id=-1;uint32_t best=0;int best_small=1;unsigned long long best_binds=~0ull;
+  for(int id=0;id<TEXREG_N;id++){
+   if(!g_idvk[id]||id==want_id)continue;
+   if(nvn_vk_tex_id_in_use(id))continue;          /* 约束①：正被槽引用的图一律不动 */
+   if(m40ae_on()&&g_m40ae_eid[id]>=0)continue;    /* M40AE：共享图不在这里逐个拆 */
+-  if(best_id<0||g_id_lru[id]<best){best=g_id_lru[id];best_id=id;}
++  if(best_id<0){best=g_id_lru[id];best_id=id;best_small=1;best_binds=~0ull;}
++  if(m103a_on()){
++   /* M103A P2：小图 → 低 binds → 最老（与共享路径同口径）。 */
++   unsigned long long by=nvn_vk_tex_vkbytes(g_idvk[id]);
++   int sm=(by&&by<=(1ull<<20))?0:1;
++   unsigned long long bd=g_t_idbinds[id];
++   if(sm<best_small||
++      (sm==best_small&&(bd<best_binds||(bd==best_binds&&g_id_lru[id]<best)))){
++    best=g_id_lru[id];best_id=id;best_small=sm;best_binds=bd;}
++  } else if(g_id_lru[id]<best){best=g_id_lru[id];best_id=id;}
+  }
+  if(best_id<0){g_z_evict_noslot++;return;}
+  {unsigned long long by=nvn_vk_tex_vkbytes(g_idvk[best_id]);
+   nvn_vk_texture_forget(g_idvk[best_id]);         /* 防御性：正常情况下该图的 view 已无槽引用 */
+   /* M6a B：不再每张一次 vkQueueWaitIdle（M5z 455 次 / 860 MB 重传的吞吐代价）。
+      进坟场，由 nvn_vk_draw_flush 在「本批 CB 已过栅栏」那一刻统一销毁。 */
+@@ -1577,23 +1648,65 @@
+ static void m30a_q_tick(void)
+ {
+  unsigned want=(m30a_sw(0)&1)?1024u:384u;
+  {unsigned ov=m40ag_cap();if(ov)want=ov;}   /* M40AG：smo_m40ag_cap 覆盖（0=不改） */
+  int m40o=m40o_on();
+  if(m40o&1)want=M40O_CAP;
++ if(m103a_on())want=M103A_CAP;   /* M103A P1：4096（最高优先级；关态才看上面那条历史链） */
+  if(want==k_id_img_max){m40o_stat();return;}
+- if(m40o&1)vk_boot_logf("[m40o] on cap=%u lru=%llu resident=%llu deny=%llu (was %u)",
++ if(m103a_on())vk_boot_logf("[m103a] cap %u -> %u (id 图名额；按需建图 + LRU 回收 + 活体字节顶 %lluMB)",
++                            k_id_img_max,want,(unsigned long long)(M103A_BYTES_MAX>>20));
++ else if(m40o&1)vk_boot_logf("[m40o] on cap=%u lru=%llu resident=%llu deny=%llu (was %u)",
+                         want,(unsigned long long)g_z_evict,(unsigned long long)g_t_idimg,
+                         (unsigned long long)g_z_evict_deny,k_id_img_max);
+  else if(k_id_img_max==M40O_CAP)vk_boot_logf("[m40o] off cap=%u lru=%llu resident=%llu deny=%llu (restore smo_m30a_q=%d)",
+                         want,(unsigned long long)g_z_evict,(unsigned long long)g_t_idimg,
+                         (unsigned long long)g_z_evict_deny,m30a_sw(0));
+  else vk_boot_logf("[m30a] id_img_max %u -> %u (smo_m30a_q=%d)",k_id_img_max,want,m30a_sw(0));
+  k_id_img_max=want;
+  m40o_stat();
+ }
++/* ================= M103A P1/P2：压顶判据 + 回收 tick（唯一调用点都在 g_rp_bind_tex） ==========
++   `need` = 本次要新建这张图的**预估字节**。口径与 g_t_bytes_live 一致（上送成功 +=sn->avail，
++   让位换出 -=nvn_vk_tex_vkbytes），所以 `live + need` 与真实占用同量级，可当硬顶判据用。 */
++static unsigned long long g_m103a_deny_bytes;   /* 活体字节硬顶挡下的建图请求数（why=-36） */
++static unsigned long long g_m103a_reclaim;      /* 回收 tick 换出的张数 */
++static unsigned long long g_m103a_evict;        /* 建图判决处的让位张数（开态口径） */
++static int t_idimg_bytes_ok(unsigned long long need)
++{
++ if(!m103a_on())return 1;                        /* 关态：一字不判（原行为逐字不变） */
++ if(need>M103A_BYTES_MAX)return 0;               /* 单张自己就超顶 ⇒ 不建（上送门另有 32 MB 兜底） */
++ return (g_t_bytes_live+need<=M103A_BYTES_MAX)?1:0;
++}
++static int m103a_pressure(unsigned long long need)
++{
++ if(nvn_vk_is_up()&&g_t_idimg>=k_id_img_max)return 1;   /* 名额满（开/关态同义） */
++ if(!m103a_on())return 0;
++ if(g_t_bytes_live+need>M103A_BYTES_MAX)return 1;       /* 活体字节触顶 */
++ return 0;
++}
++/* 回收 tick：每笔 bind 顶部跑一次。只在真越顶时动，最多 M103A_RECLAIM_PER_SUB 张/submit。
++   候选约束与建图判决处同源（t_evict_one：只换无槽引用的图；小图/低 binds/最老优先）。 */
++static void m103a_reclaim(void)
++{
++ if(!m103a_on())return;
++ unsigned n=0;
++ while(m103a_pressure(0)&&n<M103A_RECLAIM_PER_SUB){
++  unsigned long long was=g_z_evict;
++  if(!t_evict_slot_small())break;
++  t_evict_one(-1);
++  if(g_z_evict==was)break;     /* 无候选（全被采样槽引用）⇒ 停止；下一笔再试 */
++  g_m103a_reclaim++;n++;
++ }
++ if(n){static unsigned long long said;if(said<24){said++;
++   vk_boot_logf("[m103a] reclaim n=%u idimg=%llu/%u live=%lluMB/%lluMB evict=%llu evict_tot=%llu",
++    n,(unsigned long long)g_t_idimg,(unsigned)k_id_img_max,
++    (unsigned long long)(g_t_bytes_live>>20),(unsigned long long)(M103A_BYTES_MAX>>20),
++    (unsigned long long)g_m103a_reclaim,(unsigned long long)g_z_evict);}}
++}
++
+ /* M4u P1：注册期对象直读兜底。
+    缺口（m4t_b2 实测）：`[t] reg ... snap=0` 在 4096-th 之后全是同一个 tex/view 指针
+    （tex=0x6ec86f3c78 view=0x7f6e7af050），id 一路涨到 22528，23596 次注册里只有 2949 条进了表，
+    其余 20392 条被当「未过宿主 Initialize」丢掉 ⇒ 这些 id 之后被绑定时整片进 unres（40,984）。
+    同一指针反复注册说明它不是「没 Initialize 过」，而是 Initialize 快照已被 16 K 环形表挤掉。
+    这里在**注册那一刻**（游戏刚写好的同步点）只读一次 magic 校验通过的四个字段建快照，
+@@ -2774,13 +2887,13 @@
+ static unsigned long long g_t_unres_dropped,g_t_slot_hi;
+ /* M4t P2（2026-11-03）：按 id 的绑定次数 + 「上送失败原因」分布。
+    为什么需要：`up=256` 是「不同的纹理张数」而不是「上送次数」，答不了「哪张常用纹理没内容」。
+    这里给每个 id 记绑定次数，周期性地把「从未上送过的高频 id」top20 打出来（每 6000 submit 一次，
+    最多 4 次），并把 upload_storage 的负码按原因分桶（-2 MSAA/-3 空或超限/-4 预算/-5 深度+模板/
+    -6 soft_bc/-7 布局不可解/-8 deswizzle 几何/-9 malloc/-10 越界/-11 入参非法）。 */
+-static unsigned g_t_idbinds[TEXREG_N];
++/* M103A：`g_t_idbinds` 的声明已上移到 M5z/M7k 段（让位优先序要用），这里不再重复定义。 */
+ static unsigned long long g_t_upfail[16], g_t_upfail_n;
+ static void g_t_upfail_add(int ok)
+ {
+     g_t_upfail_n++;
+     if (ok < 0 && -ok < (int)(sizeof g_t_upfail/sizeof *g_t_upfail)) g_t_upfail[-ok]++;
+     else g_t_upfail[0]++;   /* 0 = 入参非法（旧口径）；正码不该出现在失败分支 */
+@@ -4375,12 +4488,13 @@
+   int fd=open(p[i],O_CREAT|O_WRONLY|O_TRUNC,0666);
+   if(fd>=0){ssize_t w=write(fd,"0\n",2);(void)w;close(fd);chmod(p[i],0666);}
+  }}
+ static int g_rp_bind_tex(int stage,int first,int n,const uint64_t *h,void *u){
+  (void)u;(void)stage;
+  m30a_q_tick();   /* M30A：smo_m30a_q bit0 时把 id-image 名额抬到 1024（关态恒 384，无副作用） */
++ m103a_reclaim(); /* M103A P1：名额/活体字节越顶时先回收（关态第一行就 return，零副作用） */
+  m40q_stat();     /* M40Q：每 60 s 一行 [m40q] st（仅 smo_m40q 开态；关态第一行就 return，基线日志不变） */
+  if(!h||n<=0)return 0;
+  nvn_vk_tex *res[TX_SLOT_MAX];memset(res,0,sizeof res);int nres=0,changed=0;
+  void *repl[TX_SLOT_MAX];memset(repl,0,sizeof repl);int rids[TX_SLOT_MAX];int nrepl=0;
+  unsigned long long rstore[TX_SLOT_MAX];memset(rstore,0,sizeof rstore);   /* M4w P1：store 路命中的池地址 */
+  int m36a_slot[TX_SLOT_MAX];   /* M36A：本槽命中的 RT 槽号（-1 = 没有），只供取证行 */
+@@ -4553,37 +4667,54 @@
+    if(!vk&&!m40q_skip){
+     /* M5z P1：名额满了先让位（LRU 驱逐一张无槽引用的旧图），再走原来的建图/门槛判定。 */
+     int ev=0;
+     /* M7k P1：小图（≤1MB）不受 binds>=8 让位门槛约束（首绑即让位）；其余条件不变。
+        M7k P2（boot2）：小图走独立 submit 配额（t_evict_slot_small），不再与热 id 洪水抢 8 次/submit。 */
+     int ev_small = M7K_SMALL_EVICT_ON&&sn&&sn->avail&&sn->avail<=(1ull<<20)&&tid>=0&&tid<TEXREG_N;
+-    int ev_hot   = g_t_idbinds[tid]>=M5Z_EVICT_MIN_BINDS&&t_evict_slot();
+-    int ev_sm_ok = ev_small&&t_evict_slot_small();
+-    if(g_t_idimg>=k_id_img_max&&nvn_vk_is_up()&&tid>=0&&tid<TEXREG_N&&(ev_hot||ev_sm_ok)){
++    /* M103A P2（2026-11-13）：压顶判据 = 名额满 **或** 活体字节顶，并且**只有真压顶才求值配额**
++       （旧代码无条件求值 ev_sm_ok ⇒ 每笔小图 bind 吃一次配额，deny_s 涨的是记账假象）。
++       开态下任何 id 都能让位（LRU 缓存语义），不再要求 binds>=8 或 avail<=1MB —— 3D 段新到的
++       id（2952/2953/2954 那批 1280×160 fmt=0x25）正是被这两条门槛一起挡死的。 */
++    int press = (tid>=0&&tid<TEXREG_N&&nvn_vk_is_up())?m103a_pressure(sn?sn->avail:0ull):0;
++    if(press&&(((g_t_idbinds[tid]>=M5Z_EVICT_MIN_BINDS)&&t_evict_slot())
++               ||(ev_small&&t_evict_slot_small())
++               ||(m103a_on()&&t_evict_slot_small()))){
+      unsigned long long was=g_z_evict;
+      t_evict_one(tid);
+      ev=(g_z_evict!=was);
++     if(ev&&m103a_on())g_m103a_evict++;
+      if(ev&&ev_small&&g_t_idimg<k_id_img_max){g_z_evict_small++;
+       if(g_z_evict_small<=16)vk_boot_logf("[m7k] small evict id=%d avail=%llu binds=%llu idimg=%u/%u live=%lluMB deny=%llu deny_s=%llu",
+         tid,(unsigned long long)sn->avail,(unsigned long long)g_t_idbinds[tid],
+         g_t_idimg,(unsigned)k_id_img_max,(unsigned long long)(g_t_bytes_live>>20),
+         (unsigned long long)g_z_evict_deny,(unsigned long long)g_z_evict_deny_s);}
++     else if(ev){static unsigned long long m103a_ev_lines;
++      if(m103a_ev_lines<16){m103a_ev_lines++;
++       vk_boot_logf("[m103a] evict id=%d avail=%llu binds=%llu idimg=%u/%u live=%lluMB/%lluMB deny=%llu deny_s=%llu",
++        tid,(unsigned long long)sn->avail,(unsigned long long)g_t_idbinds[tid],
++        g_t_idimg,(unsigned)k_id_img_max,(unsigned long long)(g_t_bytes_live>>20),
++        (unsigned long long)(M103A_BYTES_MAX>>20),
++        (unsigned long long)g_z_evict_deny,(unsigned long long)g_z_evict_deny_s);}}
+     }
+-    if(g_t_idimg<k_id_img_max&&nvn_vk_is_up()){
++    if(g_t_idimg<k_id_img_max&&nvn_vk_is_up()&&t_idimg_bytes_ok(sn?sn->avail:0ull)){
+      if(!tex_up_gate_ok(tid,sn,&big)){if(tid>=0&&tid<TEXREG_N)g_t_idwhy[tid]=-30;t_starve_note(tid,sn->avail,0);if(m34a_on())m34a_fam_add(tid,sn);}   /* M4u P1b/M4as P2：冷 id 让位，但大图有独立配额。M34A：这一支就是「被拒族」的诞生点 ⇒ 按池地址登记进动态族表（关态不执行） */
+      else {vk=nvn_vk_tex_create(&sn->d);
+       if(vk){g_idvk[tid]=vk;g_t_idimg++;g_idup[tid]=0;
+        /* M40AE ①：登记进共享表（refs=1）。表满或 mem==0 时不登记 ⇒ 这张图退回逐 id 语义。 */
+        if(m40ae_on()&&tid>=0&&tid<TEXREG_N&&sn->mem)
+         m40ae_reg(tid,(unsigned long long)(uintptr_t)sn->mem,(unsigned)sn->d.width,(unsigned)sn->d.height,(unsigned)fmt,vk);
+        nvn_vk_m40p_idrep(tid,(unsigned)sn->d.width,(unsigned)sn->d.height,(unsigned)sn->d.format);   /* M40P：同 id 重复建图计数 */
+        m40ad_img(tid,(unsigned long long)(uintptr_t)sn->mem,(unsigned)sn->d.width,(unsigned)sn->d.height,(unsigned)fmt);   /* M40AD：同存储是否换 id（关态零副作用） */
+        if(ev)t_fix_note(tid);   /* 这张图是"换出来的" ⇒ 没有本次改动该槽此刻会是白占位 */
+        if(g_t_idimg<=8)vk_boot_logf("[t] id img #%llu id=%d %ux%u fmt=0x%x",g_t_idimg,tid,sn->d.width,sn->d.height,fmt);}
+       else {g_t_idimg_cap++;if(tid>=0&&tid<TEXREG_N)g_t_idwhy[tid]=-32;}}
+-    } else {g_t_idimg_cap++;t_starve_note(tid,sn->avail,1);if(tid>=0&&tid<TEXREG_N&&nvn_vk_is_up())g_t_idwhy[tid]=-31;
++    } else {g_t_idimg_cap++;t_starve_note(tid,sn->avail,1);
++            /* M103A：区分「名额满」(-31) 与「活体字节顶」(-36) —— 两个都必须能单独读出来。 */
++            if(tid>=0&&tid<TEXREG_N&&nvn_vk_is_up()){
++             if(g_t_idimg<k_id_img_max&&!t_idimg_bytes_ok(sn?sn->avail:0ull)){g_t_idwhy[tid]=-36;g_m103a_deny_bytes++;}
++             else g_t_idwhy[tid]=-31;}
+             else if(tid>=0&&tid<TEXREG_N)g_t_idwhy[tid]=-33;}
+    }
+    }   /* M40Q：m40q_skip 作用域结束（跳过时上面整段让位/建图都没跑） */
+    if(vk&&!nvn_vk_tex_matches_desc(vk,&sn->d)){vk=NULL;g_t_mism++;if(tid>=0&&tid<TEXREG_N)g_t_idwhy[tid]=-34;}   /* 理论不发生：自建图即按快照建 */
+    if(vk){
+     int idx=tid;   /* 上传标记按 id（自建图） */
+@@ -4935,13 +5066,55 @@
+ /* M4an P2：四个单数状态设置的调用量（定义在此，报表在上方，接线块在下方） */
+ static unsigned long long g_ss_viewport,g_ss_scissor,g_ss_depthrange,g_ss_blendcolor;
+ extern void nvn_port_callcmd_totals(uint64_t *o);
+ extern void nvn_port_cmdmem_stats(uint64_t *o);
+ extern void nvn_port_last_cb(uint64_t *o);
+ extern void nvn_port_note_submit_h(const void *h,int n);
++/* ================= M103A P3（2026-11-13）：两处仪表改成按时间触发 =================
++   病根（M102C §5.1/§5）：`[tex] miss class` 与 `[t] lru` 都挂在「每 300 submit」的报表门上。
++   3D 段只有 0.2–0.25 fps（整段约 300 submit / 130 s），所以 3D 段的 evict/noslot/deny 与
++   cap_idimg/heat_gate/budget 分项**一行都打不出来**，只能拿 `[m7k] ph` 当代理值。
++   修法：把这两条读数从 submit 门里解耦，改成**时间门 ≥30 s**（同一 30 s 拍子，不重复打印）。
++   触发点 = nvn_queue_submit_commands 入口（每 submit 一次判断，成本 = 一次 time() + 两次比较）。
++   关态：m103a 关也照样按时间打（这是纯粹的仪表修正，不改任何渲染/建图行为）。 */
++static long g_t_lru_t; static int g_t_lru_seen;
++static void t_lru_report(unsigned sub);
++static void m103a_time_report(unsigned sub)
++{
++ long now=(long)time(NULL);
++ if(g_t_lru_seen&&now-g_t_lru_t<30)return;   /* 门在 t_lru_report 内部，这里只做早期短路 */
++ t_lru_report(sub);
++ nvn_vk_m103a_tick(sub);                     /* [tex] miss class（nvn_vk.c 内部同款 30 s 门） */
++}
++/* M5z P1：LRU 驱逐台账（修的是「id 图名额一次性」这个类）。evict=真换出的张数/字节；
++   noslot=想换但所有图都被槽引用（安全侧，宁可不换）；deny=被每 submit 限流挡下。
++   M6a B：延迟销毁台账。deferred=进坟场张数；freed=已销毁；sync=坟场满回退同步的；pend=此刻还挂着。
++   旧的 evict 每张一次 vkQueueWaitIdle（evict=455 时就是 455 次全队列同步）⇒ 现在每批一次。
++   M103A P3：本函数自带 30 s 时间门 ⇒ 低帧率段（3D 0.2 fps）也能出，一行/30 s 封顶。
++   M103A 追加 `[m103a] stat`：名额/活体字节/让位/压顶拒绝的同拍读数（判据①②⑥的原始口径）。 */
++static void t_lru_report(unsigned sub)
++{
++ long now=(long)time(NULL);
++ if(g_t_lru_seen&&now-g_t_lru_t<30)return;
++ g_t_lru_t=now;g_t_lru_seen=1;
++ {unsigned long long gd=0,gf=0,gs=0;unsigned gp=0;nvn_vk_tex_graveyard_stats(&gd,&gf,&gs,&gp);
++  vk_boot_logf("[t] lru evict=%llu evict_bytes=%lluMB noslot=%llu deny=%llu deny_s=%llu small=%llu idimg=%llu/%u live=%lluMB cum=%lluMB grave deferred=%llu freed=%llu synced=%llu pend=%u",
++   g_z_evict,(unsigned long long)(g_z_evict_bytes>>20),g_z_evict_noslot,g_z_evict_deny,g_z_evict_deny_s,g_z_evict_small,
++   g_t_idimg,(unsigned)k_id_img_max,(unsigned long long)(g_t_bytes_live>>20),(unsigned long long)(g_t_bytes>>20),
++   gd,gf,gs,gp);}
++ vk_boot_logf("[m103a] stat on=%d @submit#%u cap=%u idimg=%llu live=%lluMB/%lluMB evict=%llu reclaim=%llu "
++              "deny=%llu deny_s=%llu deny_bytes=%llu up=%llu skip=%llu",
++  m103a_on(),sub,(unsigned)k_id_img_max,(unsigned long long)g_t_idimg,
++  (unsigned long long)(g_t_bytes_live>>20),(unsigned long long)(M103A_BYTES_MAX>>20),
++  (unsigned long long)g_m103a_evict,(unsigned long long)g_m103a_reclaim,
++  (unsigned long long)g_z_evict_deny,(unsigned long long)g_z_evict_deny_s,
++  (unsigned long long)g_m103a_deny_bytes,
++  (unsigned long long)g_t_up,(unsigned long long)g_t_skip);
++}
+ static void nvn_h_report(unsigned sub){ int kinds=0;uint64_t skipped=0; for(int i=0;i<CMD_TRACE_MAX_OPS;i++)if(g_h_ops.per_op[i]){kinds++;if(i!=NVN_CMD_OP_CLEAR_COLOR)skipped+=g_h_ops.per_op[i];}
++
+  vk_boot_logf("[h] opcode skipped @submit#%u: skipped=%llu kinds=%d clear_ok=%llu clear_fail=%llu noptr=%llu exec_fail=%llu records=%llu bad_cb=%llu",
+   sub,(unsigned long long)skipped,kinds,(unsigned long long)g_h_clear_ok,(unsigned long long)g_h_clear_err,
+   (unsigned long long)g_h_clear_noptr,(unsigned long long)g_h_exec_fail,(unsigned long long)g_h_ops.total,
+   (unsigned long long)nvn_rec_bad_cb());
+  /* M3i：RT 绑定取证（比例用这条：SET_RENDER_TARGETS 条数见下方 opcode 行） */
+  {unsigned long long rb=0,rn=0,bo=0,bf=0;nvn_vk_rt_stats(&rb,&rn,&bo,&bf);
+@@ -5075,17 +5248,18 @@
+   g_t_starve_cap_ids,g_t_starve_cap_bytes,g_t_starve_heat_ids,g_t_starve_heat_bytes,
+   g_t_idimg,(unsigned)k_id_img_max,(unsigned long long)(g_t_bytes>>20));
+  /* M5z P1：LRU 驱逐台账（修的是「id 图名额一次性」这个类）。evict=真换出的张数/字节；
+     noslot=想换但所有图都被槽引用（安全侧，宁可不换）；deny=被每 submit 限流挡下。 */
+  /* M6a B：延迟销毁台账。deferred=进坟场张数；freed=已销毁；sync=坟场满回退同步的；pend=此刻还挂着。
+     旧的 evict 每张一次 vkQueueWaitIdle（evict=455 时就是 455 次全队列同步）⇒ 现在每批一次。 */
+- {unsigned long long gd=0,gf=0,gs=0;unsigned gp=0;nvn_vk_tex_graveyard_stats(&gd,&gf,&gs,&gp);
+-  vk_boot_logf("[t] lru evict=%llu evict_bytes=%lluMB noslot=%llu deny=%llu deny_s=%llu small=%llu idimg=%llu/%u live=%lluMB cum=%lluMB grave deferred=%llu freed=%llu sync=%llu pend=%u",
+-   g_z_evict,(unsigned long long)(g_z_evict_bytes>>20),g_z_evict_noslot,g_z_evict_deny,g_z_evict_deny_s,g_z_evict_small,
+-   g_t_idimg,(unsigned)k_id_img_max,(unsigned long long)(g_t_bytes_live>>20),(unsigned long long)(g_t_bytes>>20),
+-   gd,gf,gs,gp);}
++ /* M103A P3：`[t] lru` 与 `[tex] miss class` 改成**按时间**触发（≥30 s 一行）——
++    3D 段 0.2 fps，旧的「每 300 submit」在整段里只能落一次（M102C §5 实测：最后一行停在
++    submit#1200 / app_t≈310 s 菜单段），低帧率段等于仪表全盲。门在 t_lru_report 内部，
++    两个调用点（nvn_h_report 的 submit 门 + m103a_time_report 的时间门）共用同一个 30 s 拍子，
++    因此不会重复打印。 */
++ t_lru_report(sub);
+  /* M4u P1：unres 病根三分 + 修复计数（验收口径 src=init|reg|bad；addr/handle 两路弃用理由见 texreg_snap_from_obj 注释）。
+     unres_dropped = unres 里「注册期因无快照被丢弃」的那部分，是 P1 要打的靶。 */
+  vk_boot_logf("[t] unres fix src=init n=%llu src=reg n=%llu src=bad n=%llu src=addr n=0 src=handle n=0 pin_evict=%llu unres_dropped=%llu heat_gate=%llu",
+   g_t_unres_fix_init,g_t_unres_fix_reg,g_t_unres_fix_bad,g_t_pin_evict,g_t_unres_dropped,g_t_heat_gate);
+  tex_bind_stats_dump(sub);   /* M4t P2：never-up top20 + 上送失败原因分布（每 6000 submit 一次，最多 4 次） */
+  /* M4e（route②）源图替换口径：hit_self=命中当前 RT（走影子副本）hit_other=命中别的 RT（直接采样）
+@@ -5220,12 +5394,13 @@
+     但让崩溃前的最后一份落点最多晚 300 submit（≈75s@4fps）而不是 1800。 */
+  if(sub==1||sub%100==0)nvn_mem_report(sub);   /* M4i P0：每 100 submit 一条 RSS/fd 曲线 */
+  if(sub==1800||sub==3600||sub==5400)nvn_mem_top(sub);   /* M4i P1：映射明细（三次足够定位） */
+  if(sub==1||sub==10||sub==100||sub==300||sub==600||(sub>600&&sub%300==0))nvn_h_report(sub);
+ }
+ static void nvn_queue_submit_commands(void *q,int n,const void *h){(void)q;unsigned long sub=(unsigned long)atomic_fetch_add_explicit(&g_beat_nvn_submit,1,memory_order_relaxed)+1;   /* M3g 探针 #3：NVN 提交计数（入口即计，不参与后面的 dump 判定）；M3h：返回值即 submit 序号 */
++ m103a_time_report(sub);   /* M103A P3：按时间触发的 [t] lru / [tex] miss class / [m103a] stat（≥30 s 一行） */
+  m40h_tick();   /* M40H：每 submit 重读首绑纹理源首 64 B（≤64 id，开关 smo_m40h） */
+  nvn_vk_m40j_tick();   /* M40J：每 600 submit 一条 cpsum（拷贝目标分桶，开关 smo_m40j） */
+  { extern void nvn_vk_m40k_tick(unsigned long long);
+    nvn_vk_m40k_tick((unsigned long long)sub); }   /* M40K：每 2 s 对 ≤16 个池区间做内容 hash 差分（开关 smo_m40k） */
+  nvn_port_note_submit_h(h,n);   /* M5r：记下本笔提交的 handle 及其首 32 字节（判空 CB 归因用，只读边界受 cmdmem_readable 约束） */
+  runtime_thread_note_op(1);   /* M5b：冻结线程表里 op=1 且 age 持续增长 = 卡在这笔 submit 的宿主实现里没返回 */
+diff --git mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c
+--- mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c
++++ mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c
+@@ -13455,12 +13455,13 @@
+     case -20: return "snap_missing";
+     case -30: return "create_heat";
+     case -31: return "create_cap";
+     case -32: return "create_fail";
+     case -33: return "render_down";
+     case -34: return "desc_mismatch";
++    case -36: return "create_bytes";   /* M103A：id 图活体字节硬顶（512 MiB）挡下 */
+     default: return "unknown";
+     }
+ }
+ 
+ static void k_sentinel_print(const R_Key *kv, const R_Key *kf, int count, unsigned nverts)
+ {
+@@ -20883,13 +20884,13 @@
+ static int r_tm_class(int slot)
+ {
+     int w = (int)g_r_tx_diag[slot].why;
+     unsigned b = g_r_tx_diag[slot].binds;
+     if (!b) return TM_NEVER_BOUND;
+     if (w > 0) return TM_CLEARED;
+-    if (w == -31 || w == -32 || w == -33) return TM_CAP_IDIMG;
++    if (w == -31 || w == -32 || w == -33 || w == -36) return TM_CAP_IDIMG;   /* M103A：-36 = 字节顶，同属「名额/预算类」 */
+     if (w == -30 || w == -12) return TM_HEAT_GATE;
+     if (w == -4) return TM_BUDGET;
+     if (w == -20) return TM_NO_SNAPSHOT;
+     if (w < 0) return TM_UPLOAD_FAIL;
+     return TM_OTHER;
+ }
+@@ -20995,13 +20996,13 @@
+         }
+     }
+ }
+ 
+ /* M5z P0 报表：① 三类占比（从未创建 / 创建了没绑到该槽 / 绑了但内容全零）；
+    ② 按 fs 键的空槽 Top 表，一行一个 (fs,binding,slot)，带 expect_fmt/ext/id 与归因码。 */
+-static void m5z_report(unsigned sub)
++static void m5z_report_now(unsigned sub)
+ {
+     unsigned long long never_created = 0, created_not_bound = 0, tot = 0;
+     unsigned long long cn[TM_NWHY];
+     memset(cn, 0, sizeof cn);
+     for (int w = 0; w < R_TM_WHY; w++) cn[w] = g_tm_all[w];   /* 精确口径：全局计数 */
+     for (int w = 0; w < R_TM_WHY; w++) {
+@@ -21073,12 +21074,27 @@
+         vk_boot_logf("[m27a] rep @submit#%u: keys=%llu pairs=%llu ds_write_u_eq_i=%llu ds_write_u_ne_i=%llu",
+                      sub, g_m27a_keys, g_m27a_pairs, g_m27a_map_same, g_m27a_map_diff);
+     m26a_report(sub);
+ }
+ 
+ /* 周期报表（挂在 nvn_vk_gm_report 末尾，与 [r] draw totals 同节流点）。 */
++/* M103A P3（2026-11-13）：`[tex] miss class` 从「每 300 submit」改成**按时间**触发（≥30 s）。
++   依据（M102C §5 实测）：3D 段 0.2–0.25 fps，整段只推进约 300 submit ⇒ 旧口径的报表最后一行停在
++   submit#1200 / app_t≈310 s（菜单段），3D 段的 cap_idimg/heat_gate/budget/nosnap 分项**一行都没有**，
++   只能拿 `[m7k] ph` 的 why 当代理。本函数把门搬到时间轴上，两个调用点（m5y_report 的 submit 门、
++   nvn_vk_m103a_tick 的时间门）共用同一个 30 s 拍子 ⇒ 不会重复打印。只改仪表，不改任何判决。 */
++static long g_m103a_miss_t;
++static int g_m103a_miss_seen;
++static void m5z_report(unsigned sub)
++{
++    long now = (long)time(NULL);
++    if (g_m103a_miss_seen && now - g_m103a_miss_t < 30) return;
++    g_m103a_miss_t = now; g_m103a_miss_seen = 1;
++    m5z_report_now(sub);
++}
++void nvn_vk_m103a_tick(unsigned sub) { m5z_report(sub); }
+ static void m5y_report(unsigned sub)
+ {
+     vk_boot_logf("[b] tgt census @submit#%u: host=%llu ovf=%llu n=%d", sub, g_tc_host, g_tc_ovf, g_tc_n);
+     for (int i = 0; i < g_tc_n; i++) {
+         char t[300]; size_t o = 0; t[0] = 0;
+         for (int k = 0; k < g_tc[i].ntop && o + 40 < sizeof t; k++)
+@@ -25979,12 +25995,90 @@
+                  g_p_sel_call, g_p_sel_slot, g_p_sel_why,
+                  g_rt_cur ? "gameRT" : "hostRT", (unsigned long long)(uintptr_t)g_h_img,
+                  (unsigned)g_rt_w, (unsigned)g_rt_h, g_p_src_hit, g_p_src_cur, g_p_src_fallback,
+                  g_p_src_content, g_p_content_lost, g_p_content_seen, g_p_content_rej, g_p_src_snap);
+ }
+ 
++/* ===== M103A P3（2026-11-13）：present「到底拷了哪张」一次性自证行 =====================
++   病根（M102C §5.1，本单要钉的第一件事）：同一个 boot 里三个读数对不上——
++     · `[p] sig` 写 `src=tex sel_slot=3 sel_why=tex mean=0/0/0`（= 拷了 slot3，内容是黑的）
++     · `[p] dump slot=60` 写 `mean=49/49/0`（= 槽 60 是纯黄）
++     · 屏幕截图又是纯黄 15.89%
++   三者至少有一个采的不是最终上屏的那张。本行把「实际拷贝」钉死在一行里：
++     ① 我们真正 phase-1 拷贝的源：sel_why / sel_slot / simg / ext / lay；
++     ② 该槽在 RT 表里的身份：img / **texid** / ext / key，以及 simg 是否就是这张（same_img）——
++        与 `[p] dump slot=N` 用的是同一张 g_rt_tab ⇒ 按 slot + texid 直接对齐；
++     ③ 游戏自己指定上屏的那张（p_slot_by_key(g_p_tex_key)，与 `[p] dump game-present` 同源）；
++     ④ staging 的 mean/nz（与 `[p] sig` 同口径，采样每 64 像素）。
++   时机：拷贝 + fence 都过去之后（此刻 staging 里装的就是本帧要送屏的像素）⇒ 与 `[p] sig` 同一刻。
++   预算：全 boot ≤8 行、且相邻两行间隔 ≥30 s（一次性自证，不是周期报表）——这样菜单段与 3D 段
++   各有若干行，能直接比对「同一根 slot/texid 在菜单段与 3D 段拷出来的均值是否不同」。
++   只读：不碰任何 Vulkan 状态、不改选源。 */
++static void m103a_proof_line(unsigned long long call, const char *why, int sel_slot,
++                             VkImage simg, uint32_t sw, uint32_t sh, int lay, int winok)
++{
++    static long last;
++    static unsigned n;
++    if (!why || n >= 8) return;
++    {
++        long now = (long)time(NULL);
++        if (n && now - last < 30) return;   /* 同一 30 s 拍子最多一行 */
++        last = now; n++;
++    }
++    const int nsl = (int)(sizeof g_rt_tab / sizeof *g_rt_tab);
++    /* ② 我们拷的槽在 RT 表里的身份（与 [p] dump 同一张表） */
++    const char *slot_img = "<none>";
++    unsigned long long slot_imgv = 0, slot_key = 0;
++    int slot_tx = -1, slot_same = -1;
++    unsigned slot_w = 0, slot_h = 0;
++    int dt = -1;
++    if (sel_slot >= 0 && sel_slot < nsl) {
++        h_rt_slot *s = &g_rt_tab[sel_slot];
++        slot_img = s->img ? "img" : "no-img";
++        slot_imgv = (unsigned long long)(uintptr_t)s->img;
++        slot_key = (unsigned long long)s->key;
++        slot_tx = s->tex_id; slot_w = (unsigned)s->w; slot_h = (unsigned)s->h;
++        slot_same = (s->img == simg) ? 1 : 0;
++        dt = slot_tx;
++    }
++    /* ③ 游戏自己指定上屏的那张 */
++    int gi = -1, gi_tx = -1, gi_same = -1;
++    unsigned long long gi_img = 0;
++    unsigned gi_w = 0, gi_h = 0;
++    { h_rt_slot *gs = NULL; gi = p_slot_by_key(g_p_tex_key, &gs);
++      if (gi >= 0 && gs) {
++          gi_img = (unsigned long long)(uintptr_t)gs->img; gi_tx = gs->tex_id;
++          gi_w = (unsigned)gs->w; gi_h = (unsigned)gs->h;
++          gi_same = (gs->img == simg) ? 1 : 0;
++      } }
++    /* ④ staging 均值（每 64 像素取 1，成本 <0.1 ms） */
++    unsigned long long sr = 0, sg = 0, sb = 0, nz = 0, ns = 0;
++    { const unsigned char *p = (const unsigned char *)g_p_map;
++      if (p) {
++          const unsigned long long npx = (unsigned long long)g_p_cp_w * g_p_cp_h;
++          for (unsigned long long i = 0; i < npx; i += 64) {
++              const unsigned char *q = p + i * 4;
++              sr += q[0]; sg += q[1]; sb += q[2];
++              if (q[0] || q[1] || q[2]) nz++;
++              ns++;
++          }
++      } }
++    vk_boot_logf("[m103a] proof #%u call=%llu draws=%llu sel_why=%s sel_slot=%d simg=%#llx ext=%ux%u lay=%d win=%s | "
++                 "slot[%d]: %s img=%#llx texid=%d ext=%ux%u key=%#llx same_img=%d | "
++                 "gpres slot=%d img=%#llx texid=%d ext=%ux%u same_img=%d | "
++                 "staging mean=%llu/%llu/%llu nz=%.2f%% of %llux%llu | align dump_slot=%d dump_texid=%d",
++                 n, call, g_r_draws, why, sel_slot, (unsigned long long)(uintptr_t)simg, (unsigned)sw, (unsigned)sh,
++                 lay, winok ? "ok" : "fail",
++                 sel_slot, slot_img, slot_imgv, slot_tx, slot_w, slot_h, slot_key, slot_same,
++                 gi, gi_img, gi_tx, gi_w, gi_h, gi_same,
++                 ns ? sr / ns : 0ull, ns ? sg / ns : 0ull, ns ? sb / ns : 0ull,
++                 ns ? 100.0 * (double)nz / (double)ns : 0.0,
++                 (unsigned long long)g_p_cp_w, (unsigned long long)g_p_cp_h,
++                 sel_slot, dt);
++}
++
+ 
+ /* ---- M4ag P1（2026-11-04）：上屏源 = **游戏自己指定的那张窗口纹理** ----
+    权威信号链：`nvnWindowBuilderSetTextures(builder,n,tex[])` 把 n 张 NVNtexture 交给窗口
+    （gfx_bridge.c:849 登记 → nvn_window_initialize:858 拷进 win->tex[]），每帧
+    `nvnWindowAcquireTexture` 轮转给出 idx，`nvnQueuePresentTexture(q,w,idx)` 用的就是同一个 idx
+    ⇒ **win->tex[idx] 就是这一帧游戏要给人看的那张**。gfx_bridge 把它解析成**存储身份**
+@@ -27895,15 +27989,15 @@
+         if (f) {
+             fprintf(f, "P7\nWIDTH %u\nHEIGHT %u\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n",
+                     (unsigned)s->w, (unsigned)s->h);
+             wrote = (unsigned long long)fwrite(p, 1, (size_t)sz, f);
+             fclose(f);
+         }
+-        vk_boot_logf("[p] dump slot=%d key=%#llx img=%#llx ext=%ux%u lay=%d -> %s bytes=%llu "
++        vk_boot_logf("[p] dump slot=%d key=%#llx img=%#llx texid=%d ext=%ux%u lay=%d -> %s bytes=%llu "
+                      "mean=%llu/%llu/%llu min=%llu/%llu/%llu max=%llu/%llu/%llu nz=%.2f%%",
+-                     idx, (unsigned long long)s->key, (unsigned long long)(uintptr_t)s->img,
++                     idx, (unsigned long long)s->key, (unsigned long long)(uintptr_t)s->img, s->tex_id,
+                      (unsigned)s->w, (unsigned)s->h, (int)lay, used, wrote,
+                      sr2 / (ns ? ns : 1), sg2 / (ns ? ns : 1), sb2 / (ns ? ns : 1),
+                      (unsigned long long)mn[0], (unsigned long long)mn[1], (unsigned long long)mn[2],
+                      (unsigned long long)mx[0], (unsigned long long)mx[1], (unsigned long long)mx[2],
+                      100.0 * (double)nz / (double)(ns ? ns : 1));
+         vkUnmapMemory(g_dev, mem);
+@@ -30613,12 +30707,16 @@
+                      call, t1 - t0, ok ? "ok" : "fail", g_p_ok, g_p_skip, g_p_winfail, srcname, sw, sh);
+     /* M4x P1：真正送屏的像素（staging）签名，与 [rt] 行同口径；#1~3 全落、之后每 120 次一条。
+        M4y P1：content 源每次上屏都统计（只算均值/极值，<1ms），用于 content lost 计数；行本身仍限流。 */
+     {
+         int psig_verbose = (call <= 3 || (call % 120) == 0);
+         int psig_want = psig_verbose || !strcmp(srcname, "content") || g_p_m4ak_sig_pair;
++        /* M103A P3：一次性自证（实际拷贝的 slot/texid/simg/sel_why + staging 均值），
++           与 `[p] dump slot=N` 用同一张 g_rt_tab ⇒ 按 slot/texid 直接对齐。
++           函数自带「≤8 行 / 相邻 ≥30 s」的预算，菜单段与 3D 段都会各落几行。*/
++        m103a_proof_line(call, srcname, g_p_sel_slot, simg, sw, sh, (int)slay, ok);
+         if (psig_want)
+             p_sig_line(call, srcname, simg, sw, sh, crox, croy, ok, psig_verbose || g_p_m4ak_sig_pair);
+         g_p_m4ak_sig_pair = 0;
+     }
+     pthread_mutex_unlock(&lock);
+     return ok ? 1 : 0;
+diff --git mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.h mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.h
+--- mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.h
++++ mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.h
+@@ -266,12 +266,16 @@
+ unsigned long long nvn_vk_program_binds(void);
+ unsigned long long nvn_vk_program_bind_misses(void);
+ unsigned long long nvn_vk_pipe_cap_hits(void);   /* M3v P1：管线表撞满次数（skip_nopipe 成因拆分） */
+ unsigned long long nvn_vk_pipe_skip_gmem(void);  /* M3x P1：binding 17 (GMem) 未接线而跳过的管线数 */
+ /* M5v P1：gmem 后台账（heap 状态 / 搬迁笔数与字节 / slot 用尽 / 跨度超限），与 [r] draw totals 同节流点 */
+ void nvn_vk_gm_report(unsigned sub);
++/* M103A P3（2026-11-13）：`[tex] miss class` 改按**时间**触发（≥30 s 一行）——3D 段 0.2 fps 时
++   旧的「每 300 submit」在整段里只能落一次，低帧率段等于仪表全盲。由 gfx_bridge 的 30 s tick 调用；
++   函数内部自带同一道 30 s 门，所以与 submit 报表路径共用拍子、不会重复打印。 */
++void nvn_vk_m103a_tick(unsigned sub);
+ /* M5w P0：[hang] 行的第二行——在飞批次成分（ndraw/verts_max/tops）、上一批实测 us、隔离表。只读。
+    注意名字必须与 vk_boot.c 的弱引用一致（runtime_hang_batch_dump）。 */
+ void runtime_hang_batch_dump(void);
+ unsigned long long nvn_vk_pipe_skip_bigfs(void);  /* M4k P1③：>256KB 片元着色器按需跳过数 */
+ /* M4k P0-2：宿主侧阻塞计数（up=上传栅栏 >5s；destroy=纹理销毁 vkQueueWaitIdle >300ms） */
+ void nvn_vk_stall_stats(unsigned long long *up, unsigned long long *destroy);

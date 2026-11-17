@@ -1,0 +1,472 @@
+--- mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c
++++ mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c
+@@ -23352,6 +23352,442 @@
+     if (!(g_m105a_texmask[si >> 6] & (1ull << (si & 63)))) return 0;  /* 本帧必须已有带贴图笔写过它 */
+     g_m105a_skip_n++;
+     return 1;
++}
++
++/* ================= M107A（2026-11-14）：slot 的「白」从哪来 —— 帧内写入时序 + 三处签名 + 采样贴图白度 =====
++   唯一判断题（M106A 遗留，PARTIAL 收口）：slot 75 每帧 ~237 笔带贴图 draw，末端是「近白场 + 一条深色斜线」。
++   两条岔路，本单只要一句话的答案：
++     (a) 帧内**烧白**：该槽在本帧内**曾经** dcol>=8，随后被后面的 draw/pass 烧成 dcol<=2；
++     (b) 贴图/FS 本身**全白**：本帧首笔之后就已经 dcol<=2，且这笔采样到的纹理 mean≈255 / dcol<=2。
++   做法（**只加探针**；knob 缺省 0 = 关态逐字节等于 M106A 行为，零回读、零输出）：
++     ① 逐笔记账：每笔写该槽的颜色 draw 记 {seq, fs 键, ntex_decl/ntex_real, nv}（与 M105A 同口径，
++        复用 m105a_ntex ⇒ decl/real 的定义与 M102B 逐字一致）；
++     ② 三处签名：本帧首笔之后 / 中段（≈ 上一帧该槽笔数的一半）/ 末笔之后，各整幅回读一次该槽，
++        算 mean/spread/dcol/colored/nz（dcol = 每通道 >>4 量化后的**不同三元组数**，主判据一律用**源**槽；
++        nyb 不作主判据 —— 白也会被算成「非黑非黄」）；
++     ③ 采样贴图白度：该槽带贴图 draw 的采样纹理按 texid 去重（每帧 ≤8 张、单张 ≤1 Mpx、全帧 ≤4 Mpx），
++        统计 mean/dcol/all_white。
++   **回读时机的工程约束（必须写清楚，否则数据会被误读）**：本引擎的 draw 先录进 g_r_cb、再在 flush 里
++   提交+等栅栏。在绘制录制途中（渲染通道还开着、CB 未提交）整幅回读既读不到本帧内容，又会和在飞 CB
++   抢这张图的布局记账（布局账是「已录制」而非「已执行」的状态）⇒ 只可能读到上一批的内容并制造 UB。
++   故三处签名一律落在**两个 GPU 已空闲的安全点**：
++     · t0/t1：flush 的 submit+栅栏成功之后解析（这就是「首笔/中段之后最近的提交边界」）；
++     · t2   ：present（本帧最后一次提交已在它之前完成）⇒ 它就是「末笔之后」的槽内容。
++   语义如实标注：同一 flush 窗口内的多个时间点会给出同一个值（记 nflush 与 late 便于甄别），
++   这不是探针缺陷，是引擎批次语义；`trunc` = 环形表溢出丢弃的笔数。
++   knob `smo_m107a`（app 启动自种 0；每 2 s 重读，变化/心跳都打 `[m107a] sw knob -> val=`）：
++     0        = 关（缺省，关态等于 M106A）；
++     v>0      ⇒ slot = (v & 0xff)（为 0 时取默认 75），phase = (v >> 8) & 0xff：
++                phase 0 = 全开（逐笔行 + 三处签名 + 贴图白度）
++                phase 1 = 只签名（不打逐笔行、不做贴图白度，省日志）
++                phase 2 = 签名 + 贴图白度（不打逐笔行）
++   采样预算：每帧 ≤3 次整幅槽回读（400×225 = 90 000 px，可接受）⇒ 3D 段只在前 10 帧 + 之后每 60 帧做；
++   knob 每次变化都把帧计数归零 ⇒ 写 knob 后立刻就有 10 帧满采样，便于「30 s 内看到生效」。
++   本块不碰任何渲染语义：不改 pass 顺序、不改选源、不写任何 RT（只回读 + 打日志）。 */
++#define M107A_A P_SLOT_DIR_A "/smo_m107a"
++#define M107A_B P_SLOT_DIR_B "/smo_m107a"
++#define M107A_RING 2048u
++#define M107A_FRAME_MAX 64u
++#define M107A_TEX_MAX 8u
++#define M107A_TEX_PX_MAX 1048576ull      /* 单张贴图回读上限 1 Mpx */
++#define M107A_TEX_PX_FRAME 4194304ull    /* 每帧贴图回读总像素上限 4 Mpx */
++#define M107A_DEF_SLOT 75
++
++/* 签名（与 M106A 的 m106a_sig 同口径，但本块自带一份：M106A 块在文件更后面，C 要求先定义） */
++typedef struct {
++    unsigned mr, mg, mb;      /* 均值 */
++    unsigned mx;              /* 各通道最大值里的最大 */
++    unsigned spread;          /* 各通道极差的最大（<16 = 近单色） */
++    unsigned nz10;            /* 非零像素千分比 */
++    unsigned col10;           /* colored（任一 RGB 非零）千分比 */
++    unsigned nyb10;           /* 非黑非纯黄像素千分比（不作主判据） */
++    unsigned dcol;            /* 12-bit 量化不同三元组数（0..4096）—— 主判据 */
++    unsigned npx;
++} m107a_sig_t;
++
++static void m107a_sig(const uint8_t *p, unsigned w, unsigned h, m107a_sig_t *o)
++{
++    unsigned char seen[512];
++    unsigned long long sr = 0, sg2 = 0, sb = 0, nz = 0, col = 0, nyb = 0, n = 0;
++    unsigned mn[3] = { 255, 255, 255 }, mx[3] = { 0, 0, 0 };
++    unsigned d = 0;
++    memset(o, 0, sizeof *o);
++    if (!p || !w || !h) return;
++    memset(seen, 0, sizeof seen);
++    const unsigned long long npx = (unsigned long long)w * (unsigned long long)h;
++    for (unsigned long long i = 0; i < npx; i++) {
++        const uint8_t *q = p + i * 4;
++        const unsigned r = q[0], g = q[1], b = q[2];
++        sr += r; sg2 += g; sb += b; n++;
++        if (r || g || b) { nz++; col++; }
++        if (!(r < 16 && g < 16 && b < 16) && !(r >= 240 && g >= 240 && b < 32)) nyb++;
++        if (r < mn[0]) mn[0] = r;
++        if (g < mn[1]) mn[1] = g;
++        if (b < mn[2]) mn[2] = b;
++        if (r > mx[0]) mx[0] = r;
++        if (g > mx[1]) mx[1] = g;
++        if (b > mx[2]) mx[2] = b;
++        const unsigned k = ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4);
++        if (!(seen[k >> 3] & (1u << (k & 7u)))) { seen[k >> 3] |= (unsigned char)(1u << (k & 7u)); d++; }
++    }
++    if (!n) return;
++    o->mr = (unsigned)(sr / n); o->mg = (unsigned)(sg2 / n); o->mb = (unsigned)(sb / n);
++    o->mx = mx[0] > mx[1] ? (mx[0] > mx[2] ? mx[0] : mx[2]) : (mx[1] > mx[2] ? mx[1] : mx[2]);
++    for (int c = 0; c < 3; c++) { const unsigned dd = mx[c] - mn[c]; if (dd > o->spread) o->spread = dd; }
++    o->nz10 = (unsigned)(nz * 1000ull / n);
++    o->col10 = (unsigned)(col * 1000ull / n);
++    o->nyb10 = (unsigned)(nyb * 1000ull / n);
++    o->dcol = d;
++    o->npx = (unsigned)n;
++}
++
++typedef struct {
++    unsigned long long seq, dr;
++    unsigned nv, cnt;
++    unsigned char decl, real, dv;
++    char fs[17];
++} m107a_ent;
++
++typedef struct { VkImage img; VkImageLayout lay; unsigned w, h; int u, id; const char *what; } m107a_texq;
++
++static m107a_ent g_m107a_ring[M107A_RING];
++static unsigned long long g_m107a_w, g_m107a_rd, g_m107a_seq;
++static int g_m107a_v = -2, g_m107a_slot = -1, g_m107a_ph;
++static double g_m107a_kt, g_m107a_klog;
++static unsigned long long g_m107a_fno, g_m107a_pf, g_m107a_rslot;
++static int g_m107a_gate = 1;                 /* 本帧是否采样（前 10 帧 + 之后每 60 帧） */
++static unsigned g_m107a_cnt;                 /* 本帧该槽颜色笔数（累计） */
++static unsigned g_m107a_mid_at = 8u;         /* 中段笔序号（≈ 上一帧该槽笔数/2；首帧取 8） */
++static unsigned g_m107a_nprev, g_m107a_nflush, g_m107a_late;
++static int g_m107a_p0p, g_m107a_p1p, g_m107a_p0d, g_m107a_p1d;
++static unsigned long long g_m107a_p0seq, g_m107a_p1seq;
++static char g_m107a_p0fs[17], g_m107a_p1fs[17];
++static m107a_sig_t g_m107a_t0, g_m107a_t1, g_m107a_t2;
++static int g_m107a_t0ok, g_m107a_t1ok, g_m107a_t2ok;
++static unsigned g_m107a_texn, g_m107a_texpx, g_m107a_texq_n;
++static int g_m107a_texid[M107A_TEX_MAX], g_m107a_texid_n;
++static m107a_texq g_m107a_texq[M107A_TEX_MAX];
++static unsigned long long g_m107a_nf, g_m107a_burned, g_m107a_firstwhite, g_m107a_taw, g_m107a_tn;
++static unsigned long long g_m107a_late_total;
++
++/* p_slot_layout 定义在文件更后面（present 段），此处前向声明（同 M105A/M106A 的口径）。 */
++static VkImageLayout p_slot_layout(h_rt_slot *s);
++
++/* knob 解码：(v & 0xff) = slot（0 ⇒ 默认 75），(v >> 8) & 0xff = phase。写 knob 后把帧计数归零，
++   让接下来 10 帧立刻满采样（否则可能要等到下一个 %60 帧才看到数据）。 */
++static void m107a_decode(int v)
++{
++    const int sl = v & 0xff;
++    g_m107a_slot = (sl > 0) ? sl : M107A_DEF_SLOT;
++    g_m107a_ph = (v >> 8) & 0xff;
++    g_m107a_fno = 0; g_m107a_gate = 1;
++    g_m107a_nprev = 0; g_m107a_mid_at = 8u;
++    g_m107a_cnt = 0; g_m107a_pf = 0;
++    g_m107a_p0p = 0; g_m107a_p1p = 0;
++    /* 槽/phase 变了 ⇒ 从当前写游标重新起帧，别把上一帧的半截时序混进新帧 */
++    g_m107a_rd = __atomic_load_n(&g_m107a_w, __ATOMIC_ACQUIRE);
++}
++
++/* knob：文件必须 app 自己先建（hdc 在沙箱里建不出新文件）；每 2 s 重读，值变化立刻打
++   `[m107a] sw knob -> val=`，未变化也每 10 s 打一行同格式心跳（M104A 教训：knob 未生效不许当结果）。 */
++static int m107a_knob(void)
++{
++    const double t = (double)pf_now_us() / 1e6;
++    if (g_m107a_v == -2) {
++        const char *p[2] = { M107A_A, M107A_B };
++        int have = 0, i;
++        for (i = 0; i < 2 && !have; i++) { FILE *f = fopen(p[i], "r"); if (f) { fclose(f); have = 1; } }
++        for (i = 0; i < 2 && !have; i++) { FILE *f = fopen(p[i], "w"); if (f) { fputs("0\n", f); fclose(f); have = 1; } }
++        g_m107a_v = p_file_int(M107A_A, M107A_B, 0);
++        g_m107a_kt = t; g_m107a_klog = t;
++        m107a_decode(g_m107a_v);
++        vk_boot_logf("[m107a] sw knob -> val=%d (seed)", g_m107a_v);
++        return g_m107a_v;
++    }
++    if (t - g_m107a_kt >= 2.0) {
++        const int v = p_file_int(M107A_A, M107A_B, 0);
++        g_m107a_kt = t;
++        if (v != g_m107a_v) {
++            g_m107a_v = v;
++            m107a_decode(v);
++            g_m107a_klog = t;
++            vk_boot_logf("[m107a] sw knob -> val=%d slot=%d phase=%d", g_m107a_v, g_m107a_slot, g_m107a_ph);
++        } else if (t - g_m107a_klog >= 10.0) {
++            g_m107a_klog = t;
++            vk_boot_logf("[m107a] sw knob -> val=%d slot=%d phase=%d", g_m107a_v, g_m107a_slot, g_m107a_ph);
++        }
++    }
++    return g_m107a_v;
++}
++
++static void m107a_reset_frame(void)
++{
++    g_m107a_cnt = 0; g_m107a_nflush = 0; g_m107a_late = 0;
++    g_m107a_p0p = 0; g_m107a_p1p = 0; g_m107a_p0d = 0; g_m107a_p1d = 0;
++    g_m107a_t0ok = 0; g_m107a_t1ok = 0; g_m107a_t2ok = 0;
++    memset(&g_m107a_t0, 0, sizeof g_m107a_t0);
++    memset(&g_m107a_t1, 0, sizeof g_m107a_t1);
++    memset(&g_m107a_t2, 0, sizeof g_m107a_t2);
++    g_m107a_texq_n = 0; g_m107a_texid_n = 0; g_m107a_texn = 0; g_m107a_texpx = 0;
++}
++
++/* 整幅回读 + 签名（持 g_vkq_lock，与 M99A/M106A 同锁序）。只在「GPU 已空闲」的点被调用。 */
++static int m107a_sig_img(VkImage img, VkImageLayout lay, unsigned w, unsigned h, m107a_sig_t *o)
++{
++    VkDeviceSize sz;
++    void *px;
++    memset(o, 0, sizeof *o);
++    if (!img || !w || !h) return 0;
++    /* c_raw_copy 只认这四种源布局，别的直接说「读不出」，不猜 */
++    if (lay != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL && lay != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL &&
++        lay != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL && lay != VK_IMAGE_LAYOUT_GENERAL) return 0;
++    sz = (VkDeviceSize)w * (VkDeviceSize)h * 4ull;
++    pthread_mutex_lock(&g_vkq_lock);
++    px = c_raw_copy(img, lay, w, h, sz);
++    pthread_mutex_unlock(&g_vkq_lock);
++    if (!px) return 0;
++    m107a_sig((const uint8_t *)px, w, h, o);
++    free(px);
++    return o->npx ? 1 : 0;
++}
++
++/* 目标槽整幅回读（tag: 0=t0 1=t1 2=t2）。返回 1 = 读到。 */
++static int m107a_sample_slot(int tag)
++{
++    m107a_sig_t *dst = (tag == 0) ? &g_m107a_t0 : (tag == 1) ? &g_m107a_t1 : &g_m107a_t2;
++    int ok = 0;
++    if (g_m107a_slot >= 0 && g_m107a_slot < H_RT_SLOTS) {
++        h_rt_slot *s = &g_rt_tab[g_m107a_slot];
++        if (s->key && s->img && s->w && s->h) ok = m107a_sig_img(s->img, p_slot_layout(s), s->w, s->h, dst);
++    }
++    if (!ok) memset(dst, 0, sizeof *dst);
++    if (tag == 0) g_m107a_t0ok = ok; else if (tag == 1) g_m107a_t1ok = ok; else g_m107a_t2ok = ok;
++    g_m107a_rslot++;
++    return ok;
++}
++
++static void m107a_sample_log(const char *tag, unsigned long long seq, const char *fs, unsigned late,
++                             const m107a_sig_t *sg, int ok)
++{
++    vk_boot_logf("[m107a] s tag=%s slot=%d ok=%d nflush=%u late=%u seq=%llu fs=%s "
++                 "dcol=%d mean=%u/%u/%u spread=%u col=%u.%u%% nz=%u.%u%% npx=%u",
++                 tag, g_m107a_slot, ok, g_m107a_nflush, late, seq, (fs && fs[0]) ? fs : "-",
++                 ok ? (int)sg->dcol : -1, sg->mr, sg->mg, sg->mb, sg->spread,
++                 sg->col10 / 10u, sg->col10 % 10u, sg->nz10 / 10u, sg->nz10 % 10u, sg->npx);
++}
++
++/* 采样贴图白度入队（每帧 ≤8 张 / 单张 ≤1 Mpx / 全帧 ≤4 Mpx；按 texid 去重；真正回读在安全点做）。 */
++static void m107a_texq_push(const R_Key *kf)
++{
++    int ntex, i, k;
++    if (!kf) return;
++    ntex = kf->ntex < NVN_TX_SLOTS ? kf->ntex : NVN_TX_SLOTS;
++    for (i = 0; i < ntex; i++) {
++        const int u = r_unit_of(kf, i);
++        VkImage im = VK_NULL_HANDLE;
++        VkImageLayout ly = VK_IMAGE_LAYOUT_UNDEFINED;
++        unsigned w0 = 0, h0 = 0, b0 = 0;
++        const char *what = "none";
++        int id, dup = 0;
++        if (u < 0 || u >= NVN_TX_SLOTS || !g_r_tx_view[u]) continue;
++        if (g_m107a_texq_n >= M107A_TEX_MAX || g_m107a_texn >= M107A_TEX_MAX) return;
++        if (!r_fs_slot_image(u, &im, &ly, &w0, &h0, &b0, &what)) continue;
++        if (!im || b0 != 4u || !w0 || !h0) continue;     /* 只统计 32bpp 紧排图；压缩格式不猜 */
++        if ((unsigned long long)w0 * (unsigned long long)h0 > M107A_TEX_PX_MAX) continue;
++        if ((unsigned long long)g_m107a_texpx + (unsigned long long)w0 * (unsigned long long)h0 > M107A_TEX_PX_FRAME) continue;
++        id = g_r_tx_info[u].id;
++        for (k = 0; k < g_m107a_texid_n; k++) if (g_m107a_texid[k] == id) { dup = 1; break; }
++        for (k = 0; k < (int)g_m107a_texq_n && !dup; k++) if (g_m107a_texq[k].id == id) dup = 1;
++        if (dup) continue;
++        if (g_m107a_texid_n < (int)M107A_TEX_MAX) g_m107a_texid[g_m107a_texid_n++] = id;
++        g_m107a_texq[g_m107a_texq_n].img = im;
++        g_m107a_texq[g_m107a_texq_n].lay = ly;
++        g_m107a_texq[g_m107a_texq_n].w = w0;
++        g_m107a_texq[g_m107a_texq_n].h = h0;
++        g_m107a_texq[g_m107a_texq_n].u = u;
++        g_m107a_texq[g_m107a_texq_n].id = id;
++        g_m107a_texq[g_m107a_texq_n].what = what;
++        g_m107a_texq_n++;
++        g_m107a_texpx += w0 * h0;
++    }
++}
++
++/* 逐笔记账（knob<=0 / 非本帧采样 / 非该槽 ⇒ 第一句即返回：关态零输出、零回读）。 */
++static void m107a_draw(const R_Key *kf, int slot, int dvar, unsigned nverts, int count)
++{
++    int decl = 0, real = 0;
++    m107a_ent *e;
++    if (g_m107a_v == -2) (void)m107a_knob();
++    if (g_m107a_v <= 0) return;
++    if (dvar >= 3 || slot < 0 || slot >= H_RT_SLOTS || slot != g_m107a_slot) return;
++    if (!g_m107a_gate) return;
++    m105a_ntex(kf, &decl, &real);
++    e = &g_m107a_ring[(unsigned)(g_m107a_w % (unsigned long long)M107A_RING)];
++    memset(e, 0, sizeof *e);
++    e->seq = ++g_m107a_seq;
++    e->dr = (unsigned long long)g_r_draws;
++    e->nv = nverts;
++    e->cnt = (unsigned)(count > 0 ? count : 0);
++    e->decl = (unsigned char)(decl > 255 ? 255 : decl);
++    e->real = (unsigned char)(real > 255 ? 255 : real);
++    e->dv = (unsigned char)(dvar < 0 ? 0 : (dvar > 255 ? 255 : dvar));
++    if (kf && kf->key[0]) { memcpy(e->fs, kf->key, 16); e->fs[16] = 0; }
++    __atomic_store_n(&g_m107a_w, g_m107a_w + 1ull, __ATOMIC_RELEASE);
++    g_m107a_cnt++;
++    if (g_m107a_cnt == 1u) {                    /* ① 本帧首笔：下一个提交边界解析 t0 */
++        g_m107a_p0p = 1;
++        g_m107a_p0seq = e->seq;
++        snprintf(g_m107a_p0fs, sizeof g_m107a_p0fs, "%s", e->fs);
++    } else if (g_m107a_cnt >= g_m107a_mid_at && !g_m107a_p1p && !g_m107a_p1d) {
++        g_m107a_p1p = 1;                        /* ② 中段：≈ 上一帧该槽笔数的一半 */
++        g_m107a_p1seq = e->seq;
++        snprintf(g_m107a_p1fs, sizeof g_m107a_p1fs, "%s", e->fs);
++    }
++    if (real > 0 && g_m107a_ph != 1) m107a_texq_push(kf);
++}
++
++/* 安全回读点 ①：draw 批次已提交 + 栅栏已过（GPU 空闲、g_r_cb 已回收）⇒ 解析 t0/t1 + 贴图白度。 */
++static void m107a_flush(void)
++{
++    unsigned k;
++    if (g_m107a_v == -2) (void)m107a_knob();
++    if (g_m107a_v <= 0 || !g_m107a_gate) return;
++    g_m107a_nflush++;
++    if (g_m107a_p0p) {
++        int ok;
++        g_m107a_p0p = 0; g_m107a_p0d = 1;
++        ok = m107a_sample_slot(0);
++        m107a_sample_log("t0", g_m107a_p0seq, g_m107a_p0fs, 0, &g_m107a_t0, ok);
++    }
++    if (g_m107a_p1p) {
++        int ok;
++        g_m107a_p1p = 0; g_m107a_p1d = 1;
++        ok = m107a_sample_slot(1);
++        m107a_sample_log("t1", g_m107a_p1seq, g_m107a_p1fs, 0, &g_m107a_t1, ok);
++    }
++    for (k = 0; k < g_m107a_texq_n && k < M107A_TEX_MAX; k++) {
++        m107a_sig_t sg;
++        const int ok = m107a_sig_img(g_m107a_texq[k].img, g_m107a_texq[k].lay,
++                                     g_m107a_texq[k].w, g_m107a_texq[k].h, &sg);
++        const int aw = (ok && sg.dcol <= 2u && sg.mr >= 250u && sg.mg >= 250u && sg.mb >= 250u) ? 1 : 0;
++        g_m107a_tn++;
++        if (aw) g_m107a_taw++;
++        vk_boot_logf("[m107a] tex id=%d wh=%ux%u mean=%u/%u/%u dcol=%u all_white=%d what=%s rb=%d",
++                     g_m107a_texq[k].id, g_m107a_texq[k].w, g_m107a_texq[k].h,
++                     sg.mr, sg.mg, sg.mb, ok ? sg.dcol : 0u, aw,
++                     g_m107a_texq[k].what ? g_m107a_texq[k].what : "-", ok);
++        g_m107a_texn++;
++    }
++    g_m107a_texq_n = 0;
++}
++
++/* 帧边界（present 内调）：解析残余 t0/t1 + 采 t2 + 打 judge 行与逐笔行。knob=0 ⇒ 零输出。 */
++static void m107a_frame(unsigned long long call, const char *srcname, int sel_slot, int ok)
++{
++    const unsigned long long w = __atomic_load_n(&g_m107a_w, __ATOMIC_ACQUIRE);
++    unsigned long long r = g_m107a_rd, i, n, trunc = 0, lastseq = 0;
++    unsigned ndraw = 0;
++    char firstfs[17], midfs[17], lastfs[17];
++    int ldecl = -1, lreal = -1;
++    const int v = m107a_knob();
++    (void)srcname; (void)sel_slot; (void)ok;
++    firstfs[0] = midfs[0] = lastfs[0] = 0;
++    if (v <= 0 || !g_m107a_gate) {          /* 关态 / 非采样帧：只推平游标（零输出、零回读） */
++        g_m107a_rd = w;
++        m107a_reset_frame();
++        return;
++    }
++    if (w - r > (unsigned long long)M107A_RING) {
++        trunc = (w - r) - (unsigned long long)M107A_RING;
++        r = w - (unsigned long long)M107A_RING;
++    }
++    n = w - r;
++    for (i = r; i < w; i++) {
++        const m107a_ent *e = &g_m107a_ring[(unsigned)(i % (unsigned long long)M107A_RING)];
++        if (!ndraw) memcpy(firstfs, e->fs, sizeof firstfs);
++        if (ndraw + 1u == g_m107a_mid_at) memcpy(midfs, e->fs, sizeof midfs);
++        memcpy(lastfs, e->fs, sizeof lastfs);
++        lastseq = e->seq;
++        ldecl = (int)e->decl; lreal = (int)e->real;
++        ndraw++;
++    }
++    if (!midfs[0] && ndraw) {               /* 本帧笔数不到 mid_at ⇒ 取中间那笔当「中段」 */
++        const unsigned long long mm = r + (unsigned long long)(ndraw / 2u);
++        const m107a_ent *e = &g_m107a_ring[(unsigned)((mm < w ? mm : w - 1ull) % (unsigned long long)M107A_RING)];
++        memcpy(midfs, e->fs, sizeof midfs);
++    }
++    /* t0/t1：若整帧都没等到提交边界（本帧不再提交），就在 present 这里补一次 ⇒ late=1 */
++    if (g_m107a_p0p) {
++        g_m107a_p0p = 0; g_m107a_p0d = 1;
++        m107a_sample_slot(0);
++        g_m107a_late++; g_m107a_late_total++;
++        m107a_sample_log("t0", g_m107a_p0seq, g_m107a_p0fs, 1, &g_m107a_t0, g_m107a_t0ok);
++    }
++    if (g_m107a_p1p) {
++        g_m107a_p1p = 0; g_m107a_p1d = 1;
++        m107a_sample_slot(1);
++        g_m107a_late++; g_m107a_late_total++;
++        m107a_sample_log("t1", g_m107a_p1seq, g_m107a_p1fs, 1, &g_m107a_t1, g_m107a_t1ok);
++    }
++    /* t2 = 末笔之后：本帧最后一次提交已在 present 之前完成 ⇒ 这次回读就是「末笔之后」的槽内容 */
++    if (ndraw) {
++        m107a_sample_slot(2);
++        m107a_sample_log("t2", lastseq, lastfs, 0, &g_m107a_t2, g_m107a_t2ok);
++    }
++    if (g_m107a_pf < M107A_FRAME_MAX) {
++        vk_boot_logf("[m107a] f call=%llu slot=%d n=%u gate=%d nflush=%u "
++                     "t0[dcol=%d mean=%u/%u/%u sp=%u] t1[dcol=%d mean=%u/%u/%u sp=%u] "
++                     "t2[dcol=%d mean=%u/%u/%u sp=%u] "
++                     "first_fs=%s mid_fs=%s last_fs=%s last_decl=%d last_real=%d mid_at=%u nprev=%u trunc=%llu",
++                     call, g_m107a_slot, ndraw, g_m107a_gate, g_m107a_nflush,
++                     g_m107a_t0ok ? (int)g_m107a_t0.dcol : -1, g_m107a_t0.mr, g_m107a_t0.mg, g_m107a_t0.mb, g_m107a_t0.spread,
++                     g_m107a_t1ok ? (int)g_m107a_t1.dcol : -1, g_m107a_t1.mr, g_m107a_t1.mg, g_m107a_t1.mb, g_m107a_t1.spread,
++                     g_m107a_t2ok ? (int)g_m107a_t2.dcol : -1, g_m107a_t2.mr, g_m107a_t2.mg, g_m107a_t2.mb, g_m107a_t2.spread,
++                     firstfs[0] ? firstfs : "-", midfs[0] ? midfs : "-", lastfs[0] ? lastfs : "-",
++                     ldecl, lreal, g_m107a_mid_at, g_m107a_nprev, trunc);
++        if (g_m107a_ph != 1) {              /* phase 0：逐笔行（≤16 行/帧：前 8 + 后 8，另打一行 gap） */
++            m107a_ent head[8], tail[8];
++            int nh = 0, nt = 0, k, pos = 0;
++            for (i = r; i < w; i++) {
++                const m107a_ent *e = &g_m107a_ring[(unsigned)(i % (unsigned long long)M107A_RING)];
++                if (nh < 8) head[nh++] = *e;
++                else { tail[nt % 8] = *e; nt++; }
++            }
++            for (k = 0; k < nh; k++)
++                vk_boot_logf("[m107a] w i=%d seq=%llu fs=%s decl=%d real=%d nv=%u cnt=%u",
++                             pos++, head[k].seq, head[k].fs[0] ? head[k].fs : "-",
++                             (int)head[k].decl, (int)head[k].real, head[k].nv, head[k].cnt);
++            if (nt > 0) {
++                const int st = (nt > 8) ? (nt % 8) : 0, cn = (nt > 8) ? 8 : nt;
++                vk_boot_logf("[m107a] g n=%llu shown=%d gap=%llu (first8+last8)", n, nh + cn, n - (unsigned long long)(nh + cn));
++                for (k = 0; k < cn; k++) {
++                    const m107a_ent *e = &tail[(st + k) % 8];
++                    vk_boot_logf("[m107a] w i=%d seq=%llu fs=%s decl=%d real=%d nv=%u cnt=%u",
++                                 (int)n - cn + k, e->seq, e->fs[0] ? e->fs : "-",
++                                 (int)e->decl, (int)e->real, e->nv, e->cnt);
++                }
++            }
++        }
++        g_m107a_pf++;
++    }
++    /* 帧末速览（判据②③）：烧白 = 曾经 dcol>=8 而末态 dcol<=2；首笔就白 = t0 就 dcol<=2 */
++    {
++        const int mid_colored = (g_m107a_t0ok && g_m107a_t0.dcol >= 8u) || (g_m107a_t1ok && g_m107a_t1.dcol >= 8u);
++        if (mid_colored && g_m107a_t2ok && g_m107a_t2.dcol <= 2u) g_m107a_burned++;
++        if (g_m107a_t0ok && g_m107a_t0.dcol <= 2u) g_m107a_firstwhite++;
++    }
++    g_m107a_nf++;
++    if ((g_m107a_nf % 16ull) == 0ull)
++        vk_boot_logf("[m107a] sum f=%llu burned=%llu firstwhite=%llu tex_allwhite=%llu tex=%llu rslot=%llu late=%llu",
++                     g_m107a_nf, g_m107a_burned, g_m107a_firstwhite, g_m107a_taw, g_m107a_tn,
++                     g_m107a_rslot, g_m107a_late_total);
++    g_m107a_fno++;
++    g_m107a_gate = (g_m107a_fno < 10ull || (g_m107a_fno % 60ull) == 0ull) ? 1 : 0;
++    if (g_m107a_pf >= M107A_FRAME_MAX) g_m107a_gate = 0;   /* 本 boot 打印预算用尽 ⇒ 停采样（不再白花回读） */
++    g_m107a_nprev = ndraw;
++    g_m107a_mid_at = (ndraw > 4u) ? (ndraw / 2u) : 8u;
++    g_m107a_rd = w;
++    m107a_reset_frame();
+ }
+ 
+ int nvn_vk_draw_elements(int mode, int type, int count, uint64_t idx, int base_vertex, int base_instance,
+@@ -24210,6 +24646,8 @@
+             /* M105A（只读，knob<2 立即返回）：帧内写入时序记账 —— pass 句柄 + fs 键 + decl/real + 序号。 */
+             m105a_rec(kf, si, dvar, (unsigned)nverts, (int)count,
+                       (unsigned long long)(uintptr_t)ps, (unsigned long long)(uintptr_t)g_r_pass_rp, 0);
++            /* M107A（只读，knob<=0 立即返回）：该槽的帧内写入时序 —— 首笔/中段/末笔三处签名的标记点。 */
++            m107a_draw(kf, si, dvar, (unsigned)nverts, (int)count);
+             /* M40AU ①（只读记账，au=0 一个分支都不进）：本帧「最后一笔颜色 draw」落到哪个槽。
+                这是 present 取源的**唯一**来源 —— 记在绘制之后，present 只读不重算（M40AT 已证
+                present 时刻再取源时 RT 已被清屏）。零额外开销：只搬 3 个标量。 */
+@@ -25808,6 +26246,9 @@
+         }
+         return -6;
+     }
++    /* M107A（knob<=0 立即返回）：**唯一安全的整幅回读点** —— 本批已提交且栅栏已过、g_r_cb 已回收，
++       所以这里读到的就是「首笔/中段之后最近的提交边界」的槽内容（t0/t1），并顺带做贴图白度。 */
++    m107a_flush();
+     /* M4n P4③：批次已提交并等到栅栏 ⇒ 此刻 RT 内容稳定，拍一次签名（内容变化才落行）。
+        只在 bd>0 时拍：空批次不会改内容。 */
+     unsigned long long m23b_sg0 = m23b_f ? pf_now_us() : 0;
+@@ -31510,6 +31951,7 @@
+            函数自带「≤8 行 / 相邻 ≥30 s」的预算，菜单段与 3D 段都会各落几行。*/
+         m103a_proof_line(call, srcname, g_p_sel_slot, simg, sw, sh, (int)slay, ok);
+         m105a_frame(call, srcname, g_p_sel_slot, ok);   /* M105A：帧内写入时序 + judge + 内容签名 */
++        m107a_frame(call, srcname, g_p_sel_slot, ok);   /* M107A：三处签名（t2 = 末笔之后）+ 逐笔时序 + 贴图白度 */
+         if (psig_want)
+             p_sig_line(call, srcname, simg, sw, sh, crox, croy, ok, psig_verbose || g_p_m4ak_sig_pair);
+         g_p_m4ak_sig_pair = 0;

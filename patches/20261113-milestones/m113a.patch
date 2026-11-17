@@ -1,0 +1,685 @@
+--- mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c
++++ mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c
+@@ -24741,8 +24741,594 @@
+     /* 每 8 帧衰减一次窗口写入量（保证选槽跟着「当前」写入量走，而不是整 boot 累计） */
+     if ((g_m109a_fno % 8ull) == 0ull) memset(g_m109a_wr, 0, sizeof g_m109a_wr);
+     m109a_pick();
++}
++
++/* ================= M113A（2026-11-14）：计数无条件 + 报告时选槽 + 状态抓取/skip 按 fs 直接匹配 ============
++   两轮失败的根因（M110A/M111A 的 report §3）：都是「用选槽门去门控计数」——
++     build#1：先 memset 窗口写入量、再 pick ⇒ pick 只看到全 0 ⇒ 永远落到下标最小的陈旧白槽（0 笔）；
++     build#2：把 wr++ 放到 `if (si != sel) return 0;` 这道门**之后** ⇒ sel=-1 ⇒ 一笔都不计 ⇒ 自举死锁。
++   本轮按 task.md §0 六条重写，**去掉「选槽门控」这个失败源**：
++     A1 计数无条件：m113a_draw() 的**前四行**就是 wr 自增 / last_fs / last_nv 记账，它们之前
++        **没有任何 if**（入口到自增之间只有一条下标记数与一条饱和表达式）；选槽门、fs 门、knob 门
++        一律在自增**之后**。knob=0 时照样记账（纯整数，无输出、无渲染影响），所以「选择」永不可能
++        反过来饿死「计数」。
++     A2 选槽只在报告/上屏时算：m113a_pick() 只读计数器（绝不丢弃任何笔），每 30 s 打
++        `[m113a] top k=0..2 slot=… wh=… wr=… last_fs=…`；目标槽 = 本窗口 wh==400x225 里 wr 最大者
++        （并列取 wh 大者、再并列取槽号小者）。
++     A3 状态抓取按 fs 直接匹配（**不看 sel**）：fs==b715ff0659654281 ∧ decl==4 ∧ real==4 ∧
++        本笔目标槽 wh==400x225 的每一笔 ⇒ present 安全点打 d 行（blend/vp/sc/mask/z/cull/topo/nv/idx）
++        + 4/4 纹理 t 行（u=0..3 全部 resolve）+ g 行（几何覆盖 ndc_cover）。draw 路径零回读。
++     A4 skip 直接匹配（同一谓词、同样不看 sel）：smo_m113a bit1 时跳过这些笔，其余一笔不跳；
++        并把目标槽经 M106A 的同一条通道 blit 上屏（同一张 800x450 dst 图 + 同一条 vkCmdBlitImage
++        + 同一条 present 拷贝，不造第二条通道）；每帧打 `[m113a] f call=… skip=… t2[dcol mean sp]`。
++     A5 自检：knob≠0 时，启动 60 s 后若计数器仍全 0 ⇒ `[m113a] miss why=no_wr` +
++        `[m113a] boot sel=CAND …`（候选表 + wh 直方图）；**只多打日志，不改任何绘制行为**。
++     A6 knob `smo_m113a` 缺省 0：三个 hook（draw / present / frame）都不输出、不跳笔、不回读
++        ⇒ 关态逐字节等于 M111A（= M109A 链）。bit0(1)=抓状态，bit1(2)=skip + 目标槽 blit 上屏。
++   预算：top 每 30 s 3 行；f 每帧 1 行（bit1）；d/t/g 每帧 ≤4 笔 × 6 行，窗口 = 3D 段前 10 帧 +
++   之后每 60 帧（≤8 帧/窗口）；skip 行 ≤8；miss 行 ≤3。 */
++#define M113A_FS        "b715ff0659654281"
++#define M113A_A         P_SLOT_DIR_A "/smo_m113a"
++#define M113A_B         P_SLOT_DIR_B "/smo_m113a"
++#define M113A_N         (H_RT_SLOTS + 1)   /* 末格 = slot 非法时的 sink 格（保证自增行里没有 if） */
++#define M113A_CAPN      4u
++#define M113A_PX_MAX    1048576ull
++#define M113A_GEOM_MAX  8192u
++#define M113A_CACHE     8
++#define M113A_TOPK      3
++#define M113A_FRAME_MAX 8ull
++#define M113A_REPORT_S  30.0
++#define M113A_MISSMAX   3u
++
++typedef struct {
++    int u, id, fmt, kind, up, bpp, img_ok, lay, rb, dcol;
++    unsigned w, h, mr, mg, mb, spread;
++    VkImage img;
++    char what[10];
++    char why[16];
++} m113a_tx;
++
++typedef struct {
++    int ok, nidx, npj, nin, mb;
++    float xmin, xmax, ymin, ymax, zmin, zmax, cover;
++    char why[16];
++} m113a_geo;
++
++typedef struct {
++    unsigned long long seq;
++    unsigned nv, cnt;
++    int slot, topo, dvar, mask, cull, zt, zw, blend_en, blendok, m14b, m14bfix;
++    int sr, dr, sa, da, er, ea, hasc;
++    float vp[4];
++    int sc[4];
++    char fs[17];
++    int ntx;
++    m113a_tx tx[4];
++    m113a_geo geo;
++} m113a_cap;
++
++/* ＝＝ A1 的载体：无条件计数表（末格 = sink）＝＝ */
++static unsigned g_m113a_wr[M113A_N];        /* 本窗口每一笔 draw 的计数（无任何前置门） */
++static unsigned g_m113a_dv[M113A_N];        /* 其中深度笔（dvar>=3）笔数，供审计 */
++static unsigned g_m113a_lno[M113A_N];       /* last_nv */
++static char g_m113a_lfs[M113A_N][17];       /* last_fs */
++static int g_m113a_v = -2;
++static int g_m113a_sel = -1;
++static double g_m113a_kt, g_m113a_klog, g_m113a_t0, g_m113a_rt;
++static unsigned long long g_m113a_fno, g_m113a_pf, g_m113a_seq;
++static m113a_cap g_m113a_cap[M113A_CAPN];
++static unsigned g_m113a_capn;
++static int g_m113a_capwant;
++static unsigned long long g_m113a_skipped, g_m113a_skipf, g_m113a_skiplog;
++static unsigned long long g_m113a_hit4, g_m113a_missnowr;
++static unsigned long long g_m113a_blits, g_m113a_bline, g_m113a_bfail;
++static m107a_sig_t g_m113a_t2;
++static int g_m113a_t2ok;
++static int g_m113a_blit_on;
++
++/* 定长 fs 拷贝（不 snprintf：本函数在 draw 路径上每笔都跑）。 */
++static void m113a_cp17(char *d, const char *s)
++{
++    int k = 0;
++    if (s) { while (k < 16 && s[k]) { d[k] = s[k]; k++; } }
++    d[k] = 0;
++}
++
++/* knob 文件必须 app 自己先建（hdc 在沙箱里建不出新文件）；每 2 s 重读。
++   **val=0（缺省）时一行都不打**（A6：关态探针行 0 行）；只有 val>0 才打 seed/变化/心跳行。 */
++static int m113a_knob(void)
++{
++    const double t = (double)pf_now_us() / 1e6;
++    if (g_m113a_v == -2) {
++        const char *p[2] = { M113A_A, M113A_B };
++        int have = 0, i;
++        for (i = 0; i < 2 && !have; i++) { FILE *f = fopen(p[i], "r"); if (f) { fclose(f); have = 1; } }
++        for (i = 0; i < 2 && !have; i++) { FILE *f = fopen(p[i], "w"); if (f) { fputs("0\n", f); fclose(f); have = 1; } }
++        g_m113a_v = p_file_int(M113A_A, M113A_B, 0);
++        g_m113a_kt = t; g_m113a_klog = t;
++        if (g_m113a_v > 0) vk_boot_logf("[m113a] sw knob -> val=%d (seed)", g_m113a_v);
++        return g_m113a_v;
++    }
++    if (t - g_m113a_kt >= 2.0) {
++        const int v = p_file_int(M113A_A, M113A_B, 0);
++        g_m113a_kt = t;
++        if (v != g_m113a_v) {
++            g_m113a_v = v;
++            g_m113a_klog = t;
++            vk_boot_logf("[m113a] sw knob -> val=%d", g_m113a_v);
++        } else if (g_m113a_v > 0 && t - g_m113a_klog >= 10.0) {
++            g_m113a_klog = t;
++            vk_boot_logf("[m113a] sw knob -> val=%d", g_m113a_v);
++        }
++    }
++    return g_m113a_v;
++}
++
++/* ＝＝ A2：选槽只在报告/上屏路径调用；**只读计数器，一笔都不丢** ＝＝
++   候选 = 池里有活图且有 ext 的 400x225 槽；取本窗口 wr 最大者（并列取 wh 大者、再取槽号小者）。
++   没有任何合格写入时保持上一帧的选择（槽失效才清 -1）—— 这一步不影响计数。 */
++static void m113a_pick(void)
++{
++    int i, b = -1;
++    unsigned bw = 0, bwh = 0;
++    for (i = 0; i < H_RT_SLOTS; i++) {
++        const h_rt_slot *s = &g_rt_tab[i];
++        unsigned w0;
++        if (!s->key || !s->img || !s->w || !s->h) continue;
++        if (s->w != 400u || s->h != 225u) continue;
++        w0 = g_m113a_wr[i];
++        if (!w0) continue;
++        if (b < 0 || w0 > bw || (w0 == bw && ((s->w * s->h) > bwh))) {
++            b = i; bw = w0; bwh = s->w * s->h;
++        }
++    }
++    if (b < 0) {
++        if (g_m113a_sel >= 0) {
++            const h_rt_slot *s = &g_rt_tab[g_m113a_sel];
++            if (!s->key || !s->img || !s->w || !s->h) g_m113a_sel = -1;
++        }
++        return;
++    }
++    g_m113a_sel = b;
++}
++
++/* 槽整幅回读 + 签名 + 白像素千分比（只在 present 安全点调用）。 */
++static int m113a_sig_img(VkImage img, VkImageLayout lay, unsigned w, unsigned h, m107a_sig_t *o)
++{
++    VkDeviceSize sz;
++    void *px;
++    memset(o, 0, sizeof *o);
++    if (!img || !w || !h) return 0;
++    if ((unsigned long long)w * (unsigned long long)h > M113A_PX_MAX) return 0;
++    if (lay != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL && lay != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL &&
++        lay != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL && lay != VK_IMAGE_LAYOUT_GENERAL) return 0;
++    sz = (VkDeviceSize)w * (VkDeviceSize)h * 4ull;
++    pthread_mutex_lock(&g_vkq_lock);
++    px = c_raw_copy(img, lay, w, h, sz);
++    pthread_mutex_unlock(&g_vkq_lock);
++    if (!px) return 0;
++    m107a_sig((const uint8_t *)px, w, h, o);
++    free(px);
++    return o->npx ? 1 : 0;
++}
++
++static int m113a_sig_slot(int slot, m107a_sig_t *o)
++{
++    h_rt_slot *s;
++    memset(o, 0, sizeof *o);
++    if (slot < 0 || slot >= H_RT_SLOTS) return 0;
++    s = &g_rt_tab[slot];
++    if (!s->key || !s->img || !s->w || !s->h) return 0;
++    return m113a_sig_img(s->img, p_slot_layout(s), s->w, s->h, o);
++}
++
++/* 纹理槽解析（4/4 全部 resolve，三级回落，全部只读；不猜、失败给 why）。
++   ① r_fs_slot_image（rt/shadow/tex）；② nvn_vk_tex 对象；③ 裸 view（显式标 rawview）。 */
++static void m113a_tex_meta(const R_Key *kf, int i, m113a_tx *t)
++{
++    int u;
++    memset(t, 0, sizeof *t);
++    t->id = -1; t->dcol = -1;
++    snprintf(t->what, sizeof t->what, "%s", "none");
++    snprintf(t->why, sizeof t->why, "%s", "empty");
++    if (!kf) { snprintf(t->why, sizeof t->why, "%s", "nokf"); return; }
++    u = r_unit_of(kf, i);
++    t->u = u;
++    if (u < 0 || u >= NVN_TX_SLOTS) { snprintf(t->why, sizeof t->why, "%s", "u_range"); return; }
++    t->id = g_r_tx_info[u].id; t->fmt = g_r_tx_info[u].fmt;
++    t->kind = g_r_tx_info[u].kind; t->up = g_r_tx_info[u].up;
++    {
++        VkImage im = VK_NULL_HANDLE;
++        VkImageLayout ly = VK_IMAGE_LAYOUT_UNDEFINED;
++        unsigned w0 = 0, h0 = 0, b0 = 0;
++        const char *what = "none";
++        if (r_fs_slot_image(u, &im, &ly, &w0, &h0, &b0, &what)) {
++            t->img = im; t->lay = (int)ly; t->w = w0; t->h = h0; t->bpp = (int)b0;
++            t->img_ok = 1;
++            snprintf(t->what, sizeof t->what, "%s", what ? what : "-");
++            snprintf(t->why, sizeof t->why, "%s", "-");
++            return;
++        }
++        if (g_r_tx_texobj[u] && g_r_tx_texobj[u]->img) {
++            t->img = g_r_tx_texobj[u]->img; t->lay = (int)g_r_tx_texobj[u]->layout;
++            t->w = g_r_tx_texobj[u]->w; t->h = g_r_tx_texobj[u]->h;
++            t->bpp = (int)vkfmt_bpp_guess(g_r_tx_texobj[u]->fmt);
++            t->img_ok = 1;
++            snprintf(t->what, sizeof t->what, "%s", "texobj");
++            snprintf(t->why, sizeof t->why, "%s", "fs_slot_miss");
++            return;
++        }
++        if (g_r_tx_view[u]) {
++            t->w = g_r_tx_info[u].w; t->h = g_r_tx_info[u].h;
++            snprintf(t->what, sizeof t->what, "%s", "rawview");
++            snprintf(t->why, sizeof t->why, "%s", "no_img");
++            return;
++        }
++    }
++}
++
++/* VBO 快照几何覆盖（同 M110A 口径）：位置属性 = loc0（紧排 vec4），按索引实际引用到的顶点统计
++   世界范围；NDC 覆盖 = 候选矩阵（单位阵 + VS 每个 cbuf bank 的 off+96/off+0 两处 4x4）里视内点
++   最多者的投影 bbox 裁到 [-1,1] 的面积占比；mb 如实标出用了哪一路，找不到给 why=no_matrix。 */
++static void m113a_geom(const R_Key *kv, int nattr, const uint32_t *attrloc,
++                       const VkDeviceSize *aoff_v, const uint32_t *nents,
++                       const void *map, int count, VkDeviceSize vbytes, m113a_geo *o)
++{
++    int k, kp = -1, i, n;
++    unsigned nv;
++    const float *pos;
++    const uint32_t *dix;
++    memset(o, 0, sizeof *o);
++    o->mb = -3;
++    snprintf(o->why, sizeof o->why, "%s", "-");
++    if (!map) { snprintf(o->why, sizeof o->why, "%s", "nomap"); return; }
++    for (k = 0; k < nattr && k < R_MAX_ATTR; k++) if (attrloc[k] == 0u) { kp = k; break; }
++    if (kp < 0) { snprintf(o->why, sizeof o->why, "%s", "no_loc0"); return; }
++    nv = nents[kp];
++    if (!nv) { snprintf(o->why, sizeof o->why, "%s", "nents0"); return; }
++    if (nv > (unsigned)M113A_GEOM_MAX) nv = (unsigned)M113A_GEOM_MAX;
++    pos = (const float *)(const void *)((const uint8_t *)map + aoff_v[kp]);
++    dix = (const uint32_t *)(const void *)((const uint8_t *)map + vbytes);
++    n = count > 0 ? count : 0;
++    if (n > (int)(M113A_GEOM_MAX * 3u)) n = (int)(M113A_GEOM_MAX * 3u);
++    {
++        int used = 0;
++        float xmn = 0.f, xmx = 0.f, ymn = 0.f, ymx = 0.f, zmn = 0.f, zmx = 0.f;
++        for (i = 0; i < n; i++) {
++            const uint32_t v = dix[i];
++            const float *q;
++            if (v >= nv) continue;
++            q = pos + (size_t)v * 4;
++            if (!used) { xmn = xmx = q[0]; ymn = ymx = q[1]; zmn = zmx = q[2]; }
++            else {
++                if (q[0] < xmn) xmn = q[0]; if (q[0] > xmx) xmx = q[0];
++                if (q[1] < ymn) ymn = q[1]; if (q[1] > ymx) ymx = q[1];
++                if (q[2] < zmn) zmn = q[2]; if (q[2] > zmx) zmx = q[2];
++            }
++            used++;
++        }
++        o->nidx = n;
++        if (!used) { snprintf(o->why, sizeof o->why, "%s", "no_vert"); return; }
++        o->xmin = xmn; o->xmax = xmx; o->ymin = ymn; o->ymax = ymx; o->zmin = zmn; o->zmax = zmx;
++    }
++    {
++        int cand, best = -3, bestin = -1, bestpj = 0;
++        float bx0 = 0.f, bx1 = 0.f, by0 = 0.f, by1 = 0.f;
++        int step = 1, npr = n;
++        if (npr > 64) { step = npr / 64; npr = 64; }
++        for (cand = -1; cand < 64; cand++) {
++            float M[16];
++            int nb, half, j, nin = 0, npj = 0;
++            float x0 = 0.f, x1 = 0.f, y0 = 0.f, y1 = 0.f;
++            if (cand < 0) {
++                memset(M, 0, sizeof M); M[0] = M[5] = M[10] = M[15] = 1.0f;
++            } else {
++                uint32_t off;
++                nb = cand & 31; half = (cand >> 5) & 1;
++                if (!kv || !(kv->cbuf_mask & (1u << nb))) continue;
++                off = g_r_ubo_off[0][nb];
++                if (!off || !g_r_ubo_map) continue;
++                if ((unsigned long long)off + 96ull + 64ull > (unsigned long long)R_UBO_ARENA) continue;
++                memcpy(M, (const uint8_t *)g_r_ubo_map + off + (half ? 0u : 96u), sizeof M);
++            }
++            for (j = 0; j < npr; j++) {
++                const uint32_t v = dix[(size_t)(j * step)];
++                const float *p;
++                float q[4], nx, ny, w;
++                if (v >= nv) continue;
++                p = pos + (size_t)v * 4;
++                q[0] = M[0] * p[0] + M[1] * p[1] + M[2] * p[2] + M[3] * p[3];
++                q[1] = M[4] * p[0] + M[5] * p[1] + M[6] * p[2] + M[7] * p[3];
++                q[3] = M[12] * p[0] + M[13] * p[1] + M[14] * p[2] + M[15] * p[3];
++                npj++;
++                w = q[3];
++                if (!(w > 1e-6f)) continue;
++                nx = q[0] / w; ny = q[1] / w;
++                if (!(nx == nx) || !(ny == ny)) continue;
++                if (nx >= -1.001f && nx <= 1.001f && ny >= -1.001f && ny <= 1.001f) {
++                    if (!nin) { x0 = x1 = nx; y0 = y1 = ny; }
++                    else {
++                        if (nx < x0) x0 = nx; if (nx > x1) x1 = nx;
++                        if (ny < y0) y0 = ny; if (ny > y1) y1 = ny;
++                    }
++                    nin++;
++                }
++            }
++            if (nin > bestin) { bestin = nin; best = cand; bestpj = npj; bx0 = x0; bx1 = x1; by0 = y0; by1 = y1; }
++        }
++        o->mb = best; o->nin = bestin; o->npj = bestpj;
++        if (bestin <= 0) { snprintf(o->why, sizeof o->why, "%s", "no_matrix"); return; }
++        {
++            float cx0 = bx0 < -1.f ? -1.f : bx0, cx1 = bx1 > 1.f ? 1.f : bx1;
++            float cy0 = by0 < -1.f ? -1.f : by0, cy1 = by1 > 1.f ? 1.f : by1;
++            float fx = (cx1 - cx0) * 0.5f, fy = (cy1 - cy0) * 0.5f;
++            if (fx < 0.f) fx = 0.f; if (fx > 1.f) fx = 1.f;
++            if (fy < 0.f) fy = 0.f; if (fy > 1.f) fy = 1.f;
++            o->cover = fx * fy;
++        }
++        o->ok = 1;
++    }
+ }
+ 
++/* ===== draw 时点（A1 + A3/A4 的匹配）=====
++   返 1 = 本笔跳过（只在 knob bit1 时可能）。 */
++static int m113a_draw(const R_Key *kv, const R_Key *kf, int si, int dvar,
++                      unsigned nverts, int count, int topo,
++                      int nattr, const uint32_t *attrloc, const VkDeviceSize *aoff_v,
++                      const uint32_t *nents, const void *map, VkDeviceSize vbytes)
++{
++    /* ───── A1 计数无条件：以下 5 行是入口的第一批语句，**它们之前没有任何 if / return / 门控**
++       （选槽门、fs 门、knob 门、dvar 门全部在它们之后；sink 格只用于"槽号非法"的下标归一）。
++       可复核：本函数第一条语句 = 下标记数，第二条 = wr 自增。 ───── */
++    const int ii = (si >= 0 && si < H_RT_SLOTS) ? si : H_RT_SLOTS;
++    g_m113a_wr[ii] += (g_m113a_wr[ii] < 0xffffffffu) ? 1u : 0u;      /* ← wr 自增（无前置条件） */
++    g_m113a_dv[ii] += (dvar >= 3) ? 1u : 0u;                        /* 审计：其中深度笔 */
++    g_m113a_lno[ii] = nverts;                                       /* last_nv */
++    m113a_cp17(g_m113a_lfs[ii], (kf && kf->key[0]) ? kf->key : "-");/* last_fs */
++    /* ───── 以下才是门（A4 的匹配谓词只依赖 fs / decl / real / 目标槽 wh 四项）───── */
++    if (g_m113a_v == -2) (void)m113a_knob();
++    if (g_m113a_v <= 0) return 0;
++    if (si < 0 || si >= H_RT_SLOTS) return 0;
++    if (!kf || !kf->key[0]) return 0;
++    if (strcmp(kf->key, M113A_FS) != 0) return 0;
++    {
++        int decl = 0, real = 0;
++        m105a_ntex(kf, &decl, &real);
++        if (decl != 4 || real != 4) return 0;
++    }
++    {
++        const h_rt_slot *s = &g_rt_tab[si];
++        if (s->w != 400u || s->h != 225u) return 0;                 /* tgt wh==400x225 */
++    }
++    /* ⇒ 命中「帧末那一组」：g_m113a_seq 是本窗口的命中序号（与 wr 无关，仅供行号对齐） */
++    g_m113a_seq++;
++    g_m113a_hit4++;
++    if ((g_m113a_v & 1) && g_m113a_capwant && g_m113a_capn < M113A_CAPN) {
++        m113a_cap *c = &g_m113a_cap[g_m113a_capn];
++        int tgt = 0, sr = -1, dr = -1, sa = -1, da = -1, er = -1, ea = -1, okf = 0;
++        memset(c, 0, sizeof *c);
++        c->seq = g_m113a_seq;
++        c->nv = nverts;
++        c->cnt = (unsigned)(count > 0 ? count : 0);
++        c->slot = si;
++        c->topo = (int)topo;
++        c->dvar = dvar;
++        c->mask = (dvar >= 3) ? 0x0 : 0xF;
++        c->cull = m40c_sw() ? 2 : 0;                 /* 2 = BACK（M40C 开关），0 = NONE（本移植缺省） */
++        c->zt = (dvar != 0);
++        c->zw = (dvar != 0);
++        m14b_dec(g_m14b_blend_raw, &tgt, &sr, &dr, &sa, &da, &er, &ea);
++        okf = m14b_func_ok(sr) && m14b_func_ok(dr) && m14b_func_ok(sa) && m14b_func_ok(da)
++              && m14b_eq_ok(er) && m14b_eq_ok(ea);
++        c->m14bfix = g_m14b_fix;
++        c->m14b = g_m14b_blend_en ? 1 : 0;
++        c->blendok = okf;
++        c->blend_en = (g_m14b_fix && g_m14b_blend_en && okf) ? 1 : 0;   /* = m14b_apply 真正下发的 en */
++        c->sr = sr; c->dr = dr; c->sa = sa; c->da = da; c->er = er; c->ea = ea;
++        c->hasc = (sr >= 0x61 || dr >= 0x61 || sa >= 0x61 || da >= 0x61) ? 1 : 0;
++        memcpy(c->vp, g_r_fs_vp, sizeof c->vp);
++        memcpy(c->sc, g_r_fs_sc, sizeof c->sc);
++        snprintf(c->fs, sizeof c->fs, "%s", kf->key);
++        {
++            int ntex = kf->ntex, u;
++            if (ntex > (int)NVN_TX_SLOTS) ntex = (int)NVN_TX_SLOTS;
++            if (ntex > 4) ntex = 4;                  /* 规格：u=0..3 全部 resolve */
++            for (u = 0; u < ntex; u++) m113a_tex_meta(kf, u, &c->tx[u]);
++            c->ntx = ntex;
++        }
++        m113a_geom(kv, nattr, attrloc, aoff_v, nents, map, count, vbytes, &c->geo);
++        g_m113a_capn++;
++    }
++    if (g_m113a_v & 2) {                             /* A4：只跳这一组，其余一笔不跳 */
++        g_m113a_skipped++;
++        g_m113a_skipf++;
++        if (g_m113a_skiplog < 8ull) {
++            g_m113a_skiplog++;
++            vk_boot_logf("[m113a] skip slot=%d wh=400x225 fs=%s seq=%llu nv=%u cnt=%u dvar=%d mask=0x%x",
++                         si, kf->key, g_m113a_seq, nverts, (unsigned)(count > 0 ? count : 0),
++                         dvar, (dvar >= 3) ? 0u : 0xFu);
++        }
++        return 1;
++    }
++    return 0;
++}
++
++/* ===== present 安全点：d / t / g 行（回读全在这里，draw 路径零回读） ===== */
++static void m113a_emit_cap(int ci)
++{
++    static struct { VkImage img; int ok; m107a_sig_t sg; } cache[M113A_CACHE];
++    static int cachen;
++    m113a_cap *c = &g_m113a_cap[ci];
++    int k;
++    /* ① d 行：本笔真实下发的状态 */
++    vk_boot_logf("[m113a] d i=%d seq=%llu slot=%d wh=%ux%u nv=%u idx=%u topo=%d dvar=%d "
++                 "blend=%d src=%s dst=%s op=%s srcA=%s dstA=%s opA=%s blendc=%s m14b=%d fix=%d blok=%d "
++                 "mask=0x%x vp=%.1f,%.1f,%.1fx%.1f sc=%d,%d,%dx%d z=%d/%d/%s cull=%s fs=%s",
++                 ci, c->seq, c->slot, (unsigned)g_rt_tab[c->slot].w, (unsigned)g_rt_tab[c->slot].h,
++                 c->nv, c->cnt, c->topo, c->dvar,
++                 c->blend_en,
++                 (c->m14bfix && c->sr >= 0) ? m14b_func_name(c->sr) : "-",
++                 (c->m14bfix && c->dr >= 0) ? m14b_func_name(c->dr) : "-",
++                 (c->m14bfix && c->er >= 0) ? m14b_eq_name(c->er) : "-",
++                 (c->m14bfix && c->sa >= 0) ? m14b_func_name(c->sa) : "-",
++                 (c->m14bfix && c->da >= 0) ? m14b_func_name(c->da) : "-",
++                 (c->m14bfix && c->ea >= 0) ? m14b_eq_name(c->ea) : "-",
++                 c->hasc ? "0,0,0,0" : "na",
++                 c->m14b, c->m14bfix, c->blendok,
++                 (unsigned)c->mask,
++                 (double)c->vp[0], (double)c->vp[1], (double)c->vp[2], (double)c->vp[3],
++                 c->sc[0], c->sc[1], c->sc[2], c->sc[3],
++                 c->zt, c->zw, c->zt ? "LEQUAL" : "ALWAYS",
++                 (c->cull == 2) ? "BACK" : "NONE", c->fs);
++    /* ② t 行：4/4 全部 resolve（回读按图去重，每帧 ≤4 张、单张 ≤1 Mpx） */
++    for (k = 0; k < c->ntx && k < 4; k++) {
++        m113a_tx *t = &c->tx[k];
++        int ci2, rb = 0, dcol = -1;
++        unsigned mr = 0, mg = 0, mb = 0, sp = 0;
++        if (t->img_ok && t->bpp == 4) {
++            for (ci2 = 0; ci2 < cachen; ci2++) if (cache[ci2].img == t->img) break;
++            if (ci2 < cachen) {
++                rb = cache[ci2].ok; dcol = rb ? (int)cache[ci2].sg.dcol : -1;
++                mr = cache[ci2].sg.mr; mg = cache[ci2].sg.mg; mb = cache[ci2].sg.mb; sp = cache[ci2].sg.spread;
++            } else {
++                m107a_sig_t sg;
++                rb = m113a_sig_img(t->img, (VkImageLayout)t->lay, t->w, t->h, &sg);
++                dcol = rb ? (int)sg.dcol : -1;
++                mr = sg.mr; mg = sg.mg; mb = sg.mb; sp = sg.spread;
++                if (cachen < M113A_CACHE) { cache[cachen].img = t->img; cache[cachen].ok = rb; cache[cachen].sg = sg; cachen++; }
++            }
++            t->rb = rb; t->dcol = dcol;
++        }
++        vk_boot_logf("[m113a] t i=%d u=%d texid=%d kind=%d up=%d fmt=%d what=%s wh=%ux%u bpp=%d "
++                     "mean=%u/%u/%u sp=%u dcol=%d rb=%d why=%s",
++                     ci, t->u, t->id, t->kind, t->up, t->fmt, t->what,
++                     t->w, t->h, t->bpp, mr, mg, mb, sp, dcol, rb, t->why);
++    }
++    /* ③ g 行：VBO 快照几何覆盖 */
++    vk_boot_logf("[m113a] g i=%d nidx=%d nv=%u xmin=%.5g xmax=%.5g ymin=%.5g ymax=%.5g "
++                 "zmin=%.5g zmax=%.5g ndc_cover=%.3f nin=%d/%d mb=%d ok=%d why=%s",
++                 ci, c->geo.nidx, c->nv, (double)c->geo.xmin, (double)c->geo.xmax,
++                 (double)c->geo.ymin, (double)c->geo.ymax, (double)c->geo.zmin, (double)c->geo.zmax,
++                 (double)c->geo.cover, c->geo.nin, c->geo.npj, c->geo.mb, c->geo.ok, c->geo.why);
++}
++
++/* A5：候选表 + wh 直方图（只读 g_rt_tab / 计数器，**不改任何绘制行为**）。 */
++static void m113a_boot_cand(void)
++{
++    unsigned h225 = 0, h228 = 0, h450 = 0, ho = 0, nlive = 0;
++    char cand[200];
++    int i, shown = 0, cl = 0;
++    cand[0] = 0;
++    for (i = 0; i < H_RT_SLOTS; i++) {
++        const h_rt_slot *s = &g_rt_tab[i];
++        if (!s->key || !s->img || !s->w || !s->h) continue;
++        nlive++;
++        if (s->w == 400u && s->h == 225u) h225++;
++        else if (s->w == 400u && s->h == 228u) h228++;
++        else if (s->w == 800u && s->h == 450u) h450++;
++        else ho++;
++        if (shown < 4 && cl < 150) {
++            cl += snprintf(cand + cl, sizeof cand - (size_t)cl, "%s%d(%ux%u,wr=%u,nv=%u,fs=%s)",
++                           shown ? "," : "", i, (unsigned)s->w, (unsigned)s->h,
++                           g_m113a_wr[i], g_m113a_lno[i], g_m113a_lfs[i][0] ? g_m113a_lfs[i] : "-");
++            if (cl < 0 || cl >= (int)sizeof cand) cl = (int)sizeof cand - 1;
++            shown++;
++        }
++    }
++    if (!shown) snprintf(cand, sizeof cand, "%s", "-");
++    vk_boot_logf("[m113a] boot sel=CAND sel=%d nlive=%u nlive400x225=%u wh[400x225=%u 400x228=%u "
++                 "800x450=%u other=%u] cand=%s",
++                 g_m113a_sel, nlive, h225, h225, h228, h450, ho, cand);
++}
++
++/* A2 报告：每 30 s 打 top k=0..2（wr 降序，并列取 wh 大者、再取槽号小者）+ 目标槽 + A5 自检。
++   只读计数器；打完这一窗口才清零（清零**不丢任何笔**：新窗口从下一帧重新累计）。 */
++static void m113a_report(unsigned long long call)
++{
++    int k, i, chosen[M113A_TOPK];
++    unsigned long long nz = 0;
++    for (k = 0; k < M113A_TOPK; k++) chosen[k] = -1;
++    for (i = 0; i < H_RT_SLOTS; i++) if (g_m113a_wr[i]) nz++;
++    m113a_pick();                                   /* 目标槽（只读计数器） */
++    for (k = 0; k < M113A_TOPK; k++) {
++        int b = -1, j;
++        unsigned bw = 0;
++        for (j = 0; j < H_RT_SLOTS; j++) {
++            const h_rt_slot *s = &g_rt_tab[j];
++            unsigned w0;
++            int dup = 0, q;
++            if (!s->key || !s->img || !s->w || !s->h) continue;
++            for (q = 0; q < k; q++) if (chosen[q] == j) dup = 1;
++            if (dup) continue;
++            w0 = g_m113a_wr[j];
++            if (!w0) continue;
++            if (b < 0 || w0 > bw || (w0 == bw && (s->w * s->h) > (g_rt_tab[b].w * g_rt_tab[b].h))) { b = j; bw = w0; }
++        }
++        chosen[k] = b;
++        if (b < 0) break;
++        {
++            const h_rt_slot *s = &g_rt_tab[b];
++            vk_boot_logf("[m113a] top k=%d slot=%d wh=%ux%u wr=%u last_fs=%s last_nv=%u dv=%u sel=%d call=%llu",
++                         k, b, (unsigned)s->w, (unsigned)s->h, g_m113a_wr[b],
++                         g_m113a_lfs[b][0] ? g_m113a_lfs[b] : "-", g_m113a_lno[b], g_m113a_dv[b],
++                         g_m113a_sel, call);
++        }
++    }
++    /* A5 自检（只在 knob≠0 时打；knob=0 必须 0 行 ⇒ A6 优先） */
++    if (!nz && g_m113a_missnowr < (unsigned long long)M113A_MISSMAX && g_m113a_t0 > 0.0) {
++        const double now = (double)pf_now_us() / 1e6;
++        if (now - g_m113a_t0 >= 60.0) {
++            g_m113a_missnowr++;
++            vk_boot_logf("[m113a] miss why=no_wr f=%llu call=%llu (本窗口 wr 全 0：一笔 draw 都没走到计数点；"
++                         "自检不改变任何绘制行为)", g_m113a_fno, call);
++            m113a_boot_cand();
++        }
++    }
++    /* 收口本窗口（下一帧起重新累计） */
++    memset(g_m113a_wr, 0, sizeof g_m113a_wr);
++    memset(g_m113a_dv, 0, sizeof g_m113a_dv);
++    memset(g_m113a_lno, 0, sizeof g_m113a_lno);
++    memset(g_m113a_lfs, 0, sizeof g_m113a_lfs);
++    g_m113a_hit4 = 0;
++}
++
++/* 帧边界（present 内）：A2 报告 / A3 抓取行 / A4 每帧 f 行。knob=0 ⇒ 一行不打、零回读。 */
++static void m113a_frame(unsigned long long call)
++{
++    const int v = m113a_knob();
++    const double now = (double)pf_now_us() / 1e6;
++    if (!g_m113a_t0) g_m113a_t0 = now;
++    if (v <= 0) return;                              /* A6：关态零输出 */
++    if (!g_m113a_rt || now - g_m113a_rt >= M113A_REPORT_S) {
++        g_m113a_rt = now;
++        m113a_report(call);
++    }
++    if (v & 1) {                                     /* A3：抓取行（回读都在本安全点） */
++        int ci;
++        for (ci = 0; ci < (int)g_m113a_capn && ci < (int)M113A_CAPN; ci++) m113a_emit_cap(ci);
++    }
++    if (v & 2) {                                     /* A4：每帧判读行 */
++        m113a_pick();
++        g_m113a_t2ok = m113a_sig_slot(g_m113a_sel, &g_m113a_t2);
++        {
++            const h_rt_slot *s = (g_m113a_sel >= 0) ? &g_rt_tab[g_m113a_sel] : NULL;
++            vk_boot_logf("[m113a] f call=%llu skip=%u t2[dcol=%d mean=%u/%u/%u sp=%u] sel=%d wh=%ux%u "
++                         "hit=%llu blit=%d rb=%d",
++                         call, (unsigned)g_m113a_skipf, g_m113a_t2ok ? (int)g_m113a_t2.dcol : -1,
++                         g_m113a_t2.mr, g_m113a_t2.mg, g_m113a_t2.mb, g_m113a_t2.spread,
++                         g_m113a_sel, s ? (unsigned)s->w : 0u, s ? (unsigned)s->h : 0u,
++                         g_m113a_hit4, g_m113a_blit_on, g_m113a_t2ok);
++        }
++    }
++    /* 收口帧内状态 + 抓取窗口预算（3D 段前 10 帧 + 之后每 60 帧） */
++    g_m113a_skipf = 0;
++    g_m113a_capn = 0;
++    g_m113a_fno++;
++    g_m113a_capwant = (g_m113a_fno < 10ull || (g_m113a_fno % 60ull) == 0ull) ? 1 : 0;
++    g_m113a_blit_on = 0;
++}
++
++
+ int nvn_vk_draw_elements(int mode, int type, int count, uint64_t idx, int base_vertex, int base_instance,
+                          int instances, int dclass)
+ {
+@@ -25519,8 +26105,13 @@
+     /* M105A：knob>=3 时跳过「本帧已被带贴图笔写过的窗口槽 + 末笔同族 fs + ntex_decl==0」的那一笔
+        （= 不覆盖已有内容；不动 pass 顺序、不全局禁 renderpass）。knob<3 ⇒ m105a_skp 恒 0。 */
+     const int m105a_skp = m105a_skip_draw(kf, dvar);
+-    if (m105a_skp) {
+-        if (g_m105a_skip_n <= 8ull)
++    /* M113A（2026-11-14；缺省 knob=0 ⇒ 立即 return 0）：计数无条件 + fs 直接匹配的状态抓取/skip
++       （命中判定只依赖 fs/decl/real/目标槽 wh，不依赖选槽 ⇒ 无自举死锁）。 */
++    const int m113a_skp = m113a_draw(kv, kf,
++        g_rt_cur ? (int)(g_rt_cur - g_rt_tab) : -1, dvar, (unsigned)nverts, (int)count, (int)topo,
++        nattr, attrloc, aoff_v, nents, map, vbytes);
++    if (m105a_skp || m113a_skp) {
++        if (m105a_skp && g_m105a_skip_n <= 8ull)
+             vk_boot_logf("[m105a] skip slot=%d fs=%s seq=%llu cnt=%d",
+                          (int)(g_rt_cur ? (g_rt_cur - g_rt_tab) : -1),
+                          (kf && kf->key[0]) ? kf->key : "-", g_m105a_seq, count);
+@@ -32520,7 +33111,63 @@
+             static double last_sg;
+             const double nows = (double)pf_now_us() / 1e6;
+             if (!last_sg || nows - last_sg >= 2.0) { last_sg = nows; m106a_sig_probe(m106a_slot, m106a_src); }
++        }
++    }
++    /* ===== M113A（2026-11-14）A4：knob bit1 ⇒ 目标槽（400x225 且本窗口 wr 最大）经 M106A 的同一条
++       通道 blit 上屏（同一张 800x450 dst 图 + 同一条 vkCmdBlitImage + 同一条 present 拷贝；选源按属性，
++       不认槽号；不造第二条上屏通道）。bit0/关态 ⇒ 本块整段不生效。 ===== */
++    {
++        const int m113a_mv = m113a_knob();
++        if ((m113a_mv & 2) && !m106a_blit) {
++            m113a_pick();                            /* 只读计数器，运行期不丢任何笔 */
++            if (g_m113a_sel >= 0 && g_m113a_sel < H_RT_SLOTS) {
++                h_rt_slot *m113a_s = &g_rt_tab[g_m113a_sel];
++                const VkImageLayout m113a_sl0 = (m113a_s->img && m113a_s->w && m113a_s->h)
++                                              ? p_slot_layout(m113a_s) : VK_IMAGE_LAYOUT_UNDEFINED;
++                const int m113a_layok = (m113a_sl0 == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL ||
++                                         m113a_sl0 == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL ||
++                                         m113a_sl0 == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL ||
++                                         m113a_sl0 == VK_IMAGE_LAYOUT_GENERAL);
++                int m113a_rc = -3;
++                if (m113a_s->img && m113a_s->w && m113a_s->h && m113a_layok) m113a_rc = m106a_dst_img();
++                if (m113a_rc == 0) {
++                    m106a_src = m113a_s; m106a_slot = g_m113a_sel;
++                    m106a_sw = m113a_s->w; m106a_sh = m113a_s->h;
++                    m106a_blit = 1;
++                    simg = g_m106a_img; sw = M106A_DW; sh = M106A_DH;
++                    slay = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++                    srcname = "m113a-blit"; snap_used = 0;
++                    g_m113a_blit_on = 1;
++                    g_m113a_blits++;
++                    if (g_m113a_bline < 4ull || (call % 60ull) == 0ull) {
++                        g_m113a_bline++;
++                        vk_boot_logf("[m113a] blit src slot=%d wh=%ux%u lay=%d why=attr dst=%ux%u img=%#llx n=%llu call=%llu",
++                                     g_m113a_sel, (unsigned)m113a_s->w, (unsigned)m113a_s->h, (int)m113a_sl0,
++                                     (unsigned)M106A_DW, (unsigned)M106A_DH,
++                                     (unsigned long long)(uintptr_t)g_m106a_img, g_m113a_blits, call);
++                    }
++                } else {
++                    g_m113a_bfail++;
++                    if (g_m113a_bfail <= 4ull || (call % 300ull) == 0ull)
++                        vk_boot_logf("[m113a] blit fallback=1 rc=%d why=%s slot=%d img=%d ext=%ux%u lay=%d -> 本帧上屏走原路径 src=%s",
++                                     m113a_rc, (m113a_s->img && m113a_s->w && m113a_s->h) ? (m113a_layok ? "dst_img" : "layout") : "slot_empty",
++                                     g_m113a_sel, m113a_s->img ? 1 : 0, (unsigned)m113a_s->w, (unsigned)m113a_s->h,
++                                     (int)m113a_sl0, srcname);
++                }
++            } else if (g_m113a_sel < 0 && (call % 300ull) == 0ull) {
++                vk_boot_logf("[m113a] blit fallback=1 rc=-5 why=no_sel (本窗口没有可用的 400x225 目标槽) src=%s",
++                             srcname);
++            }
+         }
++        /* 源槽内容签名（目标槽；只在 blit 生效时，≤1/2 s 一次） */
++        if (m106a_blit && m106a_src) {
++            static double m113a_last_sg;
++            const double m113a_nows = (double)pf_now_us() / 1e6;
++            if (!m113a_last_sg || m113a_nows - m113a_last_sg >= 2.0) {
++                m113a_last_sg = m113a_nows;
++                m106a_sig_probe(m106a_slot, m106a_src);
++            }
++        }
+     }
+     uint32_t cp_w = sw, cp_h = sh;
+     int cp_clamped = 0;
+@@ -32918,6 +33565,7 @@
+         m105a_frame(call, srcname, g_p_sel_slot, ok);   /* M105A：帧内写入时序 + judge + 内容签名 */
+         m107a_frame(call, srcname, g_p_sel_slot, ok);   /* M107A：三处签名（t2 = 末笔之后）+ 逐笔时序 + 贴图白度 */
+         m109a_frame(call);   /* M109A：映射表 / 白链（t2 + 逐笔 + 采样递归 ≤2 跳） */
++        m113a_frame(call);   /* M113A：top 报告(30s)/d-t-g 抓取/每帧 f 行；knob=0 ⇒ 零输出 */
+         if (psig_want)
+             p_sig_line(call, srcname, simg, sw, sh, crox, croy, ok, psig_verbose || g_p_m4ak_sig_pair);
+         g_p_m4ak_sig_pair = 0;

@@ -1,0 +1,57 @@
+--- threads.c (round13b: kick 三门 dump 计数 + cell2 定名走 HLE thunk 索引 + HLE signal 入 evlog)
+    fixPlan(2) dump：obs kick1/al-kick/kick3 三行（与 donor 0x8ad1f0 族 ≈920+410+舞台数对账）。
+    fixPlan(1) 定名收口：实测双间接=cell→[cell]=目标（blr 即它），[cell] 落宿主 HLE thunk 表
+    （hle_stack.S runtime_hle_thunks，索引=包装注册序）——按索引 runtime_hle_describe 定名：
+    cell 0x136deb8 = nvnDeviceGetTimestampInNanoseconds（thunk#162）；cell1 验证位=Map（thunk#220）。
+    fixPlan(3) 审计：hle_signal_system_event 的 signal 入 evlog（round5 runtime_event_signal 同款）——
+    13b 实测装载器事件写端 0x1002 被 vsync_tick(services.c:301) ~59/s 持续 signal（12d 曾不可见）。
+
+--- threads.c
++++ threads.c
+@@ -1009,6 +1009,11 @@
+         if (wh) {
+             event_t *e = h_get(wh, O_EVENT_W);
+             if (!e) die("SystemEvent 写端句柄失效 %#x", wh);
++            /* round13 fixPlan(3) 审计：宿主 HLE 侧对客体 SystemEvent 的 signal 此前只改
++               signaled、不入 evlog/evcnt——装载器事件 0x1002「signaled=1 但 evc signal=0」
++               无法区分『创建即置位』（hle_bind_system_event 的 CreateSystemEvent(ev,·,1)）
++               与『被 HLE 发过』。入环对齐 runtime_event_signal（round5 同款），纯观测。 */
++            evlog(EVLOG_SIGNAL, wh, 0, (uint64_t)(uintptr_t)__builtin_return_address(0));
+             e->signaled = 1; wake_sync_waiters();
+             pthread_mutex_unlock(&G);
+             return;
+@@ -1339,12 +1344,34 @@
+               (unsigned long long)smo_obs_hits(1), (unsigned long long)smo_obs_last_x0(1));
+       fprintf(stderr, "[totk-dump] obs E2 drain 0x8af418 hits=%llu last_x0=%#llx\n",
+               (unsigned long long)smo_obs_hits(2), (unsigned long long)smo_obs_last_x0(2));
++      /* round13 fixPlan(2)：kick 断链指令级计数（donor 0x8ad1f0 族预期 ≈920+410+舞台数，与 wait#921/920/410 对账）。
++         kick1=派发函数全部入口（含 al 尾调）；al-kick=al 层调用（0x587ea8 单字门，仅过 NULL 检查的真实调用）；
++         kick3=三参变体合流点 0x8ad318（单字门）。kick1≈0 ⇒ kick 从未运行（断链在注册上游，走 fixPlan(4)）。 */
++      fprintf(stderr, "[totk-dump] obs kick1 0x8ad1f4 hits=%llu last_x0=%#llx\n",
++              (unsigned long long)smo_obs_hits(4), (unsigned long long)smo_obs_last_x0(4));
++      fprintf(stderr, "[totk-dump] obs al-kick 0x587ea8 hits=%llu last_x0=%#llx\n",
++              (unsigned long long)smo_obs_hits(5), (unsigned long long)smo_obs_last_x0(5));
++      fprintf(stderr, "[totk-dump] obs kick3 0x8ad318 hits=%llu last_x0=%#llx\n",
++              (unsigned long long)smo_obs_hits(6), (unsigned long long)smo_obs_last_x0(6));
+       /* round12e 定名：GetLoadProgress f() 的两条双间接 cell 链（0x1363dc8 已知=Map 作验证位，0x136deb8 待定名） */
+       {
+       extern int smo_obs_cell2_snapshot(uint64_t[6]);
+       uint64_t c2[6];
+       if (smo_obs_cell2_snapshot(c2)) {
+           const char *nm; uint64_t off;
++          /* round13b 实测：游戏 0x9b9bc4-0x9b9bd0 的双间接是 cell→[cell]=目标（blr 的就是它），
++             [cell] 落在宿主 HLE thunk 表（hle_stack.S runtime_hle_thunks，索引=包装注册序）——
++             上方打印的 fn= 是对 thunk 再解引用读到的头两条指令字（13b 实测 cell1 的 fn 低字
++             0xd2801b91 恰为『mov x17,#0xdc』的编码字，自证）。此处按 thunk 索引直接定名。 */
++          extern char runtime_hle_thunks[];
++          for (int k = 0; k < 2; k++) {
++              uint64_t t = c2[k * 3 + 1], base = (uint64_t)(uintptr_t)runtime_hle_thunks;
++              if (t >= base && t < base + 65536ULL * 16) {
++                  char hn[256]; runtime_hle_describe((unsigned)((t - base) / 16), hn, sizeof hn);
++                  fprintf(stderr, "[totk-dump] cell2 %s: call target %#llx = HLE thunk #%u -> %s\n",
++                          k ? "0x136deb8" : "0x1363dc8", (unsigned long long)t, (unsigned)((t - base) / 16), hn);
++              }
++          }
+           fprintf(stderr, "[totk-dump] cell2 0x1363dc8: cell=%#llx table=%#llx fn=%#llx",
+                   (unsigned long long)c2[0], (unsigned long long)c2[1], (unsigned long long)c2[2]);
+           if (runtime_module_offset(c2[2], &nm, &off)) fprintf(stderr, " -> %s+%#llx", nm, (unsigned long long)off);

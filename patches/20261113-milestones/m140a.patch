@@ -1,0 +1,167 @@
+--- mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c
++++ mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c
+@@ -5381,6 +5381,70 @@
+ static int g_h_rt_open;
+ static unsigned long long g_h_rt_binds, g_h_rt_nonempty, g_h_rt_ok, g_h_rt_fail;
+ static unsigned long long g_h_rt_flush_ok, g_h_rt_flush_fail;
++
++/* ================= M140A（2026-11-14）：RT 批次「逐目标提交」合并（knob `smo_rt_submerge`，缺省 0 = 关）=================
++   证据（build #10 施工树 + build #9 真机日志 `logs/m133a/vk_boot_b.log`，逐条见 `logs/m140a/report.md` Q1/Q2）：
++     · `[perf]` 纯稳态窗 t=120→180（60 s / 184 帧）：`rt_bind` +16,526（**89.8/帧**）、`rt_sw` +6,783
++       （**36.9/帧**）；`[m40am] st t=180s … spf=92.07` ⇒ 92 次 `vkQueueSubmit`/帧；
++     · `rt_submit_us` 同一窗口 = 1,311,411 µs = 6,783 笔 × **193 µs** ⇒ 6,783 笔就是 rt 批次提交的全部，
++       `rt_sw 36.9/帧` 与 rt 提交笔数**一一对应**（每次「换目标」= 一笔 submit，本文件 :35614 那句）。
++     ⇒ 92 次/帧里 **40 %（36.9 笔）**由 RT 目标切换产生；但按实测它只值 **7.1 ms/帧**，仅占
++       `frame_us=326,086` 的 **2.2 %** —— **提交本身不是时间大头**，不要把它当成 15× 的解释。
++     · 真正随切换而付、却**不在任何 [perf] 计时器里**的开销是这 5 个驱动调用：
++       `vkAllocateCommandBuffers`（:35630）+ `vkBeginCommandBuffer` + `vkEndCommandBuffer` + `vkFreeCommandBuffers`
++       （:35860）+ fence reset ⇒ 36.9 次/帧 × 5 ≈ **185 次未计时驱动调用/帧**，是 281 ms 未归因残差的第一嫌疑。
++   修法（只改「RT barrier CB 何时收口」，不改任何 layout/attach 语义）：knob=1 时**不**在每次目标切换处收口，
++   而是把新目标的 layout barrier + viewport/scissor **继续录进同一张 CB**，只在「必须收口」的调用点收口：
++     `gfx_bridge.c:2860`（clear 的 barrier oldLayout 依赖 RT 布局先落地）、`gfx_bridge.c:4924/:4931`（纹理解析换图）、
++     `gfx_bridge.c:5401`（一条命令流末尾）；另加**本张 CB 内 barrier 上限 `M140A_MAXBAR`**，超了就在切换点强制收口（有界，不会长成巨型 CB）。
++   为什么顺序仍正确：① 所有「必须收口」点都在任何 draw 批次**提交**之前调 `nvn_vk_rt_flush()`（`gfx_bridge.c:5401/5403`
++   是 rt→draw 的固定顺序），队列 FIFO ⇒ 合并后的 barrier CB 仍先于 draw CB 落地，与逐目标提交的相对顺序等价；
++   ② 同一张 CB 内 barrier 按录制顺序执行，不同图之间互不影响，同一图的多级切换也是链式（oldLayout 逐次传下去）；
++   ③ 本文件 :27348「录制一笔 draw 之前」补一句「合并态的 RT 批先收口」，把「draw 先于 barrier 落地」这条唯一风险路径掐死；
++   ④ 槽对象**会话内从不 destroy**（M4q/M5s 约束），所以在飞 CB 指向的图永远有效。
++   knob（文件通道，沿用 M113A/M119A/M122A/M135A 的约定）：
++     `smo_rt_submerge` 0 = 关（**缺省**：不合并、不打日志、Vulkan 调用序列逐字节等于 build #10）  1 = 开
++   缺省取 0 的理由（证据，不是保守）：合并能省下的**已测**部分只有 7.1 ms/帧（2.2 %），而它的**未测**部分
++   （185 次/帧的 CB 生命周期调用）当前没有仪器能证明占多少 ⇒ 先用这一个 build 做「同一包内 echo 0/1」的 A/B，
++   量出收益再决定 #12 是否把缺省翻成 1。开态还会多打 `[m140a] sub` 一行（每 60 s），给出 rt 提交笔数的逐窗实测。
++   ========================================================================================== */
++#define M140A_DIR_A "/data/storage/el2/base/files"
++#define M140A_DIR_B "/data/app/el2/100/base/com.vibecc.smo/files"
++#define M140A_SW_A  M140A_DIR_A "/smo_rt_submerge"
++#define M140A_SW_B  M140A_DIR_B "/smo_rt_submerge"
++#define M140A_MAXBAR 24u                 /* 一张合并 CB 里最多录多少个 barrier，超了强制收口 */
++static int g_m140a_merge = 0;            /* 0 = 关（缺省）；constructor 里按文件覆盖 */
++static unsigned g_m140a_bars;            /* 本张 CB 已录 barrier 数（关态恒 0，不累加） */
++static unsigned long long g_m140a_merged, g_m140a_forced, g_m140a_rec;
++
++/* 照抄 m135a_seed：种 "0\n" + chmod 0666（hdc 是 uid=2000，只能覆盖**已存在**的 666 文件）。 */
++__attribute__((constructor)) static void m140a_seed(void)
++{
++    static const char *const p[2] = { M140A_SW_A, M140A_SW_B };
++    for (int i = 0; i < 2; i++) {
++        if (access(p[i], F_OK) == 0) { chmod(p[i], 0666); continue; }
++        int fd = open(p[i], O_CREAT | O_WRONLY | O_TRUNC, 0666);
++        if (fd >= 0) { ssize_t wr = write(fd, "0\n", 2); (void)wr; close(fd); chmod(p[i], 0666); }
++    }
++    /* 读一次（A→B 兜底）：只在 constructor 里做 ⇒ 运行期每次只有一次 int 读 + 一次比较。 */
++    for (int i = 0; i < 2; i++) {
++        int fd = open(p[i], O_RDONLY);
++        if (fd < 0) continue;
++        char b[16]; ssize_t n = read(fd, b, sizeof b - 1); close(fd);
++        if (n <= 0) break;
++        b[n] = 0; g_m140a_merge = atoi(b) != 0; break;
++    }
++}
++static int m140a_merge_on(void)
++{
++    static int logged;
++    if (g_m140a_merge && !logged) {
++        logged = 1;
++        vk_boot_logf("[m140a] rt submerge on=1 file=%s maxbar=%u (barrier CB 跨目标续录，收口点=clear/tex/stream-end)",
++                     M140A_SW_B, (unsigned)M140A_MAXBAR);
++    }
++    return g_m140a_merge;
++}
+ 
+ /* M4c：切换「当前渲染目标」。离开时把布局记回旧目标，进入时取新目标自己的布局
+    （两张图各自的 layout 不能共用——否则 barrier 的 oldLayout 会写错）。 */
+@@ -27341,6 +27405,10 @@
+ 
+     /* M38F B（只读）：录制**之前**取「这笔之前」的目标槽内容签名（仅采样笔；关态立即返回）。 */
+     if (m38f_on()) m38f_draw_pre();
++    /* M140A：合并态下若还有一张「已录未提交」的 RT barrier CB，**必须先收口**——否则这张 draw CB 会
++       先于 barrier 落地（布局转换滞后）。关卡态本句只多一次 int 比较（`m140a_merge_on()` 恒 0 ⇒ 不进 flush），
++       不改变 build #10 的任何一条 Vulkan 调用。 */
++    if (g_h_rt_open && m140a_merge_on()) nvn_vk_rt_flush();
+     /* ---- 录制 ---- */
+     if (!g_r_open) {
+         VkCommandBufferAllocateInfo ca = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+@@ -35608,10 +35676,19 @@
+                              g_h_rt_fallback, (unsigned long long)key, rw, rh, h_rt_host_forced(), (int)H_OFF_W, (int)H_OFF_H);
+         }
+     }
++    int m140a_rec = 0;   /* M140A：合并态下「本次绑定要往**已打开**的 CB 里续录新目标的 barrier」 */
+     if (s != g_rt_cur) {
+         int had_open = g_h_rt_open;
+         atomic_fetch_add_explicit(&g_pf_rtswitch.n, 1, memory_order_relaxed);   /* M6e：真的换目标 */
+-        if (had_open) nvn_vk_rt_flush();          /* 旧目标上的批次先落地（barrier 依赖旧 layout） */
++        /* M140A：knob=0 ⇒ `merge_keep` 恒 0 ⇒ 下一句与 build #10 **逐字节相同**（同一条 if，只多一次 int 比较）。
++           knob=1 ⇒ 只有「本张 CB 里 barrier 已到 M140A_MAXBAR」才收口，否则把新目标的 barrier
++           续录进同一张 CB（见 M140A 段头的顺序论证）。 */
++        int merge_keep = had_open && m140a_merge_on() && g_m140a_bars < M140A_MAXBAR;
++        if (had_open && !merge_keep) nvn_vk_rt_flush();
++        if (merge_keep) g_m140a_merged++;
++        else if (had_open && m140a_merge_on()) g_m140a_forced++;   /* 上限触发（开态才可能） */
++        m140a_rec = g_h_rt_open;                 /* 关态：收口后 open==0 ⇒ 恒 0，下面走原有新建分支 */
++        if (m140a_rec) g_m140a_rec++;
+         h_rt_switch(s);
+         g_h_rt_switch++;
+     }
+@@ -35621,7 +35698,8 @@
+     /* M119B：MRT 附件槽解析。knob 关 ⇒ 一次缓存整数比较后整段不执行（关态零状态、零日志）。
+        位置在 h_rt_switch(s) 之后：此刻 g_rt_cur/g_h_img/g_rt_w/g_rt_h 都是本次绑定的口径。 */
+     if (nvn_vk_mrt_on()) m119b_mrt_resolve(n, s, rw, rh);
+-    if (!g_h_rt_open) {
++    int m140a_fresh = !g_h_rt_open;   /* M140A：本次是否新建 CB（关态等价于原 `if (!g_h_rt_open)`） */
++    if (m140a_fresh) {
+         VkCommandBufferAllocateInfo ca = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+         ca.commandPool = g_h_cp;
+         ca.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+@@ -35631,6 +35709,10 @@
+         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+         vkBeginCommandBuffer(g_h_rt_cb, &bi);
+         g_h_rt_open = 1;
++    }
++    /* M140A：`m140a_rec` 只可能在 knob=1 且 CB 仍打开时置位 ⇒ 续录新目标的 barrier/viewport/scissor。
++       关态 `m140a_fresh && m140a_rec==0`，走的仍是 build #10 原来那一段，一条语句都不多。 */
++    if (m140a_fresh || m140a_rec) {
+         if (g_h_layout != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) {
+             int from_xfer = (g_h_layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+             VkImageMemoryBarrier b = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+@@ -35646,6 +35728,7 @@
+             vkCmdPipelineBarrier(g_h_rt_cb, from_xfer ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                  VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+             g_h_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;   /* flush 成功后才算落地 */
++            if (m140a_rec) g_m140a_bars++;   /* 关态不累加（m140a_rec 恒 0） */
+         }
+         /* M4c：viewport/scissor 尺寸取自**当前 RT**（游戏 RT 1600x900 时不再是 1280x720） */
+         VkViewport vp = { 0.0f, 0.0f, (float)g_rt_w, (float)g_rt_h, 0.0f, 1.0f };
+@@ -35809,6 +35892,7 @@
+     if (!g_h_rt_open) return 1;                       /* 无待提交内容 */    VkCommandBuffer cb = g_h_rt_cb;
+     g_h_rt_open = 0;
+     g_h_rt_cb = NULL;
++    g_m140a_bars = 0;   /* M140A：本张 CB 已收口 ⇒ 下一张从 0 起算（关态恒 0，纯写） */
+     vkEndCommandBuffer(cb);
+     VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+     si.commandBufferCount = 1;
+@@ -37198,6 +37282,24 @@
+                  d_n[5], d_us[5], d_n[7],
+                  d_n[6], d_us[6],
+                  gpu_wait, guest_us, topbuf[0], topbuf[1], topbuf[2]);
++    /* M140A（开态才多打这一行，关态零日志）：把「rt 提交笔数 / 目标切换笔数 / 被合并掉的笔数」逐窗给出，
++       真机 A/B（echo 0 ↔ echo 1）不必再 grep，直接读这一行就能算出合并把 36.9 笔/帧压到了多少。 */
++    if (m140a_merge_on()) {
++        static unsigned long long p_sub, p_sw, p_mg, p_rc, p_fc;
++        static unsigned p_ts;
++        unsigned long long nsub = atomic_load_explicit(&g_pf_rt_submit.n, memory_order_relaxed);
++        unsigned long long nsw = rsw, nmg = g_m140a_merged, nrc = g_m140a_rec, nfc = g_m140a_forced;
++        unsigned win2 = (p_ts && tsec > p_ts) ? (unsigned)(tsec - p_ts) : (unsigned)win;
++        unsigned long long dm = dsub ? dsub : 1u;
++        if (!win2) win2 = 1;
++        vk_boot_logf("[m140a] sub t=%us win=%us frames=%llu rt_sub=%llu(+%llu=%llu.%02llu/f) rt_sw=%llu(+%llu=%llu.%02llu/f) "
++                     "merged=%llu(+%llu) forced=%llu(+%llu) rec=%llu(+%llu) bars_now=%u",
++                     tsec, win2, dsub,
++                     nsub, nsub - p_sub, (nsub - p_sub) * 100ull / dm, ((nsub - p_sub) * 100ull / dm) % 100ull,
++                     nsw, nsw - p_sw, (nsw - p_sw) * 100ull / dm, ((nsw - p_sw) * 100ull / dm) % 100ull,
++                     nmg, nmg - p_mg, nfc, nfc - p_fc, nrc, nrc - p_rc, (unsigned)g_m140a_bars);
++        p_sub = nsub; p_sw = nsw; p_mg = nmg; p_rc = nrc; p_fc = nfc; p_ts = tsec;
++    }
+     pf_prev_t0 = t1;
+     pf_prev_tsec = tsec;
+     /* 窗口滚动：清榜（下一条 [perf] 只描述下一个窗口）。 */

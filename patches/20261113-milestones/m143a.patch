@@ -1,0 +1,61 @@
+# M143A 提案（**未实施 / 未构建 / 未进 HAP**）：w_scan_tick 的频率闸（每帧 ≤1 tick）。
+# 判定依据见 logs/m143a/report.md §1：w_scan_tick 不是纯取证 —— 它写 g_w_picks 决定旧抓取是否停手，
+# 并把快照 p3_our_upload() 进 g_our_img（present 的 src=ours/world-snap）⇒ 不能挂到 smo_m24a 缺省 0。
+# 回放：cd <树根> && git apply -p0 <此文件>   （本单只做过 --check + 回放 cmp，未 build）
+--- mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c
++++ mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c
+@@ -16740,6 +16740,11 @@
+ #define W_S_MIN_FULL_US 400000ull   /* 两次整幅回读的最小间隔（防 1 秒内 8 次替换烧光预算） */
+ #define W_S_BETTER_MARGIN 0.03      /* 内容分数要有这个增量才替换（迟滞，防抖动） */
+ #define W_S_SELF_N 8u               /* 「我们自己画进去的图」ring（对照三角/A~J 等） */
++/* M143A（提案，未实施、未构建）：w_scan_tick 的频率闸 —— 每帧最多这么多次 tick。
++   依据（#10 真机实测）：7,453 µs/tick × 12.5 tick/帧 = 93 ms/帧 = draw_post 的 98%、墙钟 26.3%。
++   为什么不是「缺省关掉」：本 tick 不是纯取证 —— 它写 g_w_picks（决定 p3_grab_game_rt 是否停手）
++   并把快照 p3_our_upload() 进 g_our_img（present 的 src=ours/world-snap），关掉会改上屏源。 */
++#define W_S_TICKS_PER_FRAME 1u
+ #define W_W_NTAB     ((unsigned)(sizeof g_rt_tab / sizeof *g_rt_tab))
+ static VkImage g_w_img;                        /* 最近一次整幅回读那张图（不记槽号做判据） */
+ static unsigned g_w_w, g_w_h;
+@@ -16802,6 +16807,8 @@
+ static unsigned g_s_rr;                         /* 槽游标（只用于「不重复扫描」） */
+ static unsigned long long g_s_ticks, g_s_probes;
+ static unsigned long long g_s_last_draw[W_W_NTAB];   /* 该槽最近一次被颜色 draw 写时的 tick */
++/* M143A（提案）：频率闸的簿记 —— 当前帧号 / 本帧已跑 tick 数 / 被闸掉的 tick 次数。 */
++static unsigned long long g_w_tick_frame, g_w_tick_in_frame, g_w_tick_skip;
+ /* 「我们自己画进去的图」：当前 RT / 调试重放只要被我们的合成几何（对照三角、A~J 变体）写过，
+    就在 W_S_SELF_TICKS 个 tick 内不当候选 —— boot#1 实证 pick #1 就是自己的对照三角（tri_probe.pam 逐字段相同）。 */
+ #define W_S_SELF_TICKS 400ull
+@@ -17539,6 +17546,18 @@
+ static void w_scan_tick(void)
+ {
+     if (!g_on || !g_dev || !g_q || !g_h_cp) return;
++    /* M143A（提案）：一帧最多 W_S_TICKS_PER_FRAME 次 tick。draw_flush 每帧跑 12.5 次（= bpf 12.7），
++       每次都付一整轮 CB 分配 + vkQueueSubmit + 栅栏等待（7.45 ms，且持 g_vkq_lock 与 guest 提交互斥），
++       而选源/刷新本身只对「帧」有意义（W_S_MIN_FULL_US=400 ms 才是整幅回读的真实节流）。
++       语义后果：RT 表轮转一圈从 64 tick(≈1.8 s) 变成 64 帧（2.8 fps 下 ≈23 s）；换源反应时间同量级变慢。
++       要不要顺带把 W_S_PER_TICK 4→8 补回轮转速度，需真机 A/B 后再定。 */
++    {
++        const unsigned long long fr = r_frame_now();
++        if (fr == g_w_tick_frame) {
++            if (g_w_tick_in_frame >= W_S_TICKS_PER_FRAME) { g_w_tick_skip++; return; }
++            g_w_tick_in_frame++;
++        } else { g_w_tick_frame = fr; g_w_tick_in_frame = 1; }
++    }
+     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+     unsigned long long now = (unsigned long long)ts.tv_sec * 1000000ull + (unsigned long long)ts.tv_nsec / 1000ull;
+     g_s_ticks++;
+@@ -17729,12 +17748,12 @@
+         vk_boot_logf("[w] world stat ticks=%llu probes=%llu full=%llu/%u att=%u rej=%llu layskip=%u "
+                      "self=%u picks=%llu refresh=%llu clamps=%llu dim=%llu blend=%llu bskip=%llu "
+                      "unchg=%llu lowsc=%llu rj=%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu "
+-                     "best=%.1f%%/%u score=%.3f (t=%.0fs)",
++                     "best=%.1f%%/%u score=%.3f tskip=%llu (t=%.0fs)",
+                      g_s_ticks, g_s_probes, g_w_caps, (unsigned)W_S_MAX_FULL, g_w_att, g_w_rej,
+                      g_w_layskip, g_s_self_skips, g_w_picks, g_w_refresh, g_w_keep_noop, g_w_dim,
+                      g_blend_n, g_blend_skip, g_w_unchg, g_w_lowsc,
+                      g_w_rj_ls, g_w_rj_lh, g_w_rj_fp, g_w_rj_fl, g_w_rj_cl, g_w_rj_wp, g_w_rj_mg, g_w_rj_qdim,
+-                     g_w_best_col, g_w_best_mean, g_w_best_score,
++                     g_w_best_col, g_w_best_mean, g_w_best_score, g_w_tick_skip,
+                      (double)(now / 1000000ull));
+     }
+     /* M4bt P3（取证，不改上屏内容）：暗 RT 每 boot 落 ≤3 张，间隔 ≥40 s，看它是不是整幅单色。

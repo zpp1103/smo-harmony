@@ -1,0 +1,29 @@
+{
+  "app": {
+    "signingConfigs": [],
+    "products": [
+      {
+        "name": "default",
+        "compatibleSdkVersion": "6.0.0(20)",
+        "runtimeOS": "HarmonyOS",
+        "buildOption": {
+          "externalNativeOptions": {
+            "path": "./src/main/cpp/CMakeLists.txt",
+            "arguments": [],
+            "abiFilters": ["arm64-v8a"],
+            "cppFlags": "-std=c17 -O2",
+            "targets": ["libgame.so"]
+          }
+        }
+      }
+    ],
+    "buildModeSet": [{ "name": "release" }, { "name": "debug" }]
+  },
+  "modules": [
+    {
+      "name": "entry",
+      "srcPath": "./entry",
+      "targets": [{ "name": "default", "applyToProducts": ["default"] }]
+    }
+  ]
+}

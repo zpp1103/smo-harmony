@@ -1,0 +1,478 @@
+--- mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c
++++ mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c
+@@ -219,8 +219,189 @@
+ static inline void m40am_submit_hit(int has_fence)
+ { atomic_fetch_add_explicit(&g_m40am_submit, 1ull, memory_order_relaxed);
+   if (has_fence) atomic_fetch_add_explicit(&g_m40am_submit_f, 1ull, memory_order_relaxed); }
++/* ================= M108A（2026-11-14）：性能剖面「一帧 3.5–4.6 s 花在哪」 =================
++   派活单 M108A：把一帧拆成 record / submit / fence_wait / present / blit / other 六段，并给热点 API
++   计数 + 累计耗时，回答「一帧 4 s 是我们的翻译层贵，还是游戏本身贵」。
++   knob `smo_m108a`（app 启动自种，缺省 0 = 关）：
++     0 = 关态：本块每个 hook 第一句即 `if (g_m108a_v <= 0) return;` ⇒ **零采样、零输出、零额外调用**，
++         行为逐字节等于 M107A；
++     1 = `[m108a] pf`（每帧一行）+ `[m108a] sum`（每 30 s 一行）；
++     2 = 再加 `[m108a] hot`（每 30 s、每 API 一行）。
++   采样纪律：每帧 clock_gettime(CLOCK_MONOTONIC) ≤ 30 次（M108A_SAMP_MAX 硬预算；预算用尽后
++   m108a_ns() 返回 0 ⇒ 该次计时自动跳过，**计数照记**，不篡改数据、不静默失败）。
++   六段互不重叠（缺口全给 oth）：
++     rec   = 一批 draw 的录制段（本批首笔 → 该批 submit 之前）
++     sub   = vkQueueSubmit 本身（含 SwiftShader 软渲染任务入队）
++     fence = vkWaitForFences 等待（**复用 M40AL 已取的两枚时间戳 ⇒ 零额外采样**）
++     pres  = present 的其余工作（拷贝录制 → map/memcpy → win_fill flush），已扣掉其中的 sub/fence/blit
++     blit  = M106A 那条 vkCmdBlitImage 的录制段
++     oth   = total − (rec+sub+fence+pres+blit) = 游戏逻辑 / 其它线程 / 被上屏门挡掉的帧
++   total = 相邻两次 present 收口之间的墙钟（帧边界 = present 收口；被挡掉的帧并入下一帧的 oth）。
++   计数口径：draws/verts = 本帧 draw 调用笔数/顶点次；rp = vkCmdBeginRenderPass 次数；
++   pubs/imgs/bufs/allocs/dset = 建管线/建图/建缓冲/分配显存/更新描述符次数；submits/fences = 提交/栅栏次数。
++   **进程级**：上传/心跳/回读线程的 submit/fence 也落在同一帧窗内（数量小，hot 的 n 可甄别）。
++   输出样例（数字是**示例**，不是真机数据）：
++     [m108a] pf call=1620 app_t=512345 total=4120 rec=820 sub=210 fence=2650(n=6) pres=180 blit=1 oth=259 draws=231 rp=9 verts=18432 pubs=0 imgs=0 bufs=0 allocs=0 dset=12 submits=6
++     [m108a] sum t=512 frames=8 avg_total=4100 avg_rec=800 avg_fence=2600 avg_pres=180 max=4600 pubs=0 imgs=0 allocs=0 dset=96
++     [m108a] hot name=fence n=48 ms=21200 max=3400 */
++#define M108A_SAMP_MAX 30u
++#define M108A_H_N 11
++enum { M108A_H_SUBMIT = 0, M108A_H_FENCE, M108A_H_PIPE, M108A_H_DSET, M108A_H_IMG,
++       M108A_H_BUF, M108A_H_ALLOC, M108A_H_COPY, M108A_H_BLIT, M108A_H_LRU, M108A_H_DRAW };
++typedef struct { const char *name; unsigned long long n, ns, mx; } m108a_hot_t;
++static m108a_hot_t g_m108a_hot[M108A_H_N] = {
++    { "submit" }, { "fence" }, { "pipe_create" }, { "dset_update" }, { "img_create" },
++    { "buf_create" }, { "mem_alloc" }, { "copy_img2buf" }, { "blit" }, { "lru_evict" },
++    { "draw_rec" }
++};
++static int g_m108a_v = -2;                   /* -2 = 尚未读文件；0 = 关（缺省）；1 = pf+sum；2 = +hot */
++static unsigned g_m108a_samp;                /* 本帧已用采样数（≤ M108A_SAMP_MAX） */
++static unsigned long long g_m108a_seg[5];    /* [0]rec [1]sub [2]fence [3]pres [4]blit（ns，本帧） */
++static unsigned long long g_m108a_c_draws, g_m108a_c_verts, g_m108a_c_rp, g_m108a_c_pubs;
++static unsigned long long g_m108a_c_imgs, g_m108a_c_bufs, g_m108a_c_allocs, g_m108a_c_dset;
++static unsigned long long g_m108a_c_submits, g_m108a_c_fences;
++static unsigned long long g_m108a_t_rec, g_m108a_rec_open;
++static unsigned long long g_m108a_call;                    /* 当前帧的 present 序号（pf 的 call=） */
++static unsigned long long g_m108a_t_pres, g_m108a_t_last_end;
++static unsigned long long g_m108a_pres_sub0, g_m108a_pres_fen0, g_m108a_pres_blt0;
++static unsigned long long g_m108a_w_t0, g_m108a_w_frames, g_m108a_w_total, g_m108a_w_rec;
++static unsigned long long g_m108a_w_fence, g_m108a_w_pres, g_m108a_w_max;
++static unsigned long long g_m108a_w_pubs, g_m108a_w_imgs, g_m108a_w_allocs, g_m108a_w_dset;
++static unsigned long long g_m108a_knob_t, g_m108a_last_lru;
++static int g_m108a_w_open;
++
++/* 取一枚 CLOCK_MONOTONIC 纳秒戳；关态/预算用尽 ⇒ 返回 0（调用点必须当「这次不计时」处理）。 */
++static inline unsigned long long m108a_ns(void)
++{
++    struct timespec ts;
++    if (g_m108a_v <= 0) return 0;
++    if (g_m108a_samp >= M108A_SAMP_MAX) return 0;
++    g_m108a_samp++;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
++}
++static inline void m108a_seg_add(int s, unsigned long long d)
++{
++    if (g_m108a_v <= 0 || s < 0 || s >= 5) return;
++    g_m108a_seg[s] += d;
++}
++static inline void m108a_hot_ns(int i, unsigned long long d)
++{
++    m108a_hot_t *h;
++    if (g_m108a_v <= 0 || i < 0 || i >= M108A_H_N) return;
++    h = &g_m108a_hot[i];
++    h->n++;
++    h->ns += d;
++    if (d > h->mx) h->mx = d;
++}
++static inline void m108a_hot_add(int i, unsigned long long t0, unsigned long long t1)
++{
++    if (g_m108a_v <= 0 || !t0 || !t1 || t1 < t0) return;
++    m108a_hot_ns(i, t1 - t0);
++}
++static inline void m108a_rp_hit(void) { if (g_m108a_v > 0) g_m108a_c_rp++; }
++static inline void m108a_copy_hit(void)
++{
++    if (g_m108a_v <= 0) return;
++    g_m108a_hot[M108A_H_COPY].n++;
++}
++/* 每笔 draw：纯计数 + 「本批录制段」起点（每批只花一次采样）。 */
++static inline void m108a_draw_hit(unsigned nv)
++{
++    unsigned long long t;
++    if (g_m108a_v <= 0) return;
++    g_m108a_c_draws++;
++    g_m108a_c_verts += (unsigned long long)nv;
++    g_m108a_hot[M108A_H_DRAW].n++;
++    if (g_m108a_rec_open) return;
++    t = m108a_ns();
++    if (t) { g_m108a_rec_open = 1; g_m108a_t_rec = t; }
++}
++static void m108a_blit_close(unsigned long long t0)
++{
++    unsigned long long t1;
++    if (g_m108a_v <= 0 || !t0) return;
++    t1 = m108a_ns();
++    if (!t1 || t1 < t0) return;
++    m108a_seg_add(4, t1 - t0);
++    m108a_hot_add(M108A_H_BLIT, t0, t1);
++}
++/* vkQueueSubmit 收口：关态原样透传（一条分支都不多）；开态同时收「本批录制段」+ 提交段 + 提交计数。 */
++static VkResult m108a_queue_submit(VkQueue q, uint32_t n, const VkSubmitInfo *si, VkFence f)
++{
++    unsigned long long t0, t1;
++    VkResult r;
++    if (g_m108a_v <= 0) return vkQueueSubmit(q, n, si, f);
++    t0 = m108a_ns();
++    if (g_m108a_rec_open) {                 /* 本批录制到此收口（submit 起点即录制终点） */
++        if (t0) m108a_seg_add(0, t0 - g_m108a_t_rec);
++        g_m108a_rec_open = 0;
++    }
++    r = vkQueueSubmit(q, n, si, f);
++    t1 = m108a_ns();
++    if (t0 && t1 && t1 >= t0) m108a_seg_add(1, t1 - t0);
++    m108a_hot_add(M108A_H_SUBMIT, t0, t1);
++    g_m108a_c_submits++;
++    return r;
++}
++static void m108a_update_ds(VkDevice d, uint32_t w, const VkWriteDescriptorSet *p, uint32_t c,
++                            const VkCopyDescriptorSet *pc)
++{
++    unsigned long long t0, t1;
++    if (g_m108a_v <= 0) { vkUpdateDescriptorSets(d, w, p, c, pc); return; }
++    g_m108a_c_dset++;
++    t0 = m108a_ns();
++    vkUpdateDescriptorSets(d, w, p, c, pc);
++    t1 = m108a_ns();
++    m108a_hot_add(M108A_H_DSET, t0, t1);
++}
++static VkResult m108a_create_image(VkDevice d, const VkImageCreateInfo *ci,
++                                   const VkAllocationCallbacks *ac, VkImage *out)
++{
++    unsigned long long t0, t1;
++    VkResult r;
++    if (g_m108a_v <= 0) return vkCreateImage(d, ci, ac, out);
++    g_m108a_c_imgs++;
++    t0 = m108a_ns();
++    r = vkCreateImage(d, ci, ac, out);
++    t1 = m108a_ns();
++    m108a_hot_add(M108A_H_IMG, t0, t1);
++    return r;
++}
++static VkResult m108a_create_buffer(VkDevice d, const VkBufferCreateInfo *ci,
++                                    const VkAllocationCallbacks *ac, VkBuffer *out)
++{
++    unsigned long long t0, t1;
++    VkResult r;
++    if (g_m108a_v <= 0) return vkCreateBuffer(d, ci, ac, out);
++    g_m108a_c_bufs++;
++    t0 = m108a_ns();
++    r = vkCreateBuffer(d, ci, ac, out);
++    t1 = m108a_ns();
++    m108a_hot_add(M108A_H_BUF, t0, t1);
++    return r;
++}
++static VkResult m108a_alloc_mem(VkDevice d, const VkMemoryAllocateInfo *ai,
++                                const VkAllocationCallbacks *ac, VkDeviceMemory *out)
++{
++    unsigned long long t0, t1;
++    VkResult r;
++    if (g_m108a_v <= 0) return vkAllocateMemory(d, ai, ac, out);
++    g_m108a_c_allocs++;
++    t0 = m108a_ns();
++    r = vkAllocateMemory(d, ai, ac, out);
++    t1 = m108a_ns();
++    m108a_hot_add(M108A_H_ALLOC, t0, t1);
++    return r;
++}
++/* 四个高频热点走宏旁路（关态 = 一次 `g_m108a_v<=0` 分支 + 原调用，逐字旧行为）：
++   dset = 描述符更新、img/buf = 建图/建缓冲、alloc = 分配显存。 */
++#define vkUpdateDescriptorSets(_d, _w, _p, _c, _pc) m108a_update_ds((_d), (_w), (_p), (_c), (_pc))
++#define vkCreateImage(_d, _ci, _ac, _o) m108a_create_image((_d), (_ci), (_ac), (_o))
++#define vkCreateBuffer(_d, _ci, _ac, _o) m108a_create_buffer((_d), (_ci), (_ac), (_o))
++#define vkAllocateMemory(_d, _ai, _ac, _o) m108a_alloc_mem((_d), (_ai), (_ac), (_o))
+ #define vkQueueSubmit(_q, _c, _si, _f) \
+-    (m40am_submit_hit((_f) != VK_NULL_HANDLE), vkQueueSubmit((_q), (_c), (_si), (_f)))
++    (m40am_submit_hit((_f) != VK_NULL_HANDLE), m108a_queue_submit((_q), (_c), (_si), (_f)))
+ #define vkQueuePresentKHR(_q, _pi) \
+     (atomic_fetch_add_explicit(&g_m40am_present, 1ull, memory_order_relaxed), vkQueuePresentKHR((_q), (_pi)))
+ #define vkAcquireNextImageKHR(_d, _sc, _to, _sem, _f, _pi) \
+@@ -685,7 +866,7 @@
+         atomic_fetch_add_explicit(&g_m40ao_rp0, 1ull, memory_order_relaxed);
+ }
+ #define vkCmdBeginRenderPass(_cb, _rp, _c) \
+-    (m40ao_rp_begin(_rp), vkCmdBeginRenderPass((_cb), (_rp), (_c)))
++    (m40ao_rp_begin(_rp), m108a_rp_hit(), vkCmdBeginRenderPass((_cb), (_rp), (_c)))
+ #define vkCmdEndRenderPass(_cb) \
+     (m40ao_rp_end(), vkCmdEndRenderPass(_cb))
+ #define vkCmdClearColorImage(_cb, _img, _lay, _pc, _n, _pr) \
+@@ -705,6 +886,7 @@
+      vkCmdCopyBufferToImage((_cb), (_sb), (_di), (_dl), (_nr), (_pr)))
+ #define vkCmdCopyImageToBuffer(_cb, _si, _sl, _db, _nr, _pr) \
+     (atomic_fetch_add_explicit(&g_m40ao_copy, 1ull, memory_order_relaxed), \
++     m108a_copy_hit(), \
+      vkCmdCopyImageToBuffer((_cb), (_si), (_sl), (_db), (_nr), (_pr)))
+ #define vkCmdBlitImage(_cb, _si, _sl, _di, _dl, _nr, _pr, _fl) \
+     (atomic_fetch_add_explicit(&g_m40ao_copy, 1ull, memory_order_relaxed), \
+@@ -863,6 +1045,15 @@
+     clock_gettime(CLOCK_MONOTONIC, &m40al_b);
+     if (away) runtime_core_back(&away);
+     m40al_wait_add(m40al_a, m40al_b);   /* M40AL：wait_n/wait_us 累计（同一对计数器，与排空共用） */
++    /* M108A（v<=0 立即返回）：fence 段直接复用上面 M40AL 已取的两枚时间戳 ⇒ **零额外采样**。 */
++    if (g_m108a_v > 0) {
++        long long m108a_d = (long long)(m40al_b.tv_sec - m40al_a.tv_sec) * 1000000000LL
++                            + (long long)(m40al_b.tv_nsec - m40al_a.tv_nsec);
++        if (m108a_d < 0) m108a_d = 0;
++        m108a_seg_add(2, (unsigned long long)m108a_d);
++        m108a_hot_ns(M108A_H_FENCE, (unsigned long long)m108a_d);
++        g_m108a_c_fences++;
++    }
+     return r;
+ }
+ 
+@@ -1096,6 +1287,14 @@
+     }
+     if (ser) pthread_mutex_unlock(&g_m40ai_mtx);
+     clock_gettime(CLOCK_MONOTONIC, &t1);
++    /* M108A（v<=0 立即返回）：建管线段复用上面已有的 t0/t1 ⇒ 零额外采样。 */
++    if (g_m108a_v > 0) {
++        long long m108a_d = (long long)(t1.tv_sec - t0.tv_sec) * 1000000000LL
++                            + (long long)(t1.tv_nsec - t0.tv_nsec);
++        if (m108a_d < 0) m108a_d = 0;
++        m108a_hot_ns(M108A_H_PIPE, (unsigned long long)m108a_d);
++        g_m108a_c_pubs++;
++    }
+     { unsigned long long us = (unsigned long long)((t1.tv_sec - t0.tv_sec) * 1000000LL + (t1.tv_nsec - t0.tv_nsec) / 1000);
+       if (us > 100000000ull) us = 100000000ull;   /* 防御：>100 s 视为异常，钳住避免污染均值 */
+       atomic_fetch_add_explicit(&g_m40ai_n, 1ull, memory_order_relaxed);
+@@ -23789,7 +23988,186 @@
+     g_m107a_rd = w;
+     m107a_reset_frame();
+ }
++
++/* ================= M108A（present 侧）：knob + 帧切分收口 + pf/sum/hot 输出 =================
++   帧边界 = present 收口（或下一次 present 的入口，用于「被上屏门挡掉的那一帧」）。
++   窗口内 rec/sub/fence 由各 hook 当场累加；pres 用 present 起止两枚时间戳反解并扣掉 present 自身的
++   submit/fence/blit；其余差额全记 oth ⇒ 六段之和 + oth == total。 */
++#define M108A_A P_SLOT_DIR_A "/smo_m108a"
++#define M108A_B P_SLOT_DIR_B "/smo_m108a"
+ 
++static void m108a_reset_frame(void)
++{
++    int i;
++    for (i = 0; i < 5; i++) g_m108a_seg[i] = 0;
++    g_m108a_c_draws = 0; g_m108a_c_verts = 0; g_m108a_c_rp = 0; g_m108a_c_pubs = 0;
++    g_m108a_c_imgs = 0; g_m108a_c_bufs = 0; g_m108a_c_allocs = 0; g_m108a_c_dset = 0;
++    g_m108a_c_submits = 0; g_m108a_c_fences = 0;
++    g_m108a_rec_open = 0; g_m108a_t_rec = 0;
++}
++static void m108a_reset_window(unsigned long long tns)
++{
++    int i;
++    for (i = 0; i < M108A_H_N; i++) { g_m108a_hot[i].n = 0; g_m108a_hot[i].ns = 0; g_m108a_hot[i].mx = 0; }
++    g_m108a_w_t0 = tns;
++    g_m108a_w_open = tns ? 1 : 0;
++    g_m108a_w_frames = 0; g_m108a_w_total = 0; g_m108a_w_rec = 0;
++    g_m108a_w_fence = 0; g_m108a_w_pres = 0; g_m108a_w_max = 0;
++    g_m108a_w_pubs = 0; g_m108a_w_imgs = 0; g_m108a_w_allocs = 0; g_m108a_w_dset = 0;
++}
++/* knob 换档：帧边界与窗口一律重立基线（否则新档第一帧会把旧档的时间算进来）。 */
++static void m108a_apply_knob(int v)
++{
++    g_m108a_v = v;
++    g_m108a_t_last_end = 0;
++    g_m108a_t_pres = 0;
++    g_m108a_last_lru = g_rt_img_lru;
++    m108a_reset_frame();
++    m108a_reset_window(0);
++}
++/* knob 文件必须 app 自己先建（hdc 在沙箱里建不出新文件；hdc 只能改写已有文件）。
++   force=1 ⇒ 立刻读一次（「关态也要能切上来」与首次 seed）；force=0 ⇒ 开态按 2 s 节流重读；
++   值变化立刻打 `[m108a] sw knob -> val=`（M104A 教训：knob 未生效不许当结果）。 */
++static int m108a_knob_poll(unsigned long long tns, int force)
++{
++    if (g_m108a_v == -2) {
++        const char *p[2] = { M108A_A, M108A_B };
++        int have = 0, i;
++        for (i = 0; i < 2 && !have; i++) { FILE *f = fopen(p[i], "r"); if (f) { fclose(f); have = 1; } }
++        for (i = 0; i < 2 && !have; i++) {
++            FILE *f = fopen(p[i], "wb");
++            if (f) { fputs("0\n", f); fclose(f); have = 1; }
++        }
++        m108a_apply_knob(p_file_int(M108A_A, M108A_B, 0));
++        g_m108a_knob_t = tns;
++        vk_boot_logf("[m108a] sw knob -> val=%d (seed)", g_m108a_v);
++        return g_m108a_v;
++    }
++    if (!force) {
++        if (!tns) return g_m108a_v;
++        if (!g_m108a_knob_t) { g_m108a_knob_t = tns; return g_m108a_v; }
++        if (tns - g_m108a_knob_t < 2000000000ull) return g_m108a_v;
++    }
++    {
++        const int v = p_file_int(M108A_A, M108A_B, 0);
++        g_m108a_knob_t = tns;
++        if (v != g_m108a_v) {
++            m108a_apply_knob(v);
++            vk_boot_logf("[m108a] sw knob -> val=%d", g_m108a_v);
++        }
++    }
++    return g_m108a_v;
++}
++static void m108a_frame_close(unsigned long long t_end, unsigned long long call, int pres_done, int ok);
++
++/* 关态也要 poll：否则 hdc 把 0 改 1 之后永远切不上来（每次 present 一次 fopen，~4 s 一次）。
++   开态才清采样计数、记 present 起点与三段基线；若上一帧被上屏门挡掉（没走到收口），就在这次
++   帧边界按「该帧没有 present 段」收口 —— 否则 8 次降采样会让 pf 变成 8 帧一行。 */
++static void m108a_pres_begin(unsigned long long call)
++{
++    unsigned long long t;
++    if (g_m108a_v <= 0) {
++        (void)m108a_knob_poll(0, 1);
++        if (g_m108a_v <= 0) return;
++    }
++    g_m108a_samp = 0;
++    t = m108a_ns();
++    if (g_m108a_t_pres && t) {
++        m108a_frame_close(t, g_m108a_call, 0, 1);
++        g_m108a_samp = 0;
++        t = m108a_ns();
++    }
++    if (!t) return;
++    g_m108a_call = call;
++    g_m108a_pres_sub0 = g_m108a_seg[1];
++    g_m108a_pres_fen0 = g_m108a_seg[2];
++    g_m108a_pres_blt0 = g_m108a_seg[4];
++    g_m108a_t_pres = t;
++}
++static void m108a_pres_end(unsigned long long call, int ok)
++{
++    unsigned long long t_end;
++    if (g_m108a_v <= 0) return;
++    t_end = m108a_ns();
++    if (!t_end) return;
++    if (m108a_knob_poll(t_end, 0) <= 0) {     /* 本帧内被关掉 ⇒ 丢数据、清帧，不打半帧 */
++        g_m108a_t_pres = 0;
++        m108a_reset_frame();
++        return;
++    }
++    if (!g_m108a_t_pres) return;              /* begin 没立起（预算用尽）⇒ 本帧不计，不产出半帧 */
++    m108a_frame_close(t_end, call, 1, ok);
++}
++/* 帧收口：算出六段与计数 → 打 pf → 进 30 s 窗口（够 30 s 就打 sum，=2 时再打 hot）→ 清帧。 */
++static void m108a_frame_close(unsigned long long t_end, unsigned long long call, int pres_done, int ok)
++{
++    unsigned long long total, pres_ns = 0, seg_sum, oth, lru;
++    (void)ok;                                 /* 失败帧与成功帧同一口径（失败由 oth/计数体现） */
++    lru = g_rt_img_lru;                       /* id-img LRU 淘汰：纯计数（不占采样） */
++    if (lru > g_m108a_last_lru) g_m108a_hot[M108A_H_LRU].n += lru - g_m108a_last_lru;
++    g_m108a_last_lru = lru;
++    if (!g_m108a_t_last_end) {                /* 首帧（或刚换档）：只立基线，不下结论 */
++        g_m108a_t_last_end = t_end;
++        g_m108a_t_pres = 0;
++        m108a_reset_frame();
++        return;
++    }
++    total = (t_end > g_m108a_t_last_end) ? t_end - g_m108a_t_last_end : 0;
++    if (pres_done && g_m108a_t_pres && t_end > g_m108a_t_pres) {
++        pres_ns = t_end - g_m108a_t_pres;
++        {   /* present 段扣掉 present 自己的 submit/fence/blit（它们已单独成段，不能重复计） */
++            unsigned long long sd = g_m108a_seg[1] - g_m108a_pres_sub0;
++            unsigned long long fd = g_m108a_seg[2] - g_m108a_pres_fen0;
++            unsigned long long bd = g_m108a_seg[4] - g_m108a_pres_blt0;
++            if (sd + fd + bd >= pres_ns) pres_ns = 0;
++            else pres_ns -= sd + fd + bd;
++        }
++    }
++    g_m108a_seg[3] = pres_ns;
++    seg_sum = g_m108a_seg[0] + g_m108a_seg[1] + g_m108a_seg[2] + pres_ns + g_m108a_seg[4];
++    oth = (total > seg_sum) ? total - seg_sum : 0;
++    vk_boot_logf("[m108a] pf call=%llu app_t=%llu total=%llu rec=%llu sub=%llu fence=%llu(n=%llu) "
++                 "pres=%llu blit=%llu oth=%llu draws=%llu rp=%llu verts=%llu pubs=%llu imgs=%llu "
++                 "bufs=%llu allocs=%llu dset=%llu submits=%llu",
++                 call, t_end / 1000000ull, total / 1000000ull, g_m108a_seg[0] / 1000000ull,
++                 g_m108a_seg[1] / 1000000ull, g_m108a_seg[2] / 1000000ull, g_m108a_c_fences,
++                 pres_ns / 1000000ull, g_m108a_seg[4] / 1000000ull, oth / 1000000ull,
++                 g_m108a_c_draws, g_m108a_c_rp, g_m108a_c_verts, g_m108a_c_pubs, g_m108a_c_imgs,
++                 g_m108a_c_bufs, g_m108a_c_allocs, g_m108a_c_dset, g_m108a_c_submits);
++    g_m108a_w_frames++;
++    g_m108a_w_total += total;
++    g_m108a_w_rec += g_m108a_seg[0];
++    g_m108a_w_fence += g_m108a_seg[2];
++    g_m108a_w_pres += pres_ns;
++    if (total > g_m108a_w_max) g_m108a_w_max = total;
++    g_m108a_w_pubs += g_m108a_c_pubs;
++    g_m108a_w_imgs += g_m108a_c_imgs;
++    g_m108a_w_allocs += g_m108a_c_allocs;
++    g_m108a_w_dset += g_m108a_c_dset;
++    if (!g_m108a_w_open) m108a_reset_window(t_end);
++    if (g_m108a_w_open && t_end - g_m108a_w_t0 >= 30000000000ull) {
++        const unsigned long long fr = g_m108a_w_frames ? g_m108a_w_frames : 1ull;
++        vk_boot_logf("[m108a] sum t=%llu frames=%llu avg_total=%llu avg_rec=%llu avg_fence=%llu "
++                     "avg_pres=%llu max=%llu pubs=%llu imgs=%llu allocs=%llu dset=%llu",
++                     t_end / 1000000000ull, g_m108a_w_frames, g_m108a_w_total / fr / 1000000ull,
++                     g_m108a_w_rec / fr / 1000000ull, g_m108a_w_fence / fr / 1000000ull,
++                     g_m108a_w_pres / fr / 1000000ull, g_m108a_w_max / 1000000ull,
++                     g_m108a_w_pubs, g_m108a_w_imgs, g_m108a_w_allocs, g_m108a_w_dset);
++        if (g_m108a_v >= 2) {                /* 明细只在 =2 时开，避免刷爆日志 */
++            int i;
++            for (i = 0; i < M108A_H_N; i++)
++                if (g_m108a_hot[i].n)
++                    vk_boot_logf("[m108a] hot name=%s n=%llu ms=%llu max=%llu",
++                                 g_m108a_hot[i].name, g_m108a_hot[i].n,
++                                 g_m108a_hot[i].ns / 1000000ull, g_m108a_hot[i].mx / 1000000ull);
++        }
++        m108a_reset_window(t_end);
++    }
++    g_m108a_t_last_end = t_end;
++    g_m108a_t_pres = 0;
++    m108a_reset_frame();
++}
++
+ int nvn_vk_draw_elements(int mode, int type, int count, uint64_t idx, int base_vertex, int base_instance,
+                          int instances, int dclass)
+ {
+@@ -24616,6 +24994,7 @@
+     /* M38F B（只读）：draw 收口后记账 + 采样笔的 after 签名（关态立即返回，零输出）。 */
+     if (m38f_on()) m38f_draw_post(kv, kf, dvar, (unsigned)nverts, (int)count, (int)topo);
+     unsigned long long n = ++g_r_draws;
++    m108a_draw_hit((unsigned)nverts);   /* M108A：draw 笔数/顶点次 + 本批录制段起点（每批 1 次采样） */
+     /* M42E B：每帧 draw 的顶点数直方图（verts=4 满屏 quad / verts=3 三角形 / other）。判「是否进 3D
+        关卡」看 verts3 是否 >0，而不是看时间。收口点每笔一记，打印由 m42e_tick 做 20 s 闸。 */
+     if (nverts == 4) g_m42e_p_v4++;
+@@ -30629,6 +31008,7 @@
+     uint32_t cand_w = g_p_cand_w, cand_h = g_p_cand_h;
+     g_p_cand_slot = NULL; g_p_cand_img = VK_NULL_HANDLE; g_p_cand_w = g_p_cand_h = 0;
+     if (!g_on || !g_dev || !g_q || !g_h_img || (g_d_draws + g_r_draws) == 0 || !g_win) return 0;
++    m108a_pres_begin(g_p_calls + 1ull);   /* M108A：帧起点（关态 = 一次 knob poll，无采样、无输出） */
+     pthread_mutex_lock(&lock);
+     unsigned long long call = ++g_p_calls;
+     m40c_poll();   /* M40C：present 侧重读 smo_m40c；值变化 ⇒ 作废管线表（详见 m40c_poll 定义） */
+@@ -31715,6 +32095,8 @@
+        目标图 TRANSFER_DST → TRANSFER_SRC → 源槽布局**回程**到原值（别把 RT 记账改坏）。
+        随后下面既有 barrier + vkCmdCopyImageToBuffer 把目标图搬进 g_p_map ⇒ 走的就是 CH1。
+        m106a_blit=0 时本段整段不执行（关态零行为变化）。 */
++    const unsigned long long m108a_blt_t0 =
++        (g_m108a_v > 0 && m106a_blit && m106a_src && m106a_src->img && g_m106a_img) ? m108a_ns() : 0;
+     if (m106a_blit && m106a_src && m106a_src->img && g_m106a_img) {
+         const VkImageLayout sl0 = p_slot_layout(m106a_src);
+         VkAccessFlags sa; VkPipelineStageFlags ss;
+@@ -31760,6 +32142,7 @@
+         mb.image = m106a_src->img; mb.subresourceRange = rng;
+         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, ss, 0, 0, NULL, 0, NULL, 1, &mb);
+     }
++    m108a_blit_close(m108a_blt_t0);   /* M108A：blit 录制段收口（关态 t0=0 ⇒ 直接返回） */
+     /* M4x：源的布局不一定是附件态（内容源可能正好被当纹理采样着）——barrier 的 oldLayout / srcAccess
+        跟着 slay 走，回程也回到 slay，别把别的目标的状态记账改坏。 */
+     const int slay_sro = (slay == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+@@ -31845,6 +32228,7 @@
+         if (m40at) atomic_fetch_add_explicit(&g_m40at_skip_vk, 1ull, memory_order_relaxed);
+         vk_boot_logf("[p-red] present copy submit rv=%d wait rv=%d (%s)", (int)sr, (int)wr, vr(sr));
+         m68b_main_leave();   /* M68B：失败路径也要放开（否则泵会被永久跳过） */
++        m108a_pres_end(call, 0);   /* M108A：失败帧也收口（rc!=0 由 oth/fence 体现） */
+         pthread_mutex_unlock(&lock);
+         return 0;
+     }
+@@ -31945,6 +32329,8 @@
+        M4y P1：content 源每次上屏都统计（只算均值/极值，<1ms），用于 content lost 计数；行本身仍限流。 */
+     {
+         int psig_verbose = (call <= 3 || (call % 120) == 0);
++        /* M108A：本帧收口（pf/sum/hot）—— 放在既有探针之前（它们的回读属于各自 knob，不进 pres 段）。 */
++        m108a_pres_end(call, ok);
+         int psig_want = psig_verbose || !strcmp(srcname, "content") || g_p_m4ak_sig_pair;
+         /* M103A P3：一次性自证（实际拷贝的 slot/texid/simg/sel_why + staging 均值），
+            与 `[p] dump slot=N` 用同一张 g_rt_tab ⇒ 按 slot/texid 直接对齐。

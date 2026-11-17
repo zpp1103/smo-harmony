@@ -1,0 +1,166 @@
+--- mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c
++++ mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c
+@@ -28565,7 +28565,85 @@
+                  call, el, tick, g_m100a_mode, m100a_mode_name(g_m100a_mode), g_m100a_fb_total,
+                  g_m100a_fb_n0, g_m100a_fb_noid, g_m100a_fb_nosz, g_m100a_fb_big, g_m100a_fb_deny,
+                  g_m100a_keep, g_m100a_rescue, g_rt_cur ? (int)(g_rt_cur - g_rt_tab) : -1);
++}
++
++/* ===== M101A（2026-11-13）：堵掉「n=0 颜色目标 + depth 解不出 ⇒ key=0 ⇒ deny=1 ⇒ host 兜底」=====
++   M100A 定谳（logs/m100a/report.md §2.1）：本 boot 873/873 次 host 兜底全是同一条路径 ——
++   游戏这次 `SET_RENDER_TARGETS` 声明 **n=0**（tex0=NULL），且同一笔的 depth 也解不出
++   （`[o] dpass decl-miss n=0 … in_pool=-1`）⇒ `if (n<=0)` 里「纯深度 pass 不动颜色目标」的早退
++   没走到 ⇒ 落进通用路径时 key=0/rw=rh=0 ⇒ h_rt_ensure deny=1 ⇒ h_rt_switch(NULL) ⇒ g_rt_cur=NULL
++   ⇒ 从这一刻起每笔颜色 draw 都进 1280x720 的宿主**死图**（只写不读，present 从不枚举它）。
++   本块默认生效，`smo_m101a=0` 一键回退；`smo_m100a=1/2` 仍然优先（回到 M100A 的两种救回模式）：
++     P1 keep-cur：n<=0 且 depth 解不出 ⇒ **保持当前颜色目标**（g_r_donly 保持 NULL），早退；
++        不把 key/w/h 置 0 去调 h_rt_ensure ⇒ 不会再有 h_rt_switch(NULL)。
++        M100A mode1 已在真机证明这条路（host 桶冻结、被救的笔落 slot28/53/56/12 且逐 tick 增长）。
++     P2 hard-ban：任何「key 或尺寸为 0」的绑定都不再走 host 兜底（早退 + 有界日志），
++        作为「不可再到」的护栏，防止别的 n>0 miss 分支再把 g_rt_cur 打成 NULL。
++     P3 depth decl-miss 兜底：n<=0 且 depth 声明解不出时，按「深度槽存储身份 → 最近一次 n=0 纯深度
++        pass 的深度槽（= 同 pass 上一帧的目标）→ 当前颜色目标已挂的深度」三级找一张深度目标；
++        找到且与当前颜色目标同尺寸就补挂上去（只补深度附件，不动颜色目标），并打一行有界
++        `[m101a] dpass fallback`。
++     为什么 P3 **不**设 g_r_donly：g_r_donly 非空 ⇒ draw 走 dvar 3/4（仅深度通道），片元颜色不写、
++       也不计槽 writers（g_slot_dw_all 只在 dvar<3 时累加）⇒ 那批 3D draw 会从「落回真槽」变成
++       什么都没写，与本单目标（让 draw 落回真 RT 槽、让 present 有内容可送）正好相反。
++   关态（m101a_on()==0 且 smo_m100a==0）：逐字等于 M100A 的 mode0（落宿主图、照旧计数）。 */
++#define M101A_SW_A "/data/storage/el2/base/files/smo_m101a"
++#define M101A_SW_B "/data/app/el2/100/base/com.vibecc.smo/files/smo_m101a"
++static unsigned long long g_m101a_keep, g_m101a_fb_ds, g_m101a_attach, g_m101a_ban, g_m101a_nocur;
++static h_d_slot *g_m101a_lastds;    /* 最近一次 n=0 纯深度 pass 真的用过的深度槽 */
++static int g_m101a_sw = -1;
++static int m101a_on(void)
++{
++    static unsigned long long last;
++    if (g_m101a_sw < 0) {
++        p_file_seed(M101A_SW_A, M101A_SW_B);       /* 缺省文件 = -1 ⇒ 视为开（默认生效） */
++        g_m101a_sw = p_file_int(M101A_SW_A, M101A_SW_B, 1);
++        last = (unsigned long long)r_now_ms();
++        vk_boot_logf("[m101a] sw init on=%d (1=fix n0/depth-miss host fallback, 0=old M100A mode0)",
++                     g_m101a_sw != 0);
++        return g_m101a_sw != 0;
++    }
++    if ((unsigned long long)r_now_ms() - last >= 3000ull) {
++        const int v = p_file_int(M101A_SW_A, M101A_SW_B, 1);
++        last = (unsigned long long)r_now_ms();
++        if ((v != 0) != (g_m101a_sw != 0)) {
++            vk_boot_logf("[m101a] sw on=%d -> on=%d (runtime switch)", g_m101a_sw != 0, v != 0);
++            g_m101a_sw = v;
++        }
++    }
++    return g_m101a_sw != 0;
++}
++/* P3：n=0 且 depth 声明解不出时的深度兜底。返回深度槽（找不到 = NULL）。
++   *src：1 = 按存储身份/同 pass 上一帧的深度槽命中，2 = 当前颜色目标已挂的那张（沿用），0 = 没有。 */
++static h_d_slot *m101a_dpass_depth(uint64_t raw, int *src)
++{
++    h_d_slot *ds = NULL;
++    if (src) *src = 0;
++    if (raw) {
++        ds = h_d_lookup(raw, 0, 0);          /* 少数情况下 raw 本身就是深度存储身份 */
++        if (!ds) ds = r_dslot_by_store(raw); /* 或它本来就是池存储地址 */
++        if (ds && src) *src = 1;
++    }
++    if (!ds && g_m101a_lastds && g_m101a_lastds->img) {
++        ds = g_m101a_lastds;                 /* 「沿用同 pass 上一帧的 depth 目标」 */
++        if (src) *src = 1;
++    }
++    if (!ds && g_rt_cur && g_rt_cur->ds) {
++        ds = g_rt_cur->ds;                   /* 当前颜色目标已经挂着的那张（沿用，不换） */
++        if (src) *src = 2;
++    }
++    return ds;
+ }
++static void m101a_win_line(unsigned long long call, unsigned long long el, unsigned long long tick)
++{
++    (void)m101a_on();   /* 懒初始化：本 boot 若一次 n=0 兜底都没发生，也把开关状态打出来 */
++    vk_boot_logf("[m101a] win pipe=%llu t=%llus tick=%llu on=%d keep_cur=%llu dpass_depth=%llu "
++                 "dpass_attach=%llu ban=%llu nocur=%llu host_verts_cum=%llu host_draws_cum=%llu "
++                 "cur_slot=%d m100a_mode=%d",
++                 call, el, tick, g_m101a_sw != 0, g_m101a_keep, g_m101a_fb_ds, g_m101a_attach,
++                 g_m101a_ban, g_m101a_nocur, g_wp_verts_host, g_wp_draws_host,
++                 g_rt_cur ? (int)(g_rt_cur - g_rt_tab) : -1, g_m100a_mode);
++}
+ 
+ static void wp_tick(unsigned long long call)
+ {
+@@ -28624,6 +28702,7 @@
+             /* M100A：同一窗口的精确 (vs,fs) 分布 + 兜底原因/模式（各一行，60 s 一条） */
+             if (g_m100a_hk_n) m100a_hk_line(call, el, g_wp_ticks);
+             m100a_hf_line(call, el, g_wp_ticks);
++            m101a_win_line(call, el, g_wp_ticks);   /* M101A：每 tick 一行（即使一次兜底都没发生） */
+         }
+     }
+ 
+@@ -30673,6 +30752,7 @@
+         g_r_donly = NULL;
+         h_d_slot *ds = h_d_lookup(dkey, 0, 0);
+         if (ds) {
++            g_m101a_lastds = ds;   /* M101A：记住「同 pass 上一帧的深度目标」（P3 兜底用） */
+             g_r_donly = ds;
+             g_h_dp_only++;
+             if (g_h_dp_only <= 8)
+@@ -30684,6 +30764,38 @@
+             g_h_rt_binds++;
+             return 0;
+         }
++        /* M101A P1：**n=0 且 depth 也解不出** == M100A 定谳的那 100%（873/873）。
++           保持当前颜色目标（不换图、不 flush、不把 key=0/rw=0/rh=0 送去 h_rt_ensure），
++           顺带做 P3 的深度兜底（只补深度附件，不改颜色路由）。
++           smo_m100a=1/2 优先：那两种 M100A 救回模式需要走下面的通用路径，故此处让开。 */
++        if (m101a_on() && m100a_sw() == 0) {
++            int dsrc = 0;
++            h_d_slot *fd = m101a_dpass_depth(dkey, &dsrc);
++            if (dsrc == 1 && fd) g_m101a_lastds = fd;
++            if (fd) g_m101a_fb_ds++;
++            if (fd && g_rt_cur && g_rt_cur->ds != fd &&
++                (unsigned)fd->w == (unsigned)g_rt_cur->w && (unsigned)fd->h == (unsigned)g_rt_cur->h) {
++                g_rt_cur->ds = fd;                     /* 同尺寸才补挂：尺寸不一致宁可不挂 */
++                g_rt_cur->fb_load_d = VK_NULL_HANDLE;
++                g_rt_cur->fb_d_view = VK_NULL_HANDLE;
++                g_m101a_attach++;
++            }
++            if (!g_rt_cur) g_m101a_nocur++;
++            g_m101a_keep++;
++            if (g_m101a_keep <= 8 || (g_m101a_keep % 5000) == 0)
++                vk_boot_logf("[m101a] dpass fallback #%llu n=%d raw=%#llx src=%d ds=%s(%#llx ext=%ux%u) "
++                             "cur_slot=%d %ux%u attach=%llu -> keep color target (no host fallback)",
++                             g_m101a_keep, n, (unsigned long long)dkey, dsrc,
++                             fd ? "yes" : "none", fd ? (unsigned long long)fd->key : 0ull,
++                             fd ? (unsigned)fd->w : 0u, fd ? (unsigned)fd->h : 0u,
++                             g_rt_cur ? (int)(g_rt_cur - g_rt_tab) : -1,
++                             (unsigned)g_rt_w, (unsigned)g_rt_h, g_m101a_attach);
++            if (out_img) *out_img = (unsigned long long)(uintptr_t)g_h_img;
++            if (out_w) *out_w = g_rt_w;
++            if (out_h) *out_h = g_rt_h;
++            g_h_rt_binds++;
++            return 0;
++        }
+     } else g_r_donly = NULL;
+     /* M4c：按 RT 句柄取/建 per-RT 目标；任何一步拿不到 ⇒ 回落宿主图（计数，不静默）。 */
+     h_rt_slot *s = NULL;
+@@ -30799,6 +30911,22 @@
+                              m100a_m, m100a_mode_name(m100a_m), s ? "rescued" : "host",
+                              s ? (int)(s - g_rt_tab) : -1);
+         }
++        /* M101A P2：**硬禁 key=0（或尺寸 0）进 host 兜底**。这是「不可再到」的护栏：
++           h_rt_ensure 对 !key||!w||!h 必返 NULL，再往前走就是 h_rt_switch(NULL) ⇒ 宿主死图。
++           保持当前颜色目标并早退（M100A 的两种救回模式在上面已把 s 填上，不会走到这里）。 */
++        if (!s && m101a_on() && (!key || !rw || !rh)) {
++            g_m101a_ban++;
++            if (g_m101a_ban <= 4 || (g_m101a_ban % 20000) == 0)
++                vk_boot_logf("[m101a] ban #%llu n=%d key=%#llx %ux%u deny=%d -> keep cur slot=%d "
++                             "(key=0 never goes to host fallback)",
++                             g_m101a_ban, n, (unsigned long long)key, rw, rh, g_rt_deny_why,
++                             g_rt_cur ? (int)(g_rt_cur - g_rt_tab) : -1);
++            if (out_img) *out_img = (unsigned long long)(uintptr_t)g_h_img;
++            if (out_w) *out_w = g_rt_w;
++            if (out_h) *out_h = g_rt_h;
++            g_h_rt_binds++;
++            return 0;
++        }
+         if (!s) {
+             g_h_rt_fallback++;
+             g_h_rt_last_fb = 1;

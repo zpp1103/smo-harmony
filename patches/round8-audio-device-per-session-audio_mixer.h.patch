@@ -1,0 +1,12 @@
+--- a/entry/src/main/cpp/host/audio_mixer.h
++++ b/entry/src/main/cpp/host/audio_mixer.h
+@@ -38,4 +38,9 @@
+ void audio_mixer_render(AudioRenderer *r, double seconds);   /* called with r->lock held, after audio_voices_prepare, before voices advance */
+ void audio_voices_prepare(AudioRenderer *r);                 /* audio_renderer.c: each render frame's voice state changes (flush, stop, start) */
+ int audio_buffer_empty(const AudrenWaveBuffer *b);           /* no samples to decode: played as soon as it is reached */
++/* Per-IAudioDevice-session state: one shared event, signaled once at construction
++   (= Ryujinx AudioDevice ctor Signal: device enumeration done / default output available).
++   queried: one-shot LOG of which Query command (4/11/12) the game actually uses. */
++typedef struct { uint32_t ev; uint8_t queried; } AudioDeviceState;
+ void audio_device_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs);
++void audio_device_close(void *state);

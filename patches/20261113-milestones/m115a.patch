@@ -1,0 +1,210 @@
+--- mario-odessy-harmony/entry/src/main/cpp/games/0100000000010000/game_patches.c
++++ mario-odessy-harmony/entry/src/main/cpp/games/0100000000010000/game_patches.c
+@@ -7,6 +7,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <sys/mman.h>
++#include <errno.h>   /* M115A：RX 失败分支要打 errno + strerror */
+ 
+ /* Odyssey 1.3.0 / 1.4.1 (the same executables): the render size patches below (key 3). Each site is checked against the
+    original instruction before it is written, as CONTRIBUTING.md asks. Key 4 writes camera fields at the present instead
+@@ -3827,10 +3828,83 @@
+         int mode = (b[0] >= '0' && b[0] <= '2') ? b[0] - '0' : 0;
+         if (limit) *limit = (n > 1 && b[1] >= '1' && b[1] <= '3') ? b[1] - '0' : 1;
+         return mode;
++    }
++    return 0;
++}
++/* ═════════ M115A（2026-11-14）：门安装 RX 失败的取证 + 非致命开关 smo_obs_gate_fatal ═════════
++   目标（上一单 M114A 的唯一盲点）：一句话定性"为什么 tail page / text 的 mprotect RX 失败"，
++   并把"门装不上就 exit(1)"改成缺省非致命，好让 M113A 探针有机会跑到。
++
++   三个打印点（本文件 2 个 + platform/loader.c seal() 1 个），字段一一对齐便于逐字段 diff：
++     · [m115a] gate tail mprotect ...   ← game_patches.c smo_obs_gates_install() 尾部（tail page 的 RX）
++     · [m115a] seal text RX ...         ← loader.c seal()（[totk] FAIL: text RX 的来源）
++     · [m115a] seal patch RX ...        ← loader.c seal()（同一条通道的第二处 RX）
++   每行都含 rc / errno=%d(%s) / page / base / tail / seg_end / maps 归属；**成功也打同一行（＝OK）**，
++   所以"失败长什么样"永远有一行同字段的成功对照。
++
++   knob：smo_obs_gate_fatal（沿用既有 knob 通道：app 自建文件，hdc 只覆盖内容；两位候选路径）
++     0（缺省）= 非致命：RX 失败只记日志 —— tail page 这条本来就会走下面那段"撤 veneer"回退
++                 （把 106 个门点的 4 条出厂指令原样写回），门不生效但**没有任何跳进不可执行页的
++                 veneer 残留**，于是游戏能按原指令继续跑，M113A 探针才有机会执行；
++     1         = 旧行为：loader.c seal() 侧立即 runtime_fail("text RX") → exit(1)。（game_patches
++                 侧旧行为本来就只是"回退 + return"，不开 aborts，此开关在该侧不改变控制流。）
++   读点（必须在**第一次 RX 尝试之前**，否则 knob 不会生效）：
++     ① smo_obs_gates_install() 入口 —— 早于本函数尾部的 tail page mprotect（也是进程里第一次 RX 尝试）；
++     ② loader.c seal() 入口 —— 若 ① 没跑到（例如 no tail page 提前 return），这里补读，仍早于 seal 的 RX。
++   两次调用都命中同一个已缓存的 g_m115a_fatal，只真正读一次文件、只打一行 seed。 */
++
++#define M115A_KNOB_A "/data/storage/el2/base/files/smo_obs_gate_fatal"
++#define M115A_KNOB_B "/data/app/el2/100/base/com.vibecc.smo/files/smo_obs_gate_fatal"
++
++static int g_m115a_fatal = -1;   /* -1 = 还没读（读一次后固定在 0/1） */
++
++/* smo_obs_gate_fatal 的读取（一次性缓存）。缺省 0 = 非致命；文件内容首字符 '1' ⇒ 1（旧致命）。 */
++int smo_obs_gate_fatal(void)
++{
++    if (g_m115a_fatal < 0) {
++        const char *p[2] = { M115A_KNOB_A, M115A_KNOB_B };
++        int v = 0, have = 0;
++        for (int i = 0; i < 2 && !have; i++) {
++            FILE *f = fopen(p[i], "r");
++            if (!f) continue;
++            char b[16] = { 0 };
++            size_t n = fread(b, 1, sizeof b - 1, f);
++            fclose(f);
++            have = 1;
++            if (n > 0 && b[0] == '1') v = 1;
++        }
++        if (!have) { FILE *f = fopen(M115A_KNOB_A, "w"); if (f) { fputs("0\n", f); fclose(f); } }  /* hdc 只能覆盖已有文件 ⇒ app 先建 */
++        g_m115a_fatal = v;
++        fprintf(stderr, "[m115a] smo_obs_gate_fatal=%d (%s; 0=non-fatal continue, 1=old fatal) file=[%s]\n",
++                g_m115a_fatal, g_m115a_fatal ? "FATAL" : "NON-FATAL", M115A_KNOB_A);
+     }
++    return g_m115a_fatal;
++}
++
++/* /proc/self/maps 里包含 addr 的那一行（原样，含 lo-hi/perms/offset/path）；找不到 ⇒ "maps=none"。
++   只在取证点调用（一次启动至多几行），允许 fopen。返回 1 = 找到。 */
++int smo_obs_page_owner(uint64_t addr, char *out, size_t outn)
++{
++    char line[512];
++    if (!out || !outn) return 0;
++    snprintf(out, outn, "maps=none");
++    FILE *f = fopen("/proc/self/maps", "r");
++    if (!f) return 0;
++    while (fgets(line, (int)sizeof line, f)) {
++        unsigned long long lo = 0, hi = 0;
++        if (sscanf(line, "%llx-%llx", &lo, &hi) != 2) continue;
++        if (addr < lo || addr >= hi) continue;
++        line[strcspn(line, "\r\n")] = 0;
++        snprintf(out, outn, "maps=%.400s", line);
++        fclose(f);
++        return 1;
++    }
++    fclose(f);
+     return 0;
+ }
++
+ static void smo_obs_gates_install(const Module *m) {
++    (void)smo_obs_gate_fatal();   /* M115A 读点 ①：第一次 RX 尝试（本函数尾部 tail page mprotect）之前 */
+     /* M10A：安装期读一次开关（决定门 108 装原骨架还是 35 字强制变体）。读不到 ⇒ 0 = 完全关。
+        运行期开关只改 mask（强制次数），不改 stub 形态；mode 0 时装出的字节与 M9C 逐字节相同。 */
+     {
+@@ -4229,7 +4303,23 @@
+     if (!installed) return;
+     size_t used = (size_t)(p - page);
+     __builtin___clear_cache((char *)page, (char *)p);                       /* 新 stub 指令进 icache（文本侧 veneer 由 seal() 的 sys_icache_invalidate 覆盖） */
+-    if (mprotect(page, 0x4000, PROT_READ | PROT_EXEC) != 0) {               /* 与 seal() 给补丁区的权限一致；check_permissions 经 smo_obs_rx_range 认得此页 */
++    /* M115A 打印点 ①：tail page 的 RX 尝试。失败/成功**同一行同字段**（rc/errno/page/base/tail/
++       seg_end/maps），成功就是 rc=0 errno=0(rx ok) 的对照行。fatal 已在函数入口读过（读点 ①）。 */
++    const int m115a_fatal = smo_obs_gate_fatal();
++    const int m115a_rc = mprotect(page, 0x4000, PROT_READ | PROT_EXEC);      /* 与 seal() 给补丁区的权限一致；check_permissions 经 smo_obs_rx_range 认得此页 */
++    const int m115a_errno = errno;
++    {
++        char owner[512];
++        smo_obs_page_owner((uint64_t)(uintptr_t)page, owner, sizeof owner);
++        fprintf(stderr, "[m115a] gate tail mprotect %s: rc=%d errno=%d(%s) page=%p base=%p tail=%#llx seg_end=%#llx page_end=%#llx file_size=%#llx size=%#llx fatal=%d %s\n",
++                m115a_rc == 0 ? "OK" : "FAILED", m115a_rc, m115a_errno, strerror(m115a_errno),
++                (void *)page, (void *)m->base, (unsigned long long)tail,
++                (unsigned long long)(uintptr_t)(m->base + tail),
++                (unsigned long long)(uintptr_t)(m->base + tail + 0x4000),
++                (unsigned long long)m->file_size, (unsigned long long)m->size,
++                m115a_fatal, owner);
++    }
++    if (m115a_rc != 0) {
+         fprintf(stderr, "[odyssey] obs gates: tail page mprotect RX FAILED (gates dead: veneer will fault)\n");
+         /* 装不上就把 veneer 撤掉：留一个跳进不可执行页的 veneer 必崩，回退到原指令才安全 */
+         for (size_t s = 0; s < sizeof smo_obs_site / sizeof *smo_obs_site; s++) {
+@@ -4252,6 +4342,12 @@
+             if (now[0] == veneer[0] && now[1] == veneer[1])
+                 memcpy(m->base + site->off, site->word, sizeof site->word);   /* 原样写回 4 条出厂指令 */
+         }
++        /* M115A：veneer 已全部撤掉（上面那段就是回退路径）⇒ 无论 fatal 与否，此刻都"没有能跳进
++           不可执行页的指令残留"。=0（缺省）只多打这一行并继续跑；=1 也走同一段回退，控制流与旧版相同
++           （本分支旧代码从不 abort，只 return）。 */
++        fprintf(stderr, "[m115a] gate tail: veneer rollback done, gates=dead non-fatal=%d → %s\n",
++                !m115a_fatal, m115a_fatal ? "return + old fatal policy elsewhere (loader.c seal)" : "continue boot (M113A probes may run)");
++        g_obs_rx_lo = 0; g_obs_rx_hi = 0;   /* M115A：显式清空 ⇒ check_permissions 按 RW 期望该页（与失败态一致） */
+         return;
+     }
+     g_obs_rx_lo = (uint64_t)(uintptr_t)page; g_obs_rx_hi = g_obs_rx_lo + 0x4000;
+--- mario-odessy-harmony/entry/src/main/cpp/platform/loader.c
++++ mario-odessy-harmony/entry/src/main/cpp/platform/loader.c
+@@ -7,6 +7,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <fcntl.h>
++#include <errno.h>   /* M115A：seal() 的 RX 失败分支要打 errno + strerror */
+ #include <string.h>
+ #include <sys/mman.h>
+ #include <sys/stat.h>
+@@ -23,6 +24,10 @@
+ #include "game_patches.h"
+ #include "game_version.h"
+ void smo_obs_rx_range(uint64_t *lo, uint64_t *hi);   /* round9b：E-gate 尾部 stub 页的 RX 区间（game_patches.c；未安装时 hi=0） */
++/* M115A（2026-11-14）：门/seal 的 mprotect RX 失败取证 + 非致命开关（都定义在 games/…/game_patches.c，
++   同属 libgame.so；loader.c 沿用 smo_obs_rx_range 同款 extern 声明方式，不动公共头）。 */
++int smo_obs_gate_fatal(void);                                                     /* 0（缺省）=非致命 / 1=旧致命 */
++int smo_obs_page_owner(uint64_t addr, char *out, size_t outn);                     /* /proc/self/maps 归属行或 "maps=none" */
+ #define NM (sizeof(modules)/sizeof(modules[0]))
+ pthread_key_t runtime_keys[8];
+ static uint64_t timer_calls, svc_calls;
+@@ -265,6 +270,24 @@
+   need(actual==(uintptr_t)original,"guest nnMain address identity changed");checked++;
+  }
+  need(checked>0,"nnMain identity reference missing");
++}
++/* M115A（2026-11-14）：seal() 的 mprotect RX 取证 + 非致命开关。
++   打印点 ②③（text RX / patch RX）：rc / errno=%d(%s) / page / base / tail / seg_end / maps 归属；
++   成功打同一行（==OK）作为对照。返回 mprotect 的 rc（0 = 成功）。
++   g_m115a_seal_degraded 只会在"RX 被系统拒绝且 smo_obs_gate_fatal=0"时置位 ⇒ 供 check_permissions
++   把"必然对不上的期望权限"降级成日志（否则非致命在这一步又会 exit(1)，knob 等于白开）。 */
++static int g_m115a_seal_degraded;
++static int g_m115a_mismatch_logged;
++static int m115a_seal_rx(Module *m, void *addr, size_t len, const char *what) {
++ const int rc=mprotect(addr,len,PROT_READ|PROT_EXEC),e=errno,fatal=smo_obs_gate_fatal();
++ char owner[512];
++ smo_obs_page_owner((uint64_t)(uintptr_t)addr,owner,sizeof owner);
++ fprintf(stderr,"[m115a] seal %s RX %s: rc=%d errno=%d(%s) page=%p base=%p tail=%#zx seg_end=%#zx file_size=%#zx size=%#zx fatal=%d %s\n",
++         what,rc==0?"OK":"FAILED",rc,e,strerror(e),addr,(void *)m->base,
++         (size_t)((uint8_t *)addr-m->base),(size_t)((uintptr_t)m->base+m->size),
++         (size_t)m->file_size,(size_t)m->size,fatal,owner);
++ if(rc!=0&&!fatal)g_m115a_seal_degraded=1;
++ return rc;
+ }
+ static void seal(Module *m) {
+  size_t rx=page_up(m->text_end),ro_end=m->data_off&~(size_t)0x3fff;
+@@ -274,11 +297,12 @@
+  need(mprotect(m->base+m->key_off,0x4000,PROT_READ)==0,"key page R");
+  return;
+ #endif
+- need(mprotect(m->base,rx,PROT_READ|PROT_EXEC)==0,"text RX");
++ (void)smo_obs_gate_fatal();   /* M115A 读点 ②：早于本函数的两次 RX 尝试 */
++ if(m115a_seal_rx(m,m->base,rx,"text")!=0&&smo_obs_gate_fatal())runtime_fail("text RX");   /* =1：逐字恢复旧行为 */
+  if(ro_end>rx)need(mprotect(m->base+rx,ro_end-rx,PROT_READ)==0,"rodata R");
+  need(mprotect(m->base+m->key_off,0x4000,PROT_READ)==0,"key page R");
+  size_t patch_end=page_up(m->file_size);
+- need(mprotect(m->base+m->patch_off,patch_end-m->patch_off,PROT_READ|PROT_EXEC)==0,"patch RX");
++ if(m115a_seal_rx(m,m->base+m->patch_off,patch_end-m->patch_off,"patch")!=0&&smo_obs_gate_fatal())runtime_fail("patch RX");
+  sys_icache_invalidate(m->base,rx);sys_icache_invalidate(m->base+m->patch_off,patch_end-m->patch_off);
+ }
+ static void check_permissions(Module *m) {
+@@ -297,7 +321,15 @@
+    vm_prot_t expected=off>=page_up(m->file_size)?(p>=obs_lo&&p<obs_hi?(VM_PROT_READ|VM_PROT_EXECUTE):(VM_PROT_READ|VM_PROT_WRITE)):
+     (off<page_up(m->text_end)||off>=m->patch_off)?(VM_PROT_READ|VM_PROT_EXECUTE):
+     ((off>=page_up(m->text_end)&&off<(m->data_off&~0x3fffULL))||(off>=m->key_off&&off<m->key_off+0x4000ULL))?VM_PROT_READ:(VM_PROT_READ|VM_PROT_WRITE);
+-   if(info.protection!=expected){char pmsg[176];snprintf(pmsg,sizeof pmsg,"module permission mismatch %s off=%#llx region=[%#llx,%#llx) prot=%u expected=%u",m->name,(unsigned long long)off,(unsigned long long)a,(unsigned long long)(a+size),info.protection,expected);runtime_fail(pmsg);}
++   if(info.protection!=expected){
++    /* M115A：seal 的 RX 已被系统拒绝（g_m115a_seal_degraded 只在这种情况置位）⇒ 这里的期望值必然
++       对不上。smo_obs_gate_fatal=0（缺省）时降级成日志（前 8 页，够看清实际 prot），不再 exit(1)，
++       否则"非致命"在下一步照样死，knob 等于没开。=1 时控制流与旧版逐字相同（runtime_fail）。 */
++    if(g_m115a_seal_degraded&&!smo_obs_gate_fatal()){
++     if(g_m115a_mismatch_logged<8){g_m115a_mismatch_logged++;fprintf(stderr,"[m115a] seal degraded: module permission mismatch %s off=%#llx region=[%#llx,%#llx) prot=%u expected=%u (non-fatal, smo_obs_gate_fatal=0)\n",m->name,(unsigned long long)off,(unsigned long long)a,(unsigned long long)(a+size),(unsigned)info.protection,(unsigned)expected);}
++     continue;
++    }
++    char pmsg[176];snprintf(pmsg,sizeof pmsg,"module permission mismatch %s off=%#llx region=[%#llx,%#llx) prot=%u expected=%u",m->name,(unsigned long long)off,(unsigned long long)a,(unsigned long long)(a+size),info.protection,expected);runtime_fail(pmsg);}
+    need(info.protection==expected,"module permission mismatch");
+   }
+   a+=size;

@@ -1,0 +1,612 @@
+--- mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c
++++ mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c
+@@ -24166,8 +24166,583 @@
+     g_m108a_t_last_end = t_end;
+     g_m108a_t_pres = 0;
+     m108a_reset_frame();
++}
++
++/* ================= M109A（2026-11-14）：白链溯源（映射表 / 写入序列 + 三签名 / 采样递归 ≤2 跳）+ UBO 常量 dump ====
++   前置定谳（M107A Phase D，真机）：烧白 = NO。slot75 每帧只有 1 个 3 顶点带贴图三角，首笔即纯白；
++   它采样 id=3361（400x225 RT），该 RT 16/16 次采样 dcol<=2（无彩色）。★槽号逐 boot 漂移
++   （同一 boot 的 400x225 gameRT 在 slot 73/74，M106A 那 boot 在 75）⇒ **本块一律按属性选槽，不认槽号**。
++   本块只回答两件事，且都是只读（不写任何 RT、不改 pass 顺序、不改选源、不造第二条上屏通道）：
++     ① 白链：当 boot 的 400x225（退路 800x450）槽 —— 逐笔写入序列 + t0/t1/t2 三处签名 +
++        采样源递归 1..2 跳（每跳 id/what/wh/mean/dcol/writer_fs）⇒「第一处彩色」在第几跳 / 或到底层全白；
++     ② 曝光/常量：目标槽 pass 与全屏合成 pass（历史 pass 句柄 0x5db8f80af8 族，本块按「nv<=4 且 cnt<=6 且
++        带贴图」识别，句柄每次 boot 不同故不硬比）的 UBO 前 16 个 float（VS/FS 各 1 行，合计 ≤32 float），
++        `%g` 格式、**每 30 s ≤2 次**、只 memcpy 已 map 的 arena（g_r_ubo_map），不提交任何命令。
++   knob `smo_m109a`（app 启动自种 0；每 2 s 重读，变化/心跳都打 `[m109a] sw knob -> val=`）：
++     0 = 关（缺省；关态逐字节等于 M108A 行为：三个 hook 首句 return，零回读、零输出）；
++     1 = 映射表：当 boot 所有 ≥200x100 的 RT 槽（≤40 行），每 5 帧一次、每次 knob 档 ≤4 次；
++     2 = 白链 + 常量：写入序列（≤24 行/帧）+ 三签名 + 采样递归（≤12 行/帧）+ UBO dump。
++   回读时机（与 M107A 同一工程约束）：整幅回读只能落在 GPU 已空闲的安全点 ——
++     t0/t1 在 flush 的 submit+栅栏成功之后；t2/递归 present 内（本帧最后一次提交已在它之前完成）。
++   失败一律显式：`[m109a] miss why=…`（选不到槽 / map 空 / UBO 不可读 / 读回失败），绝不静默。 */
++#define M109A_A P_SLOT_DIR_A "/smo_m109a"
++#define M109A_B P_SLOT_DIR_B "/smo_m109a"
++#define M109A_RING 4096u
++#define M109A_FRAME_MAX 96u
++#define M109A_MAP_MAX 40
++#define M109A_MAP_MAXPX 1048576ull     /* 单槽回读上限 1 Mpx（1600x900=1.44 Mpx 只列不读，rb=0） */
++#define M109A_PX_FRAME 3145728ull      /* 每帧递归回读总像素上限 3 Mpx */
++#define M109A_WLINE 24
++#define M109A_HOP_MAX 12
++#define M109A_HOP_DEPTH 2
++#define M109A_SNAP 3                   /* 每槽快照的采样纹理数（供 hop2 用） */
++#define M109A_UBO_FLOATS 16
++#define M109A_UBO_EV_MAX 8
++#define M109A_UBO_GAP_US 30000000ull
++#define M109A_UBO_WIN_MAX 2
++
++typedef struct {
++    unsigned long long seq;
++    unsigned nv, cnt;
++    unsigned char decl, real;
++    char fs[17];
++} m109a_ent;
++
++typedef struct {
++    int id, ok;
++    unsigned w, h;
++    VkImage img;
++    VkImageLayout lay;
++    char what[8];
++} m109a_tex;
++
++static m109a_ent g_m109a_ring[M109A_RING];
++static unsigned long long g_m109a_w, g_m109a_rd, g_m109a_seq;
++static int g_m109a_v = -2, g_m109a_sel = -1;
++static double g_m109a_kt, g_m109a_klog;
++static unsigned long long g_m109a_fno, g_m109a_pf, g_m109a_maps;
++static unsigned g_m109a_wr[H_RT_SLOTS];               /* 窗口写入量（颜色笔） */
++static char g_m109a_fs[H_RT_SLOTS][17];               /* 每槽末笔 fs 键（= 该 RT 的 writer_fs） */
++static m109a_tex g_m109a_smp[H_RT_SLOTS][M109A_SNAP]; /* 每槽末笔的采样纹理快照（hop2 用） */
++static unsigned char g_m109a_smpn[H_RT_SLOTS];
++static unsigned long long g_m109a_smpf[H_RT_SLOTS];
++static unsigned g_m109a_cnt, g_m109a_mid_at = 8u, g_m109a_nprev, g_m109a_nflush;
++static int g_m109a_p0p, g_m109a_p1p, g_m109a_p0d, g_m109a_p1d;
++static unsigned long long g_m109a_p0seq, g_m109a_p1seq;
++static char g_m109a_p0fs[17], g_m109a_p1fs[17];
++static m107a_sig_t g_m109a_t0, g_m109a_t1, g_m109a_t2;
++static int g_m109a_t0ok, g_m109a_t1ok, g_m109a_t2ok;
++static unsigned long long g_m109a_px_frame;
++static unsigned g_m109a_hopmax[3];                    /* 每跳曾经出现的最大 dcol */
++static int g_m109a_firstcol = -1;                     /* 第一处彩色出现在第几跳；9 = 全白到底（未定 -1） */
++static unsigned long long g_m109a_ubo_ev, g_m109a_ubo_n, g_m109a_ubo_last_us;
++static unsigned long long g_m109a_ubo_win_n, g_m109a_ubo_win_t;
++
++/* p_slot_layout 已由 M107A 块前向声明（定义在 present 段）⇒ 这里可直接用。 */
++
++static void m109a_reset_frame(void)
++{
++    g_m109a_cnt = 0; g_m109a_nflush = 0;
++    g_m109a_p0p = 0; g_m109a_p1p = 0; g_m109a_p0d = 0; g_m109a_p1d = 0;
++    g_m109a_t0ok = 0; g_m109a_t1ok = 0; g_m109a_t2ok = 0;
++    memset(&g_m109a_t0, 0, sizeof g_m109a_t0);
++    memset(&g_m109a_t1, 0, sizeof g_m109a_t1);
++    memset(&g_m109a_t2, 0, sizeof g_m109a_t2);
++}
++
++/* knob 解码：v=1 映射表 / v=2 白链 + 常量；每次变化把帧计数归零 ⇒ 写 knob 后立刻满采样（30 s 内可见）。 */
++static void m109a_decode(int v)
++{
++    g_m109a_fno = 0; g_m109a_pf = 0; g_m109a_maps = 0;
++    g_m109a_nprev = 0; g_m109a_mid_at = 8u;
++    g_m109a_sel = -1;
++    g_m109a_ubo_n = 0; g_m109a_ubo_win_n = 0; g_m109a_ubo_win_t = 0; g_m109a_ubo_last_us = 0;
++    memset(g_m109a_wr, 0, sizeof g_m109a_wr);
++    memset(g_m109a_smpn, 0, sizeof g_m109a_smpn);
++    memset(g_m109a_smpf, 0, sizeof g_m109a_smpf);
++    g_m109a_rd = __atomic_load_n(&g_m109a_w, __ATOMIC_ACQUIRE);
++    (void)v;
++}
++
++/* knob 文件必须 app 自己先建（hdc 在沙箱里建不出新文件）；每 2 s 重读，变化/心跳都打 val= 行。 */
++static int m109a_knob(void)
++{
++    const double t = (double)pf_now_us() / 1e6;
++    if (g_m109a_v == -2) {
++        const char *p[2] = { M109A_A, M109A_B };
++        int have = 0, i;
++        for (i = 0; i < 2 && !have; i++) { FILE *f = fopen(p[i], "r"); if (f) { fclose(f); have = 1; } }
++        for (i = 0; i < 2 && !have; i++) { FILE *f = fopen(p[i], "w"); if (f) { fputs("0\n", f); fclose(f); have = 1; } }
++        g_m109a_v = p_file_int(M109A_A, M109A_B, 0);
++        g_m109a_kt = t; g_m109a_klog = t;
++        m109a_decode(g_m109a_v);
++        vk_boot_logf("[m109a] sw knob -> val=%d (seed)", g_m109a_v);
++        return g_m109a_v;
++    }
++    if (t - g_m109a_kt >= 2.0) {
++        const int v = p_file_int(M109A_A, M109A_B, 0);
++        g_m109a_kt = t;
++        if (v != g_m109a_v) {
++            g_m109a_v = v;
++            m109a_decode(v);
++            g_m109a_klog = t;
++            vk_boot_logf("[m109a] sw knob -> val=%d", g_m109a_v);
++        } else if (t - g_m109a_klog >= 10.0) {
++            g_m109a_klog = t;
++            vk_boot_logf("[m109a] sw knob -> val=%d", g_m109a_v);
++        }
++    }
++    return g_m109a_v;
++}
++
++/* 槽 → 签名（整幅回读；只在安全点调用）。返回 1 = 读到。 */
++static int m109a_sig_slot(int slot, m107a_sig_t *o)
++{
++    h_rt_slot *s;
++    memset(o, 0, sizeof *o);
++    if (slot < 0 || slot >= H_RT_SLOTS) return 0;
++    s = &g_rt_tab[slot];
++    if (!s->key || !s->img || !s->w || !s->h) return 0;
++    if ((unsigned long long)s->w * (unsigned long long)s->h > M109A_MAP_MAXPX) return 0;
++    return m107a_sig_img(s->img, p_slot_layout(s), s->w, s->h, o);
++}
++
++/* 图 → 槽（hop 的 writer 归属用）。shadow 图也算同一槽。 */
++static int m109a_slot_of_img(VkImage im)
++{
++    int i;
++    if (!im) return -1;
++    for (i = 0; i < H_RT_SLOTS; i++) {
++        const h_rt_slot *s = &g_rt_tab[i];
++        if (!s->key) continue;
++        if (s->img == im || s->s_img == im) return i;
++    }
++    return -1;
++}
++
++/* 属性选槽（**不看槽号**）：wh=400x225 且窗口写入量最大者；退 400x228；再退 800x450。 */
++static void m109a_pick(void)
++{
++    int i, b = -1, b2 = -1, b3 = -1;
++    unsigned wb = 0, wb2 = 0, wb3 = 0;
++    for (i = 0; i < H_RT_SLOTS; i++) {
++        const h_rt_slot *s = &g_rt_tab[i];
++        if (!s->key || !s->img || !s->w || !s->h) continue;
++        if (s->w == 400u && s->h == 225u) {
++            if (b < 0 || g_m109a_wr[i] > wb) { b = i; wb = g_m109a_wr[i]; }
++        } else if (s->w == 400u && s->h == 228u) {
++            if (b2 < 0 || g_m109a_wr[i] > wb2) { b2 = i; wb2 = g_m109a_wr[i]; }
++        } else if (s->w == 800u && s->h == 450u) {
++            if (b3 < 0 || g_m109a_wr[i] > wb3) { b3 = i; wb3 = g_m109a_wr[i]; }
++        }
++    }
++    if (b >= 0)       { g_m109a_sel = b;  return; }
++    if (b2 >= 0)      { g_m109a_sel = b2; return; }
++    g_m109a_sel = b3;
++}
++
++/* 每槽「末笔采样纹理」快照（hop2 用）。只在 knob>=2 时调用；rd 失败不猜（该槽快照数记 0）。 */
++static void m109a_snap_take(int si, const R_Key *kf)
++{
++    int ntex, i, n = 0;
++    if (!kf) { g_m109a_smpn[si] = 0; g_m109a_smpf[si] = g_m109a_fno; return; }
++    ntex = kf->ntex < NVN_TX_SLOTS ? kf->ntex : NVN_TX_SLOTS;
++    for (i = 0; i < ntex && n < M109A_SNAP; i++) {
++        const int u = r_unit_of(kf, i);
++        VkImage im = VK_NULL_HANDLE;
++        VkImageLayout ly = VK_IMAGE_LAYOUT_UNDEFINED;
++        unsigned w0 = 0, h0 = 0, b0 = 0;
++        const char *what = "none";
++        if (u < 0 || u >= NVN_TX_SLOTS || !g_r_tx_view[u]) continue;
++        if (!r_fs_slot_image(u, &im, &ly, &w0, &h0, &b0, &what)) continue;
++        if (!im || b0 != 4u || !w0 || !h0) continue;
++        g_m109a_smp[si][n].id = g_r_tx_info[u].id;
++        g_m109a_smp[si][n].ok = 1;
++        g_m109a_smp[si][n].w = w0;
++        g_m109a_smp[si][n].h = h0;
++        g_m109a_smp[si][n].img = im;
++        g_m109a_smp[si][n].lay = ly;
++        snprintf(g_m109a_smp[si][n].what, sizeof g_m109a_smp[si][n].what, "%s", what ? what : "-");
++        n++;
++    }
++    g_m109a_smpn[si] = (unsigned char)n;
++    g_m109a_smpf[si] = g_m109a_fno;
++}
++
++/* UBO dump 闸：每 30 s ≤2 次、全 boot ≤8 次（两次事件之间也至少 30 s，避免同一批里连打）。 */
++static int m109a_ubo_gate(unsigned long long t_us)
++{
++    if (g_m109a_ubo_ev >= (unsigned long long)M109A_UBO_EV_MAX) return 0;
++    if (g_m109a_ubo_last_us && t_us - g_m109a_ubo_last_us < M109A_UBO_GAP_US) return 0;
++    if (t_us - g_m109a_ubo_win_t >= M109A_UBO_GAP_US) g_m109a_ubo_win_n = 0;   /* 30 s 窗口滑动 */
++    if (g_m109a_ubo_win_n >= (unsigned long long)M109A_UBO_WIN_MAX) return 0;
++    if (!g_m109a_ubo_win_n) g_m109a_ubo_win_t = t_us;
++    g_m109a_ubo_win_n++;
++    g_m109a_ubo_ev++;
++    g_m109a_ubo_last_us = t_us;
++    return 1;
++}
++
++/* 一个 stage 的一行：取该 stage 第一个「有 off 且有 sz」的 bank，dump 前 16 个 float（%g）。 */
++static int m109a_ubo_stage(const char *tag, const R_Key *k, int st, unsigned long long call,
++                           unsigned rtw, unsigned rth)
++{
++    static char b[1024];
++    int bank = -1, b2, o = 0, i;
++    uint32_t off = 0, sz = 0, nf;
++    float v[M109A_UBO_FLOATS];
++    if (!k) return 0;
++    for (b2 = 0; b2 < 32; b2++) {
++        if (!(k->cbuf_mask & (1u << b2))) continue;
++        if (!g_r_ubo_off[st][b2] || g_r_ubo_sz[st][b2] < 16u) continue;
++        bank = b2; off = g_r_ubo_off[st][b2]; sz = g_r_ubo_sz[st][b2]; break;
++    }
++    if (bank < 0 || !g_r_ubo_map) return 0;
++    nf = sz / 4u;
++    if (nf > (uint32_t)M109A_UBO_FLOATS) nf = (uint32_t)M109A_UBO_FLOATS;
++    memset(v, 0, sizeof v);
++    if ((unsigned long long)off + (unsigned long long)nf * 4ull > (unsigned long long)R_UBO_ARENA) return 0;
++    memcpy(v, (const uint8_t *)g_r_ubo_map + off, (size_t)nf * sizeof(float));
++    o += snprintf(b + o, sizeof b - (size_t)o,
++                  "[m109a] ubo tag=%s st=%d stage=%s bank=%d off=%u sz=%u n=%u call=%llu ext=%ux%u pass=%#llx fs=%s",
++                  tag, st, st ? "fs" : "vs", bank, off, sz, nf, call, rtw, rth,
++                  (unsigned long long)(uintptr_t)g_r_pass_rp, k->key);
++    for (i = 0; i < (int)nf && o < (int)sizeof b - 24; i++)
++        o += snprintf(b + o, sizeof b - (size_t)o, " v%d=%g", i, (double)v[i]);
++    if (nf < (uint32_t)M109A_UBO_FLOATS && o < (int)sizeof b - 8)
++        o += snprintf(b + o, sizeof b - (size_t)o, " (sz<%uB)", (unsigned)(M109A_UBO_FLOATS * 4));
++    vk_boot_logf("%s", b);
++    return 1;
++}
++
++/* UBO 事件：目标槽 pass（tag=slot）或全屏合成 pass（tag=comp）各按闸门打 ≤2 行（VS/FS 各 16 float）。 */
++static void m109a_ubo_maybe(const R_Key *kv, const R_Key *kf, int si, unsigned nverts, int count,
++                            unsigned rtw, unsigned rth)
++{
++    const unsigned long long t_us = pf_now_us();
++    const int is_slot = (si == g_m109a_sel);
++    const int is_comp = (nverts <= 4u && count <= 6 && kf && kf->ntex >= 1 && rtw >= 400u && rth >= 225u);
++    const char *tag = is_slot ? "slot" : (is_comp ? "comp" : NULL);
++    int lines = 0;
++    if (!tag) return;
++    if (!m109a_ubo_gate(t_us)) return;
++    { const unsigned long long call = (unsigned long long)g_r_draws;
++      lines += m109a_ubo_stage(tag, kv, 0, call, rtw, rth);
++      lines += m109a_ubo_stage(tag, kf, 1, call, rtw, rth);
++      if (!lines) vk_boot_logf("[m109a] miss why=ubo_nobank tag=%s fs=%s vs=%s cbuf_fs=%#x cbuf_vs=%#x",
++                               tag, kf && kf->key[0] ? kf->key : "-", kv && kv->key[0] ? kv->key : "-",
++                               kf ? kf->cbuf_mask : 0u, kv ? kv->cbuf_mask : 0u); }
++}
++
++/* 逐笔 hook（knob<=0 第一句即返回 ⇒ 关态零输出、零记账、零回读）。 */
++static void m109a_draw(const R_Key *kv, const R_Key *kf, int si, int dvar,
++                       unsigned nverts, int count, int topo)
++{
++    m109a_ent *e;
++    int decl = 0, real = 0;
++    (void)topo;
++    if (g_m109a_v == -2) (void)m109a_knob();
++    if (g_m109a_v <= 0) return;
++    if (dvar >= 3 || si < 0 || si >= H_RT_SLOTS) return;
++    if (g_m109a_wr[si] < 0xffffffffu) g_m109a_wr[si]++;
++    if (kf && kf->key[0]) { memcpy(g_m109a_fs[si], kf->key, 16); g_m109a_fs[si][16] = 0; }
++    if (g_m109a_v >= 2) m109a_snap_take(si, kf);
++    m109a_ubo_maybe(kv, kf, si, nverts, count, (unsigned)g_rt_w, (unsigned)g_rt_h);
++    if (g_m109a_v < 2 || si != g_m109a_sel) return;
++    m105a_ntex(kf, &decl, &real);
++    e = &g_m109a_ring[(unsigned)(g_m109a_w % (unsigned long long)M109A_RING)];
++    memset(e, 0, sizeof *e);
++    e->seq = ++g_m109a_seq;
++    e->nv = nverts;
++    e->cnt = (unsigned)(count > 0 ? count : 0);
++    e->decl = (unsigned char)(decl > 255 ? 255 : decl);
++    e->real = (unsigned char)(real > 255 ? 255 : real);
++    if (kf && kf->key[0]) { memcpy(e->fs, kf->key, 16); e->fs[16] = 0; }
++    __atomic_store_n(&g_m109a_w, g_m109a_w + 1ull, __ATOMIC_RELEASE);
++    g_m109a_cnt++;
++    if (g_m109a_cnt == 1u) {
++        g_m109a_p0p = 1;
++        g_m109a_p0seq = e->seq;
++        snprintf(g_m109a_p0fs, sizeof g_m109a_p0fs, "%s", e->fs);
++    } else if (g_m109a_cnt >= g_m109a_mid_at && !g_m109a_p1p && !g_m109a_p1d) {
++        g_m109a_p1p = 1;
++        g_m109a_p1seq = e->seq;
++        snprintf(g_m109a_p1fs, sizeof g_m109a_p1fs, "%s", e->fs);
++    }
+ }
+ 
++/* 安全回读点 ①（flush 的 submit+栅栏之后）：解析 t0 / t1。 */
++static void m109a_flush(void)
++{
++    if (g_m109a_v == -2) (void)m109a_knob();
++    if (g_m109a_v < 2) return;
++    g_m109a_nflush++;
++    if (g_m109a_p0p && g_m109a_sel >= 0) {
++        int ok;
++        g_m109a_p0p = 0; g_m109a_p0d = 1;
++        ok = m109a_sig_slot(g_m109a_sel, &g_m109a_t0);
++        g_m109a_t0ok = ok;
++        vk_boot_logf("[m109a] s tag=t0 slot=%d ok=%d seq=%llu fs=%s dcol=%d mean=%u/%u/%u sp=%u nflush=%u",
++                     g_m109a_sel, ok, g_m109a_p0seq, g_m109a_p0fs[0] ? g_m109a_p0fs : "-",
++                     ok ? (int)g_m109a_t0.dcol : -1, g_m109a_t0.mr, g_m109a_t0.mg, g_m109a_t0.mb,
++                     g_m109a_t0.spread, g_m109a_nflush);
++    }
++    if (g_m109a_p1p && g_m109a_sel >= 0) {
++        int ok;
++        g_m109a_p1p = 0; g_m109a_p1d = 1;
++        ok = m109a_sig_slot(g_m109a_sel, &g_m109a_t1);
++        g_m109a_t1ok = ok;
++        vk_boot_logf("[m109a] s tag=t1 slot=%d ok=%d seq=%llu fs=%s dcol=%d mean=%u/%u/%u sp=%u nflush=%u",
++                     g_m109a_sel, ok, g_m109a_p1seq, g_m109a_p1fs[0] ? g_m109a_p1fs : "-",
++                     ok ? (int)g_m109a_t1.dcol : -1, g_m109a_t1.mr, g_m109a_t1.mg, g_m109a_t1.mb,
++                     g_m109a_t1.spread, g_m109a_nflush);
++    }
++}
++
++/* 一条 hop 行（depth / id / what / wh / mean / dcol / writer_fs）。 */
++static void m109a_hop_line(int depth, int id, const char *what, unsigned w, unsigned h,
++                           const m107a_sig_t *sg, int ok, int wslot, const char *wfs)
++{
++    vk_boot_logf("[m109a] hop depth=%d id=%d what=%s wh=%ux%u mean=%u/%u/%u dcol=%d rb=%d wslot=%d writer_fs=%s",
++                 depth, id, what && what[0] ? what : "-", w, h,
++                 sg->mr, sg->mg, sg->mb, ok ? (int)sg->dcol : -1, ok, wslot,
++                 wfs && wfs[0] ? wfs : "-");
++    if (ok) {
++        if ((unsigned)depth < 3u) {
++            if (sg->dcol > g_m109a_hopmax[depth]) g_m109a_hopmax[depth] = sg->dcol;
++        }
++        if (g_m109a_firstcol < 0 && sg->dcol >= 8u) g_m109a_firstcol = depth;
++    }
++}
++
++/* 采样递归（depth 0 = 选中槽本身；1 = 它末笔采样的纹理；2 = 那些纹理的 writer 再采样的纹理）。
++   每帧 ≤12 行、回读总量 ≤3 Mpx；只在 present 安全点调用。 */
++static void m109a_hops(unsigned long long call)
++{
++    int lines = 0, i, j;
++    const int sel = g_m109a_sel;
++    char wfs[17];
++    if (sel < 0 || lines >= M109A_HOP_MAX) return;
++    wfs[0] = 0;
++    if (g_m109a_fs[sel][0]) snprintf(wfs, sizeof wfs, "%s", g_m109a_fs[sel]);
++    {
++        m107a_sig_t sg;
++        const h_rt_slot *s = &g_rt_tab[sel];
++        const int ok = g_m109a_t2ok;
++        sg = g_m109a_t2;
++        m109a_hop_line(0, s->tex_id, "rt", s->w, s->h, &sg, ok, sel, wfs);
++        lines++;
++    }
++    if (g_m109a_smpf[sel] != g_m109a_fno) {
++        vk_boot_logf("[m109a] miss why=hop0_snap_stale slot=%d (本帧没记到选中槽的采样快照)", sel);
++        return;
++    }
++    /* depth 1 */
++    for (i = 0; i < (int)g_m109a_smpn[sel] && lines < M109A_HOP_MAX; i++) {
++        const m109a_tex *t = &g_m109a_smp[sel][i];
++        int ws;
++        m107a_sig_t sg;
++        int ok = 0;
++        unsigned long long px = (unsigned long long)t->w * t->h;
++        if (g_m109a_px_frame + px > M109A_PX_FRAME) {
++            vk_boot_logf("[m109a] miss why=hop_px_budget id=%d wh=%ux%u", t->id, t->w, t->h);
++            continue;
++        }
++        ws = m109a_slot_of_img(t->img);
++        if (ws >= 0 && g_rt_tab[ws].img == t->img) ok = m109a_sig_slot(ws, &sg);
++        else ok = m107a_sig_img(t->img, t->lay, t->w, t->h, &sg);
++        g_m109a_px_frame += px;
++        m109a_hop_line(1, t->id, t->what, t->w, t->h, &sg, ok, ws,
++                       (ws >= 0) ? g_m109a_fs[ws] : "-");
++        lines++;
++        /* depth 2：该 hop1 槽的 writer 末笔又采样了什么（必须同帧快照，避免拿到已销毁的图） */
++        if (ws < 0 || g_m109a_smpf[ws] != g_m109a_fno) continue;
++        for (j = 0; j < (int)g_m109a_smpn[ws] && lines < M109A_HOP_MAX; j++) {
++            const m109a_tex *t2 = &g_m109a_smp[ws][j];
++            const unsigned long long px2 = (unsigned long long)t2->w * t2->h;
++            int ws2;
++            m107a_sig_t sg2;
++            int ok2 = 0;
++            if (g_m109a_px_frame + px2 > M109A_PX_FRAME) {
++                vk_boot_logf("[m109a] miss why=hop_px_budget id=%d wh=%ux%u", t2->id, t2->w, t2->h);
++                continue;
++            }
++            ws2 = m109a_slot_of_img(t2->img);
++            if (ws2 >= 0 && g_rt_tab[ws2].img == t2->img) ok2 = m109a_sig_slot(ws2, &sg2);
++            else ok2 = m107a_sig_img(t2->img, t2->lay, t2->w, t2->h, &sg2);
++            g_m109a_px_frame += px2;
++            m109a_hop_line(2, t2->id, t2->what, t2->w, t2->h, &sg2, ok2, ws2,
++                           (ws2 >= 0) ? g_m109a_fs[ws2] : "-");
++            lines++;
++        }
++    }
++    (void)call;
++}
++
++/* 映射表（判据 1）：列出当 boot 所有 ≥200x100 的 RT 槽（按窗口写入量降序，≤40 行）。 */
++static void m109a_map_dump(unsigned long long call)
++{
++    int idx[H_RT_SLOTS], n = 0, i, j, rows = 0;
++    for (i = 0; i < H_RT_SLOTS; i++) {
++        const h_rt_slot *s = &g_rt_tab[i];
++        if (!s->key || !s->img || s->w < 200u || s->h < 100u) continue;
++        idx[n++] = i;
++    }
++    for (i = 0; i < n; i++)   /* 插入排序：窗口写入量降序 */
++        for (j = i + 1; j < n; j++)
++            if (g_m109a_wr[idx[j]] > g_m109a_wr[idx[i]]) { const int t = idx[i]; idx[i] = idx[j]; idx[j] = t; }
++    vk_boot_logf("[m109a] map hdr call=%llu n=%d shown<=%d (all RT slots wh>=200x100, writes=窗口写入量)",
++                 call, n, M109A_MAP_MAX);
++    for (i = 0; i < n && rows < M109A_MAP_MAX; i++) {
++        h_rt_slot *s = &g_rt_tab[idx[i]];
++        m107a_sig_t sg;
++        const int ok = m109a_sig_slot(idx[i], &sg);
++        vk_boot_logf("[m109a] map slot=%d wh=%ux%u kind=%s texid=%d writes=%u last_fs=%s dcol=%d mean=%u/%u/%u rb=%d",
++                     idx[i], s->w, s->h,
++                     s->tex_id >= 0 ? (s->s_img ? "rt+sh" : "rt") : (s->s_img ? "rt-noid+sh" : "rt-noid"),
++                     s->tex_id, g_m109a_wr[idx[i]], g_m109a_fs[idx[i]][0] ? g_m109a_fs[idx[i]] : "-",
++                     ok ? (int)sg.dcol : -1, sg.mr, sg.mg, sg.mb, ok);
++        rows++;
++    }
++    if (!rows) vk_boot_logf("[m109a] miss why=map_empty (池里没有 ≥200x100 的活槽)");
++    memset(g_m109a_wr, 0, sizeof g_m109a_wr);
++    g_m109a_maps++;
++}
++
++/* 帧边界（present 内）：签名 t2 + 判据行 + 逐笔行 + 递归 + 选槽。knob=0 ⇒ 零输出、零回读。 */
++static void m109a_frame(unsigned long long call)
++{
++    const unsigned long long w = __atomic_load_n(&g_m109a_w, __ATOMIC_ACQUIRE);
++    unsigned long long r = g_m109a_rd, i, n, trunc = 0, lastseq = 0;
++    unsigned ndraw = 0;
++    char firstfs[17], midfs[17], lastfs[17];
++    int ldecl = -1, lreal = -1;
++    const int v = m109a_knob();
++
++    firstfs[0] = midfs[0] = lastfs[0] = 0;
++    if (v <= 0) {
++        g_m109a_rd = w;
++        m109a_reset_frame();
++        g_m109a_sel = -1;
++        return;
++    }
++    if (g_m109a_sel < 0) m109a_pick();
++    if (v == 1) {
++        /* 映射表档：每 5 帧一次、每档 ≤4 次；不做签名/逐笔/递归，省日志也省回读 */
++        if (g_m109a_maps < 4ull && (g_m109a_fno == 0ull || (g_m109a_fno % 5ull) == 0ull)) m109a_map_dump(call);
++        if (g_m109a_sel >= 0) {
++            const h_rt_slot *s = &g_rt_tab[g_m109a_sel];
++            vk_boot_logf("[m109a] sel slot=%d wh=%ux%u writes=%u texid=%d why=%s",
++                         g_m109a_sel, s->w, s->h, g_m109a_wr[g_m109a_sel], s->tex_id,
++                         (s->w == 400u && s->h == 225u) ? "w400x225" : (s->w == 800u ? "w800x450" : "w400x228"));
++        } else {
++            vk_boot_logf("[m109a] miss why=no_400x225_slot (也没有 800x450)");
++        }
++        g_m109a_rd = w;
++        g_m109a_fno++;
++        m109a_reset_frame();
++        return;
++    }
++    /* v>=2：白链档 */
++    if (w - r > (unsigned long long)M109A_RING) {
++        trunc = (w - r) - (unsigned long long)M109A_RING;
++        r = w - (unsigned long long)M109A_RING;
++    }
++    n = w - r;
++    for (i = r; i < w; i++) {
++        const m109a_ent *e = &g_m109a_ring[(unsigned)(i % (unsigned long long)M109A_RING)];
++        if (!ndraw) memcpy(firstfs, e->fs, sizeof firstfs);
++        if (ndraw + 1u == g_m109a_mid_at) memcpy(midfs, e->fs, sizeof midfs);
++        memcpy(lastfs, e->fs, sizeof lastfs);
++        lastseq = e->seq;
++        ldecl = (int)e->decl; lreal = (int)e->real;
++        ndraw++;
++    }
++    if (!midfs[0] && ndraw) {
++        const unsigned long long mm = r + (unsigned long long)(ndraw / 2u);
++        const m109a_ent *e = &g_m109a_ring[(unsigned)((mm < w ? mm : w - 1ull) % (unsigned long long)M109A_RING)];
++        memcpy(midfs, e->fs, sizeof midfs);
++    }
++    if (g_m109a_p0p && g_m109a_sel >= 0) {     /* 整帧都没等到提交边界 ⇒ 在 present 补一次 */
++        g_m109a_p0p = 0; g_m109a_p0d = 1;
++        g_m109a_t0ok = m109a_sig_slot(g_m109a_sel, &g_m109a_t0);
++        vk_boot_logf("[m109a] s tag=t0 slot=%d ok=%d seq=%llu fs=%s dcol=%d mean=%u/%u/%u sp=%u nflush=%u late=1",
++                     g_m109a_sel, g_m109a_t0ok, g_m109a_p0seq, g_m109a_p0fs[0] ? g_m109a_p0fs : "-",
++                     g_m109a_t0ok ? (int)g_m109a_t0.dcol : -1, g_m109a_t0.mr, g_m109a_t0.mg, g_m109a_t0.mb,
++                     g_m109a_t0.spread, g_m109a_nflush);
++    }
++    if (g_m109a_p1p && g_m109a_sel >= 0) {
++        g_m109a_p1p = 0; g_m109a_p1d = 1;
++        g_m109a_t1ok = m109a_sig_slot(g_m109a_sel, &g_m109a_t1);
++        vk_boot_logf("[m109a] s tag=t1 slot=%d ok=%d seq=%llu fs=%s dcol=%d mean=%u/%u/%u sp=%u nflush=%u late=1",
++                     g_m109a_sel, g_m109a_t1ok, g_m109a_p1seq, g_m109a_p1fs[0] ? g_m109a_p1fs : "-",
++                     g_m109a_t1ok ? (int)g_m109a_t1.dcol : -1, g_m109a_t1.mr, g_m109a_t1.mg, g_m109a_t1.mb,
++                     g_m109a_t1.spread, g_m109a_nflush);
++    }
++    if (ndraw && g_m109a_sel >= 0) {           /* t2 = 末笔之后（本帧最后一次提交已在 present 之前完成） */
++        g_m109a_t2ok = m109a_sig_slot(g_m109a_sel, &g_m109a_t2);
++        vk_boot_logf("[m109a] s tag=t2 slot=%d ok=%d seq=%llu fs=%s dcol=%d mean=%u/%u/%u sp=%u nflush=%u",
++                     g_m109a_sel, g_m109a_t2ok, lastseq, lastfs[0] ? lastfs : "-",
++                     g_m109a_t2ok ? (int)g_m109a_t2.dcol : -1, g_m109a_t2.mr, g_m109a_t2.mg, g_m109a_t2.mb,
++                     g_m109a_t2.spread, g_m109a_nflush);
++    }
++    if (g_m109a_pf < (unsigned long long)M109A_FRAME_MAX && g_m109a_sel >= 0) {
++        const h_rt_slot *s = &g_rt_tab[g_m109a_sel];
++        vk_boot_logf("[m109a] f call=%llu slot=%d wh=%ux%u texid=%d n=%u gate=1 nflush=%u "
++                     "t0[dcol=%d mean=%u/%u/%u sp=%u] t1[dcol=%d mean=%u/%u/%u sp=%u] t2[dcol=%d mean=%u/%u/%u sp=%u] "
++                     "first_fs=%s mid_fs=%s last_fs=%s last_decl=%d last_real=%d trunc=%llu",
++                     call, g_m109a_sel, s->w, s->h, s->tex_id, ndraw, g_m109a_nflush,
++                     g_m109a_t0ok ? (int)g_m109a_t0.dcol : -1, g_m109a_t0.mr, g_m109a_t0.mg, g_m109a_t0.mb, g_m109a_t0.spread,
++                     g_m109a_t1ok ? (int)g_m109a_t1.dcol : -1, g_m109a_t1.mr, g_m109a_t1.mg, g_m109a_t1.mb, g_m109a_t1.spread,
++                     g_m109a_t2ok ? (int)g_m109a_t2.dcol : -1, g_m109a_t2.mr, g_m109a_t2.mg, g_m109a_t2.mb, g_m109a_t2.spread,
++                     firstfs[0] ? firstfs : "-", midfs[0] ? midfs : "-", lastfs[0] ? lastfs : "-",
++                     ldecl, lreal, trunc);
++        if (ndraw) {                            /* 逐笔行：前 12 + 后 12（≤24 行/帧） */
++            m109a_ent head[12], tail[12];
++            int nh = 0, nt = 0, k, pos = 0;
++            for (i = r; i < w; i++) {
++                const m109a_ent *e = &g_m109a_ring[(unsigned)(i % (unsigned long long)M109A_RING)];
++                if (nh < 12) head[nh++] = *e;
++                else { tail[nt % 12] = *e; nt++; }
++            }
++            for (k = 0; k < nh; k++)
++                vk_boot_logf("[m109a] w i=%d seq=%llu fs=%s decl=%d real=%d nv=%u cnt=%u",
++                             pos++, head[k].seq, head[k].fs[0] ? head[k].fs : "-",
++                             (int)head[k].decl, (int)head[k].real, head[k].nv, head[k].cnt);
++            if (nt > 0) {
++                const int st = (nt > 12) ? (nt % 12) : 0, cn = (nt > 12) ? 12 : nt;
++                if (nt > 12)
++                    vk_boot_logf("[m109a] g n=%llu shown=%d gap=%llu (first12+last12)",
++                                 n, nh + cn, n - (unsigned long long)(nh + cn));
++                for (k = 0; k < cn; k++) {
++                    const m109a_ent *e = &tail[(st + k) % 12];
++                    vk_boot_logf("[m109a] w i=%d seq=%llu fs=%s decl=%d real=%d nv=%u cnt=%u",
++                                 (int)n - cn + k, e->seq, e->fs[0] ? e->fs : "-",
++                                 (int)e->decl, (int)e->real, e->nv, e->cnt);
++                }
++            }
++        }
++        g_m109a_pf++;
++    }
++    /* 采样递归（≤12 行/帧）：depth0 = 选中槽（t2），depth1/2 = 它的采样源链 */
++    g_m109a_px_frame = 0;
++    m109a_hops(call);
++    /* 判读行：每 8 帧一行 —— 第一处彩色出现在第几跳（-1 = 还没定） */
++    if ((g_m109a_fno % 8ull) == 7ull)
++        vk_boot_logf("[m109a] judge f=%llu hop0_maxdcol=%u hop1_maxdcol=%u hop2_maxdcol=%u first_color=%s",
++                     g_m109a_fno, g_m109a_hopmax[0], g_m109a_hopmax[1], g_m109a_hopmax[2],
++                     g_m109a_firstcol < 0 ? "undecided" : (g_m109a_firstcol == 9 ? "none(all-white)" :
++                     (g_m109a_firstcol == 0 ? "hop0" : (g_m109a_firstcol == 1 ? "hop1" : "hop2"))));
++    g_m109a_fno++;
++    g_m109a_nprev = ndraw;
++    g_m109a_mid_at = (ndraw > 4u) ? (ndraw / 2u) : 8u;
++    g_m109a_rd = w;
++    m109a_reset_frame();
++    /* 每 8 帧衰减一次窗口写入量（保证选槽跟着「当前」写入量走，而不是整 boot 累计） */
++    if ((g_m109a_fno % 8ull) == 0ull) memset(g_m109a_wr, 0, sizeof g_m109a_wr);
++    m109a_pick();
++}
++
+ int nvn_vk_draw_elements(int mode, int type, int count, uint64_t idx, int base_vertex, int base_instance,
+                          int instances, int dclass)
+ {
+@@ -25027,6 +25602,8 @@
+                       (unsigned long long)(uintptr_t)ps, (unsigned long long)(uintptr_t)g_r_pass_rp, 0);
+             /* M107A（只读，knob<=0 立即返回）：该槽的帧内写入时序 —— 首笔/中段/末笔三处签名的标记点。 */
+             m107a_draw(kf, si, dvar, (unsigned)nverts, (int)count);
++            /* M109A（只读，knob<=0 立即返回）：按属性选槽的写入记账 + 采样快照 + UBO 常量 dump。 */
++            m109a_draw(kv, kf, si, dvar, (unsigned)nverts, (int)count, (int)topo);
+             /* M40AU ①（只读记账，au=0 一个分支都不进）：本帧「最后一笔颜色 draw」落到哪个槽。
+                这是 present 取源的**唯一**来源 —— 记在绘制之后，present 只读不重算（M40AT 已证
+                present 时刻再取源时 RT 已被清屏）。零额外开销：只搬 3 个标量。 */
+@@ -26628,6 +27205,8 @@
+     /* M107A（knob<=0 立即返回）：**唯一安全的整幅回读点** —— 本批已提交且栅栏已过、g_r_cb 已回收，
+        所以这里读到的就是「首笔/中段之后最近的提交边界」的槽内容（t0/t1），并顺带做贴图白度。 */
+     m107a_flush();
++    /* M109A（knob<2 立即返回）：t0/t1 整幅回读（本批已提交且栅栏已过）。 */
++    m109a_flush();
+     /* M4n P4③：批次已提交并等到栅栏 ⇒ 此刻 RT 内容稳定，拍一次签名（内容变化才落行）。
+        只在 bd>0 时拍：空批次不会改内容。 */
+     unsigned long long m23b_sg0 = m23b_f ? pf_now_us() : 0;
+@@ -32338,6 +32917,7 @@
+         m103a_proof_line(call, srcname, g_p_sel_slot, simg, sw, sh, (int)slay, ok);
+         m105a_frame(call, srcname, g_p_sel_slot, ok);   /* M105A：帧内写入时序 + judge + 内容签名 */
+         m107a_frame(call, srcname, g_p_sel_slot, ok);   /* M107A：三处签名（t2 = 末笔之后）+ 逐笔时序 + 贴图白度 */
++        m109a_frame(call);   /* M109A：映射表 / 白链（t2 + 逐笔 + 采样递归 ≤2 跳） */
+         if (psig_want)
+             p_sig_line(call, srcname, simg, sw, sh, crox, croy, ok, psig_verbose || g_p_m4ak_sig_pair);
+         g_p_m4ak_sig_pair = 0;

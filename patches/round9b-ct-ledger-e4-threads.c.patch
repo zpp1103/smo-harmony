@@ -1,0 +1,203 @@
+--- entry/src/main/cpp/host/threads.c
++++ /Users/zpp/VibeCoding/ns-mario-odessy-to-harmony/mario-odessy-harmony/entry/src/main/cpp/host/threads.c
+@@ -524,6 +524,11 @@
+    首见时已无槽→落溢出桶无身份。次级表专收「主表满后首见」的 key——活锁期 key 全部落这里，身份可读。 */
+ static struct { uint64_t key, n1c, n1d, n1dk; uint32_t caller; } g_pkey2[16];
+ static unsigned g_pkey2_n;
++/* round9b 第三表（E4 族大小确认）：pkey2 也满后首见的 key——溢出桶只有总数没有身份，
++   64+16+32=112 个 key 以内族成员全可读，仍溢出才落回纯计数桶。 */
++#define PKEY3_TOP 32
++static struct { uint64_t key, n1c, n1d, n1dk; uint32_t caller; } g_pkey3[PKEY3_TOP];
++static unsigned g_pkey3_n;
+ static void pkey_note(int is1d, uint64_t key, uint32_t caller) {   // 调用方持 G
+     if (is1d) atomic_fetch_add_explicit(&g_n1d, 1, memory_order_relaxed);
+     else      atomic_fetch_add_explicit(&g_n1c, 1, memory_order_relaxed);
+@@ -547,7 +552,43 @@
+         g_pkey2[g_pkey2_n].n1dk = 0; g_pkey2[g_pkey2_n].caller = is1d ? caller : 0; g_pkey2_n++;
+         return;
+     }
++    for (unsigned i = 0; i < g_pkey3_n; i++) if (g_pkey3[i].key == key) {
++        if (is1d) { g_pkey3[i].n1d++; if (!g_pkey3[i].caller) g_pkey3[i].caller = caller; }
++        else g_pkey3[i].n1c++;
++        return;
++    }
++    if (g_pkey3_n < PKEY3_TOP) {
++        g_pkey3[g_pkey3_n].key = key; g_pkey3[g_pkey3_n].n1c = !is1d; g_pkey3[g_pkey3_n].n1d = !!is1d;
++        g_pkey3[g_pkey3_n].n1dk = 0; g_pkey3[g_pkey3_n].caller = is1d ? caller : 0; g_pkey3_n++;
++        return;
++    }
+     if (is1d) g_ovf1d++; else g_ovf1c++;
++}
++/* ---------- round9b CreateThread/StartThread 全量账本（E2 宿主侧排查项）----------
++   修复方案定的宿主侧唯一排查项：核对 CreateThread/StartThread 门的全量账本（每个线程的
++   entry+arg+返回码），确认派发池消费者线程是「从未创建」而非「创建失败」。热路径零 I/O
++   （svc 0x08 成功路径本就持 G 登记；拒绝路径只加计数+末次样本），dump 时打全表与
++   线程名册（dump 逐线程行已带 entry/arg）对 diff。 */
++#define CT_LEDGER_CAP 64
++static struct { uint64_t entry, arg, stack_top; int prio, core; uint32_t handle; int started; uint32_t ret; } g_ct[CT_LEDGER_CAP];
++static unsigned g_ct_n;
++static uint64_t g_ct_calls, g_ct_rejects, g_ct_start_calls, g_ct_start_bad;
++static struct { uint64_t entry, arg; int prio, core; uint32_t ret; } g_ct_last_reject;
++static void ct_note_create(uint64_t entry, uint64_t arg, uint64_t sp, int prio, int core, uint32_t handle, uint32_t ret) {   // 调用方持 G（成功路径）
++    g_ct_calls++;
++    unsigned i = g_ct_n < CT_LEDGER_CAP ? g_ct_n++ : (unsigned)-1;
++    if (i == (unsigned)-1) return;   // 表满：只留总数（>64 个客体线程本就异常）
++    g_ct[i].entry = entry; g_ct[i].arg = arg; g_ct[i].stack_top = sp;
++    g_ct[i].prio = prio; g_ct[i].core = core; g_ct[i].handle = handle; g_ct[i].ret = ret; g_ct[i].started = 0;
++}
++static void ct_note_reject(uint64_t entry, uint64_t arg, int prio, int core, uint32_t ret) {   // 拒绝路径（无 G）：计数+末次样本，竞态可接受（取证类）
++    g_ct_calls++; g_ct_rejects++;
++    g_ct_last_reject.entry = entry; g_ct_last_reject.arg = arg; g_ct_last_reject.prio = prio; g_ct_last_reject.core = core; g_ct_last_reject.ret = ret;
++}
++static void ct_note_start(uint32_t handle, uint32_t ret) {   // 调用方持 G
++    g_ct_start_calls++;
++    if (ret) { g_ct_start_bad++; return; }
++    for (unsigned i = 0; i < g_ct_n; i++) if (g_ct[i].handle == handle) { g_ct[i].started = 1; return; }
+ }
+ static void evlog(uint32_t op, uint32_t h, uint32_t h2, uint64_t lr) {
+     /* round6 账本 + round8 归因：per-handle signal/reset 累计与首见裸 LR（0x1024 的 signal 源=宿主构造侧、
+@@ -589,6 +630,7 @@
+                 fprintf(stderr,"[totk-stack] CreateThread rejected entry=%#llx sp=%#llx prio=%d core=%d why=%s\n",
+                     (unsigned long long)regs[1],(unsigned long long)regs[3],(int)regs[4],(int)regs[5],why);
+             }
++            ct_note_reject(regs[1], regs[2], (int)regs[4], (int)regs[5], R_BAD_STATE);   /* round9b CreateThread 账本：拒绝路径（无 G，竞态可接受） */
+             regs[0]=R_BAD_STATE;return 1;
+         }
+         thr_t *t = calloc(1, sizeof *t);
+@@ -598,7 +640,9 @@
+         t->entry = regs[1]; t->arg = regs[2]; t->stack_top = regs[3] & ~0x3Full;
+         t->prio = (int)regs[4]; t->core = (int)regs[5]; t->mask = t->core >= 0 ? 1ull << t->core : 7;
+         t->born_ns = now_ns(); t->born_tick = dm_thread_tick_fn ? dm_thread_tick_fn() : 0;
+-        pthread_mutex_lock(&G); t->handle = h_new(O_THREAD, t, regs[30]); t->id = g_next_id++; t->all = g_all; g_all = t; pthread_mutex_unlock(&G);
++        pthread_mutex_lock(&G); t->handle = h_new(O_THREAD, t, regs[30]); t->id = g_next_id++; t->all = g_all; g_all = t;
++        ct_note_create(regs[1], regs[2], t->stack_top, t->prio, t->core, t->handle, 0);   /* round9b CreateThread 账本：成功路径（持 G） */
++        pthread_mutex_unlock(&G);
+         pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 8 << 20);   // also the host-service stack of this guest thread
+         pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);   // 退出即回收宿主资源（客体经句柄等待，不 join） | Host resources are reclaimed on exit (the guest waits through the handle, no join)
+         if (pthread_create(&t->pt, &a, thread_main, t)) die("pthread_create");
+@@ -610,6 +654,7 @@
+         pthread_mutex_lock(&G);
+         thr_t *t = h_get((uint32_t)regs[0], O_THREAD);
+         if (t) { t->started = 1; pthread_cond_signal(&t->cv); }
++        ct_note_start((uint32_t)regs[0], t ? 0 : R_BAD_HANDLE);   /* round9b StartThread 账本（持 G） */
+         pthread_mutex_unlock(&G);
+         regs[0] = t ? 0 : R_BAD_HANDLE; return 1;
+     }
+@@ -707,6 +752,7 @@
+         for (thr_t *w; (cnt <= 0 || n < cnt) && (w = pick(2, key)); n++) lock_acquire_for(w, w->waddr, w->wtag);   // 按内核顺序；转为锁等待或被唤醒后不再是 kind 2
+         for (unsigned i = 0; i < g_pkey_n; i++) if (g_pkey[i].key == key) { g_pkey[i].n1dk += (uint64_t)n; break; }   // round8b：per-key 实际转醒数（n1d≫n1dk 且 waiters=0 = 空打；与 g_n1d_woke 总账对照）
+         for (unsigned i = 0; i < g_pkey2_n; i++) if (g_pkey2[i].key == key) { g_pkey2[i].n1dk += (uint64_t)n; break; }   // 次级表同账
++        for (unsigned i = 0; i < g_pkey3_n; i++) if (g_pkey3[i].key == key) { g_pkey3[i].n1dk += (uint64_t)n; break; }   // round9b 第三表同账
+         atomic_fetch_add_explicit(&g_n1d_woke, (uint64_t)n, memory_order_relaxed);   // round9 观测：实际转醒的等待者数（signal 有没有人接） | In kernel order; once turned into a lock wait or woken it is no longer kind 2
+         int left = 0; for (thr_t *w = g_wait; w; w = w->next) if (w->wkind == 2 && w->wkey == key) { left = 1; break; }
+         if (!left) st32(key, 0);
+@@ -1041,6 +1087,7 @@
+     fputc('\n', stderr);
+ }
+ static void dump_threads(unsigned secs);
++static int spin_read16(uint64_t a, uint64_t out[2]);   /* round9b：dump 的 E1/E4 段用（定义在诊断段） */
+ static void *dump_after(void *arg) { unsigned secs = (unsigned)(uintptr_t)arg; sleep(secs); dump_threads(secs); return NULL; }
+ /* TOTK_LISTCHECK=<heap-relative object offset>: watch the two intrusive lists at +0x48/+0x60 of one game allocator
+    object (seen corrupted after the startup logo) and dump all threads the moment a node's next link is null. */
+@@ -1098,8 +1145,9 @@
+         uint64_t htid = 0; if (t->pt) pthread_threadid_np(t->pt, &htid);
+         fprintf(stderr, "[totk-dump] tid=%llu ", (unsigned long long)htid);
+         fprintf(stderr, "core=%d mask=%#llx ", t->cur_core, (unsigned long long)t->mask);
+-        fprintf(stderr, "h=%#x prio=%d %s wait=%d addr=%#llx key=%#llx tag=%#x word=%#x last_svc=%#x nsvc=%llu\n", t->handle, t->prio,
+-                t->exited ? "exited" : t->started ? "run" : "new", t->wkind, (unsigned long long)t->waddr, (unsigned long long)t->wkey, t->wtag, word, t->last_svc, (unsigned long long)t->nsvc);
++        fprintf(stderr, "h=%#x prio=%d %s wait=%d addr=%#llx key=%#llx tag=%#x word=%#x last_svc=%#x nsvc=%llu entry=%#llx arg=%#llx\n", t->handle, t->prio,
++                t->exited ? "exited" : t->started ? "run" : "new", t->wkind, (unsigned long long)t->waddr, (unsigned long long)t->wkey, t->wtag, word, t->last_svc, (unsigned long long)t->nsvc,
++                (unsigned long long)t->entry, (unsigned long long)t->arg);   /* round9b：entry/arg 进名册行——与 CreateThread 账本 diff 找缺席线程 */
+         if (t->wkind == 4) { fprintf(stderr, "    waiting on %d handle(s):", t->nwh); for (int i = 0; i < t->nwh && i < 4; i++) fprintf(stderr, " %#x", t->wh[i]); fputc('\n', stderr); }
+         if (t->last_hle) { char nm[256]; runtime_hle_describe((unsigned)t->last_hle - 1, nm, sizeof nm); fprintf(stderr, "    last host call while tracing: %s\n", nm); }
+         dump_chain(t->last_lr, t->last_fp);
+@@ -1255,6 +1303,89 @@
+                   (unsigned long long)g_pkey2[i].key, (unsigned long long)g_pkey2[i].n1c,
+                   (unsigned long long)g_pkey2[i].n1d, (unsigned long long)g_pkey2[i].n1dk, nw, g_pkey2[i].caller);
+       }
++      /* round9b 第三表：pkey2 也满后首见的 key（族大小确认）。 */
++      for (unsigned i = 0; i < g_pkey3_n; i++) {
++          int nw = 0; for (thr_t *w = g_wait; w; w = w->next) if (w->wkind == 2 && w->wkey == g_pkey3[i].key) nw++;
++          fprintf(stderr, "[totk-dump] pkey3 %#llx wait(0x1C)=%llu sig(0x1D)=%llu woke=%llu waiters=%d sig-caller=h%#x\n",
++                  (unsigned long long)g_pkey3[i].key, (unsigned long long)g_pkey3[i].n1c,
++                  (unsigned long long)g_pkey3[i].n1d, (unsigned long long)g_pkey3[i].n1dk, nw, g_pkey3[i].caller);
++      }
++    }
++    /* ---------- round9b CreateThread/StartThread 全量账本（E2 宿主侧排查项）----------
++       与上方线程名册（每行已带 entry=… arg=…）diff：账本里没有的 entry=从未创建；
++       有 entry 无 started=建了没 Start；rejects>0=创建失败（末次样本随行）。 */
++    fprintf(stderr, "[totk-dump] CreateThread ledger: calls=%llu entries=%u rejects=%llu (StartThread calls=%llu bad=%llu)\n",
++            (unsigned long long)g_ct_calls, g_ct_n, (unsigned long long)g_ct_rejects,
++            (unsigned long long)g_ct_start_calls, (unsigned long long)g_ct_start_bad);
++    for (unsigned i = 0; i < g_ct_n; i++)
++        fprintf(stderr, "[totk-dump] ct[%u] h=%#x entry=%#llx arg=%#llx sp=%#llx prio=%d core=%d started=%d ret=%#x\n",
++                i, g_ct[i].handle, (unsigned long long)g_ct[i].entry, (unsigned long long)g_ct[i].arg,
++                (unsigned long long)g_ct[i].stack_top, g_ct[i].prio, g_ct[i].core, g_ct[i].started, g_ct[i].ret);
++    if (g_ct_rejects)
++        fprintf(stderr, "[totk-dump] ct last reject entry=%#llx arg=%#llx prio=%d core=%d ret=%#x\n",
++                (unsigned long long)g_ct_last_reject.entry, (unsigned long long)g_ct_last_reject.arg,
++                g_ct_last_reject.prio, g_ct_last_reject.core, g_ct_last_reject.ret);
++    /* ---------- round9b E1/E2 观测门 + E4 两族合流检验（放锁后；spin_read16 是 EFAULT 安全读）----------
++       E1（main+0x57f950 元素数组门，game_patches.c）：末次快照 {el, this}，this+0x58 即发 key 表达式；
++       E4：等 key-0x78=worker 对象、发 key-0x58=池对象，两族交集=0 时唯一可能相等的绑定
++       [el+0x10]==worker+0x20（=wkey-0x58）在此直接判出。 */
++    {
++      extern uint64_t smo_obs_hits(int);
++      extern uint64_t smo_obs_last_x0(int);
++      extern unsigned smo_obs_e1_snapshot(uint64_t *, uint64_t *, unsigned, uint64_t *, uint64_t *, unsigned *);
++      fprintf(stderr, "[totk-dump] obs E1 0x57f950 hits=%llu last_x0=%#llx\n",
++              (unsigned long long)smo_obs_hits(0), (unsigned long long)smo_obs_last_x0(0));
++      fprintf(stderr, "[totk-dump] obs E2 drain 0x8aef34 hits=%llu last_x0=%#llx\n",
++              (unsigned long long)smo_obs_hits(1), (unsigned long long)smo_obs_last_x0(1));
++      fprintf(stderr, "[totk-dump] obs E2 drain 0x8af418 hits=%llu last_x0=%#llx\n",
++              (unsigned long long)smo_obs_hits(2), (unsigned long long)smo_obs_last_x0(2));
++      static uint64_t e1el[128], e1th[128];
++      uint64_t obj = 0, arr = 0; unsigned trunc = 0;
++      unsigned n = smo_obs_e1_snapshot(e1el, e1th, 128, &obj, &arr, &trunc);
++      fprintf(stderr, "[totk-dump] E1 snapshot: obj=%#llx arr=%#llx count=%u%s\n",
++              (unsigned long long)obj, (unsigned long long)arr, n, trunc ? " (TRUNCATED, see trunc count)" : "");
++      if (trunc) fprintf(stderr, "[totk-dump] E1 truncated count=%u (cap 128)\n", trunc);
++      for (unsigned i = 0; i < n; i++) {
++          uint64_t th = e1th[i];
++          fprintf(stderr, "[totk-dump] E1 el[%u]=%#llx this=[el+0x10]=%#llx sig-key(this+0x58)=%#llx",
++                  i, (unsigned long long)e1el[i], (unsigned long long)th, (unsigned long long)(th + 0x58));
++          uint64_t mq2[2];
++          if (th > 0x100000000ULL && spin_read16(th + 0x10, mq2)) {   /* +0x10/+0x18 一并取；发 key=MQ+0x40 模型对账 */
++              uint64_t mq = mq2[1];
++              fprintf(stderr, " [this+0x18]=MQ=%#llx mq-key(MQ+0x40)=%#llx", (unsigned long long)mq, (unsigned long long)(mq + 0x40));
++          }
++          fputc('\n', stderr);
++      }
++      /* E4：两族推导表 + 交集判定（worker=key-0x78；池对象=key-0x58；绑定=[el+0x10]==wkey-0x58）。 */
++      int confluence = 0, binding = 0;
++      for (thr_t *w = g_wait; w; w = w->next) if (w->wkind == 2) {
++          uint64_t worker = w->wkey - 0x78;
++          uint64_t wv[2] = {0, 0};
++          int got = worker > 0x100000000ULL && spin_read16(worker + 0x20, wv);
++          fprintf(stderr, "[totk-dump] E4 waiter h=%#x wkey=%#llx worker=%#llx [worker+0x20]=%#llx\n",
++                  w->handle, (unsigned long long)w->wkey, (unsigned long long)worker,
++                  (unsigned long long)(got ? wv[0] : 0));
++      }
++      for (unsigned t = 0; t < 3; t++) {
++          unsigned cnt = t == 0 ? g_pkey_n : t == 1 ? g_pkey2_n : g_pkey3_n;
++          for (unsigned i = 0; i < cnt; i++) {
++              uint64_t key = t == 0 ? g_pkey[i].key : t == 1 ? g_pkey2[i].key : g_pkey3[i].key;
++              fprintf(stderr, "[totk-dump] E4 sig-key %#llx (pkey%s) pool-obj(key-0x58)=%#llx\n",
++                      (unsigned long long)key, t == 0 ? "" : t == 1 ? "2" : "3", (unsigned long long)(key - 0x58));
++              for (thr_t *w = g_wait; w; w = w->next) if (w->wkind == 2 && w->wkey == key) confluence = 1;
++          }
++      }
++      /* 绑定判定独立小循环（可读性优先）：[el+0x10] == 任一停泊 worker 的 wkey-0x58 */
++      for (unsigned j = 0; j < n; j++) {
++          if (!e1th[j]) continue;
++          for (thr_t *w = g_wait; w; w = w->next) if (w->wkind == 2 && e1th[j] == w->wkey - 0x58) {
++              binding++;
++              fprintf(stderr, "[totk-dump] E4 BINDING: E1 this %#llx == worker+0x20 of waiter h=%#x (wkey=%#llx)\n",
++                      (unsigned long long)e1th[j], w->handle, (unsigned long long)w->wkey);
++          }
++      }
++      fprintf(stderr, "[totk-dump] E4 verdict: key-confluence(sig-key==wait-key)=%d e1-binding(this==worker+0x20)=%d\n",
++              confluence, binding);
+     }
+     /* round6 观测（任务3）：h=0x1023 的 svc 0x18 醒来计数——calls=进入等待次数，woken=被唤醒返回次数，
+        woken-by-0x101f=其中被目标事件 0x101f 唤醒的（woken 与之恒等差=被别的句柄或超时喂醒）。 */

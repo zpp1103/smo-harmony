@@ -1,0 +1,275 @@
+diff --git a/mario-odessy-harmony/entry/src/main/cpp/ohos_compat/ohos_compat.h b/mario-odessy-harmony/entry/src/main/cpp/ohos_compat/ohos_compat.h
+index 61667e5..6c4ff3c 100644
+--- a/mario-odessy-harmony/entry/src/main/cpp/ohos_compat/ohos_compat.h
++++ b/mario-odessy-harmony/entry/src/main/cpp/ohos_compat/ohos_compat.h
+@@ -270,20 +270,21 @@ static inline unsigned long long compat_clock_ns(int clk) { (void)clk; return ma
+ #ifndef MAP_ANON
+ #define MAP_ANON MAP_ANONYMOUS
+ #endif
+-static inline int pthread_set_qos_class_self_np(int cls, int rel) { (void)cls; (void)rel; return 0; }
++/* ---- pthread QoS：原空桩（set 恒 0 / get 恒 DEFAULT）改真实现，定义在 ohos_stub.c ----
++   dlopen libqos.so 解析 OH_QoS_SetThreadQoS / OH_QoS_ResetThreadQoS / OH_QoS_GetThreadQoS
++   （sysroot qos/qos.h，KernelEnhanceKit API 12+），Apple QOS_CLASS_* 四级映射 OHOS QoS_Level；
++   libqos 缺失时打一行日志后安全退化（set 返 -1，get 报 UNSPECIFIED）。声明取代 static inline：
++   dlopen 缓存与退化日志全进程一份，不能每翻译单元各持一份。
++   调用点：host/threads.c 客体线程 QoS（donor dm/host/hle_thread.c:287-292 同构）、
++   audio_renderer / nvn_mtl 宿主线程。 */
+ typedef int qos_class_t;
++int pthread_set_qos_class_self_np(int cls, int rel);
++int pthread_get_qos_class_np(void *tid, qos_class_t *cls, int *rel);
+ #define QOS_CLASS_UNSPECIFIED -1
+ #define QOS_CLASS_USER_INTERACTIVE 0
+ #define QOS_CLASS_USER_INITIATED 1
+ #define QOS_CLASS_DEFAULT 2
+ #define QOS_CLASS_UTILITY 3
+-static inline int pthread_get_qos_class_np(void *tid, qos_class_t *cls, int *rel) {
+-    (void)tid; if (cls) *cls = QOS_CLASS_DEFAULT; if (rel) *rel = 0; return 0;
+-}
+-#define QOS_CLASS_USER_INTERACTIVE 0
+-#define QOS_CLASS_USER_INITIATED 1
+-#define QOS_CLASS_DEFAULT 2
+-#define QOS_CLASS_UTILITY 3
+ 
+ static inline int proc_pidpath(int pid, char *buf, size_t len) {
+     (void)pid;
+diff --git a/mario-odessy-harmony/entry/src/main/cpp/ohos_compat/ohos_stub.c b/mario-odessy-harmony/entry/src/main/cpp/ohos_compat/ohos_stub.c
+index 46298eb..d531c49 100644
+--- a/mario-odessy-harmony/entry/src/main/cpp/ohos_compat/ohos_stub.c
++++ b/mario-odessy-harmony/entry/src/main/cpp/ohos_compat/ohos_stub.c
+@@ -412,3 +412,66 @@ uint64_t mach_continuous_time(void) {
+     clock_gettime(CLOCK_MONOTONIC, &ts);
+     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+ }
++
++/* ---- pthread QoS 真实现（ohos_compat.h 原空桩的函数体，round20b）----
++ * OHOS QoS 只能设/查「当前线程」（sysroot qos/qos.h：OH_QoS_SetThreadQoS /
++ * OH_QoS_ResetThreadQoS / OH_QoS_GetThreadQoS，libqos.so，API 12+），与 Apple
++ * pthread_set/get_qos_class_*_np 的自身线程语义刚好对齐（get 的调用点全部传
++ * pthread_self()，其它 tid 一律报 UNSPECIFIED）。Apple QOS_CLASS_* → QoS_Level：
++ *   USER_INTERACTIVE(0)→QOS_USER_INTERACTIVE(5)   USER_INITIATED(1)→QOS_USER_INITIATED(3)
++ *   DEFAULT(2)→QOS_DEFAULT(2)                     UTILITY(3)→QOS_UTILITY(1)
++ *   UNSPECIFIED(-1)→OH_QoS_ResetThreadQoS（撤掉已设级，回系统缺省）
++ * 直接链 -lqos 亦可，取 dlopen：老系统无 libqos.so 时不挂构建期链接，运行期才退化——
++ * 首次调用初始化失败只打一行日志，之后 set 返 -1、get 报 QOS_CLASS_UNSPECIFIED。 */
++#include <pthread.h>
++#include <dlfcn.h>
++#include <qos/qos.h>
++
++typedef int (*qos_set_fn)(QoS_Level);
++typedef int (*qos_reset_fn)(void);
++typedef int (*qos_get_fn)(QoS_Level *);
++static qos_set_fn qos_set;
++static qos_reset_fn qos_reset;
++static qos_get_fn qos_get;
++static void qos_lib_init(void) {
++    void *h = dlopen("libqos.so", RTLD_NOW | RTLD_LOCAL);
++    if (h) {
++        qos_set = (qos_set_fn)dlsym(h, "OH_QoS_SetThreadQoS");
++        qos_reset = (qos_reset_fn)dlsym(h, "OH_QoS_ResetThreadQoS");
++        qos_get = (qos_get_fn)dlsym(h, "OH_QoS_GetThreadQoS");
++    }
++    if (!h || !qos_set || !qos_reset || !qos_get)
++        fprintf(stderr, "[qos] libqos.so unavailable (dlopen/dlsym failed): thread QoS degrades to no-op\n");
++}
++int pthread_set_qos_class_self_np(int cls, int rel) {
++    static pthread_once_t once = PTHREAD_ONCE_INIT;
++    pthread_once(&once, qos_lib_init);
++    (void)rel;
++    if (!qos_set) return -1;
++    switch (cls) {
++    case QOS_CLASS_USER_INTERACTIVE: return qos_set(QOS_USER_INTERACTIVE);
++    case QOS_CLASS_USER_INITIATED:   return qos_set(QOS_USER_INITIATED);
++    case QOS_CLASS_DEFAULT:          return qos_set(QOS_DEFAULT);
++    case QOS_CLASS_UTILITY:          return qos_set(QOS_UTILITY);
++    case QOS_CLASS_UNSPECIFIED:      return qos_reset();
++    default: return -1;
++    }
++}
++int pthread_get_qos_class_np(void *tid, qos_class_t *cls, int *rel) {
++    static pthread_once_t once = PTHREAD_ONCE_INIT;
++    pthread_once(&once, qos_lib_init);
++    if (rel) *rel = 0;
++    if (cls) *cls = QOS_CLASS_UNSPECIFIED;
++    if (!qos_get || (tid && tid != (void *)pthread_self())) return 0;
++    QoS_Level l;
++    if (qos_get(&l) != 0) return 0;   /* 未设级（GetThreadQoS 返 -1）：按 UNSPECIFIED 报 */
++    if (cls) switch (l) {
++    case QOS_USER_INTERACTIVE: *cls = QOS_CLASS_USER_INTERACTIVE; break;
++    case QOS_USER_INITIATED:   *cls = QOS_CLASS_USER_INITIATED; break;
++    case QOS_DEFAULT:          *cls = QOS_CLASS_DEFAULT; break;
++    case QOS_UTILITY:          *cls = QOS_CLASS_UTILITY; break;
++    case QOS_BACKGROUND:       *cls = QOS_CLASS_UTILITY; break;   /* Apple 侧无 BACKGROUND 宏，就近代入 */
++    default:                   *cls = QOS_CLASS_USER_INTERACTIVE; break;   /* QOS_DEADLINE_REQUEST：高于 interactive 的请求级 */
++    }
++    return 0;
++}
+diff --git a/mario-odessy-harmony/entry/src/main/cpp/host/threads.c b/mario-odessy-harmony/entry/src/main/cpp/host/threads.c
+index 4b992d1..82b0a25 100644
+--- a/mario-odessy-harmony/entry/src/main/cpp/host/threads.c
++++ b/mario-odessy-harmony/entry/src/main/cpp/host/threads.c
+@@ -66,6 +66,7 @@ typedef struct thr {
+     uint64_t nsvc;             // SVC 次数（现场导出用） | SVC count (for the state dump)
+     mach_port_t mport;         // 宿主线程端口（取 CPU 时间） | Host thread port (to get CPU time)
+     uint32_t qos;
++    _Atomic int qos_pending;   // 他线程 SetThreadPriority 改了 prio：目标线程下次 SVC 入口自套用（OH_QoS 只能设自身线程；donor hle_thread.c:77）
+     _Atomic int cur_core;              // virtual core held while running guest code, -1 while blocked / not started
+     _Atomic int preempt;               // a higher-priority thread waits for this thread's core
+     _Atomic int kicked;
+@@ -293,6 +294,30 @@ uint32_t (*dm_thread_tick_fn)(void);   // 取当前游戏拍；diag.c 初始化
+ void crash_thread_init(void);
+ void guest_thread_init(void);   // thread.c：每线程 TSD 槽（门、x18、TLS、TLR）唯一设置点 | thread.c: the single place that sets the per-thread TSD slots (gate, x18, TLS, TLR)
+ __attribute__((weak)) void runtime_hle_stack_set(uintptr_t top) { (void)top; }   // standalone thread probe: no host-stack switch
++// ---------- 线程 QoS（donor dm/host/hle_thread.c:273-292 同构，round20b）----------
++// Switch 优先级 → OHOS QoS 级。SMO_QOS_MAP 带状映射（默认开；=0 回 donor 缺省：客体线程一律
++// USER_INTERACTIVE，性能控制器全压快核——donor 的 DM_QOS_MAP 真机 A/B 前默认关，本宿主反向默认开）。
++// 带状：prio≤e1（默认 44，主线程即 44）USER_INTERACTIVE、≤e2（默认 50）USER_INITIATED、其余 UTILITY
++// （SetThreadPriority 合法域 28-59 的 51-59 落 UTILITY）；SMO_QOS_EDGES=e1,e2 可改（env 法，非编译期）。
++// svc_thread_main_init 里读一次，早于任何其它客体线程。真实现见 ohos_stub.c（dlopen libqos.so）。
++static int g_qos_map = 1, g_qos_e1 = 44, g_qos_e2 = 50;
++static void qos_map_init(void) {
++    const char *e = getenv("SMO_QOS_MAP"), *d = getenv("SMO_QOS_EDGES");
++    g_qos_map = e ? atoi(e) : 1;
++    if (d) sscanf(d, "%d,%d", &g_qos_e1, &g_qos_e2);
++    if (g_qos_map) LOG("SMO_QOS_MAP=1: guest threads get QoS by priority (≤%d interactive, ≤%d user-initiated, the rest utility)", g_qos_e1, g_qos_e2);
++}
++static qos_class_t prio_qos(int prio) {
++    if (!g_qos_map) return QOS_CLASS_USER_INTERACTIVE;
++    return prio <= g_qos_e1 ? QOS_CLASS_USER_INTERACTIVE : prio <= g_qos_e2 ? QOS_CLASS_USER_INITIATED : QOS_CLASS_UTILITY;
++}
++static void qos_apply(thr_t *t) {   // 在目标线程自身上调用、持 G（prio/qos 与调度读者共享；donor hle_thread.c:287-290）
++    qos_class_t q = prio_qos(t->prio);
++    if ((uint32_t)q != t->qos && !pthread_set_qos_class_self_np(q, 0)) t->qos = (uint32_t)q;
++}
++// 宿主辅助线程（音频 notify/静音池/capture、vsync）从客体线程创建会继承客体类；SMO_QOS_MAP 下自设
++// （donor dm_host_helper_qos，hle_thread.c:291-292）。本宿主一律 QOS_CLASS_DEFAULT：别继承客体高类。
++void dm_host_helper_qos(int q) { if (g_qos_map) pthread_set_qos_class_self_np((qos_class_t)q, 0); }
+ static void *thread_main(void *p) {
+     thr_t *t = p;
+ #ifdef __MUSL__
+@@ -311,10 +336,14 @@ static void *thread_main(void *p) {
+         if (ss.ss_sp) { ss.ss_size = 16384; ss.ss_flags = 0; sigaltstack(&ss, NULL); }
+     }
+     pthread_setspecific(g_keythr, t);
+-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
++    // donor hle_thread.c:296-303：CreateThread 可能已把 t 链入 g_all（读者与 SetThreadPriority 持 G），
++    // 持 G 设自身 QoS 并读回；QoS 级按带状映射取（SMO_QOS_MAP=0 时即全 USER_INTERACTIVE）
++    pthread_mutex_lock(&G);
++    pthread_set_qos_class_self_np(prio_qos(t->prio), 0);
+     qos_class_t qc = QOS_CLASS_UNSPECIFIED; int rp = 0;
+     pthread_get_qos_class_np(pthread_self(), &qc, &rp); t->qos = (uint32_t)qc;
+     t->mport = pthread_mach_thread_np(pthread_self());
++    pthread_mutex_unlock(&G);
+ 
+     guest_thread_init();
+     pthread_mutex_lock(&G); while (!t->started) pthread_cond_wait(&t->cv, &G); core_take(t); pthread_mutex_unlock(&G);
+@@ -352,14 +381,18 @@ void dm_thread_returned(void) { die("客体线程入口函数返回（Horizon 
+ // Register the main thread and return its handle (passed to nnosInitialize as the main thread handle)
+ uint32_t svc_thread_main_init(void) {
+     pthread_key_create(&g_keythr, NULL);
++    qos_map_init();   // donor hle_thread.c:480：早于任何其它客体线程读一次开关与带边
+     thr_t *t = calloc(1, sizeof *t);
++    t->qos = (uint32_t)QOS_CLASS_UNSPECIFIED;   /* calloc 零值在本 shim 里恰是 INTERACTIVE（Apple 原值 0=UNSPECIFIED），标「未读回」防 qos_apply 首设被去重跳过 */
+     pthread_cond_init(&t->cv, NULL);
+     t->started = 1; t->prio = 44; t->core = 0; t->mask = 7; t->pt = pthread_self(); t->mport = pthread_mach_thread_np(t->pt);
+     t->cur_core = -1;
+     pthread_mutex_lock(&G); t->handle = h_new(O_THREAD, t, 0); t->id = g_next_id++; t->all = g_all; g_all = t; core_take(t); pthread_mutex_unlock(&G);
+     pthread_setspecific(g_keythr, t);
++    qos_apply(t);   // donor hle_thread.c:490：发布主线程前先按客体策略设级（继承自 appspawn 的宿主缺省不可靠）
+     qos_class_t qc = QOS_CLASS_UNSPECIFIED; int rp = 0;
+     pthread_get_qos_class_np(pthread_self(), &qc, &rp); t->qos = (uint32_t)qc;
++    LOG("main guest thread QoS %#x (priority %d)", t->qos, t->prio);   // donor hle_thread.c:497 生效行（真机探针 grep "QoS"）
+     return t->handle;
+ }
+ 
+@@ -641,7 +674,12 @@ static void evlog(uint32_t op, uint32_t h, uint32_t h2, uint64_t lr) {
+ }
+ 
+ int svc_thread(int num, uint64_t *regs) {
+-	{ thr_t *me = (g_keythr ? pthread_getspecific(g_keythr) : NULL); if (me) { me->last_svc = num; me->last_lr = regs[30]; me->last_fp = regs[29]; me->nsvc++; } }
++	{ thr_t *me = (g_keythr ? pthread_getspecific(g_keythr) : NULL); if (me) { me->last_svc = num; me->last_lr = regs[30]; me->last_fp = regs[29]; me->nsvc++;
++	       /* services.c 对每个 SVC 都先走这里 ⇒ 即 donor 的 thr_svc_enter（hle_thread.c:361-366）：
++	          他线程改过本线程 prio（qos_pending）就在此自套用——OH_QoS 只能设自身线程 */
++	       if (atomic_load_explicit(&me->qos_pending, memory_order_relaxed) && atomic_exchange(&me->qos_pending, 0)) {
++	           pthread_mutex_lock(&G); qos_apply(me); pthread_mutex_unlock(&G);
++	       } } }
+ 
+     switch (num) {
+     case 0x08: {  // CreateThread(→w1 句柄; x1 入口, x2 参数, x3 栈顶, w4 优先级, w5 核) | CreateThread(→w1 handle; x1 entry, x2 argument, x3 stack top, w4 priority, w5 core)
+@@ -723,7 +761,11 @@ int svc_thread(int num, uint64_t *regs) {
+         return 1;
+     }
+     case 0x0C: { pthread_mutex_lock(&G);thr_t *t = h_get((uint32_t)regs[1], O_THREAD); regs[0] = t ? 0 : R_BAD_HANDLE; regs[1] = t ? (uint64_t)t->prio : 0; pthread_mutex_unlock(&G);return 1; }
+-    case 0x0D: { if(regs[1]<28||regs[1]>59){regs[0]=R_BAD_STATE;return 1;}pthread_mutex_lock(&G);thr_t *t = h_get((uint32_t)regs[0], O_THREAD); if (t) t->prio = (int)regs[1]; regs[0] = t ? 0 : R_BAD_HANDLE;pthread_mutex_unlock(&G); return 1; }
++    case 0x0D: { if(regs[1]<28||regs[1]>59){regs[0]=R_BAD_STATE;return 1;}pthread_mutex_lock(&G);thr_t *t = h_get((uint32_t)regs[0], O_THREAD); if (t) { t->prio = (int)regs[1];
++               /* donor hle_thread.c:894-896：SMO_QOS_MAP 下 QoS 级随 prio——设自身线程立即生效，
++                  改他线程只置 qos_pending，目标线程下次 SVC 入口自套用（OH_QoS 无跨线程入口） */
++               if (g_qos_map) { if (t == cur()) qos_apply(t); else atomic_store(&t->qos_pending, 1); } }
++               regs[0] = t ? 0 : R_BAD_HANDLE;pthread_mutex_unlock(&G); return 1; }
+     case 0x0E: { pthread_mutex_lock(&G);thr_t *t = h_get((uint32_t)regs[2], O_THREAD);
+                  regs[0] = t ? 0 : R_BAD_HANDLE; regs[1] = t ? (uint64_t)(uint32_t)t->core : 0; regs[2] = t ? t->mask : 0;pthread_mutex_unlock(&G); return 1; }
+     case 0x0F: {  // SetThreadCoreMask(w0, w1 理想核, x2 掩码)：-1 = 用进程缺省、-2/-3 = 不改理想核；宿主只记账 | SetThreadCoreMask(w0, w1 ideal core, x2 mask): -1 = use the process default, -2/-3 = leave the ideal core unchanged; the host only keeps the bookkeeping
+diff --git a/mario-odessy-harmony/entry/src/main/cpp/host/runtime.h b/mario-odessy-harmony/entry/src/main/cpp/host/runtime.h
+index de58482..95c1c85 100644
+--- a/mario-odessy-harmony/entry/src/main/cpp/host/runtime.h
++++ b/mario-odessy-harmony/entry/src/main/cpp/host/runtime.h
+@@ -72,6 +72,10 @@ void runtime_startup_checkpoint(uintptr_t caller);
+ uint64_t runtime_now_ns(void);
+ uint32_t svc_thread_main_init(void);
+ int svc_thread(int num,uint64_t *regs);
++/* threads.c（round20b）：宿主辅助线程（音频 notify/静音池/capture、vsync）入口调用——SMO_QOS_MAP
++   下自设 QoS 级、防继承创建它的客体线程的高类（donor dm_host_helper_qos 同构；本宿主传 QOS_CLASS_DEFAULT）。
++   参数用 int：qos_class_t 在 ohos_compat.h/pthread qos shim 里均为 int 别名。 */
++void dm_host_helper_qos(int q);
+ 
+ void *runtime_gfx_override(const char *name);
+ int runtime_gfx_fault(void *addr,int is_write,void *context);
+diff --git a/mario-odessy-harmony/entry/src/main/cpp/host/audio_out.c b/mario-odessy-harmony/entry/src/main/cpp/host/audio_out.c
+index 5180500..b60b152 100644
+--- a/mario-odessy-harmony/entry/src/main/cpp/host/audio_out.c
++++ b/mario-odessy-harmony/entry/src/main/cpp/host/audio_out.c
+@@ -45,6 +45,7 @@ static void played(void *user, AudioQueueRef q, AudioQueueBufferRef b) {   /* Co
+ }
+ static void *silent_playback(void *arg) {
+     AudioOut *o = arg; uint64_t due = 0;
++    dm_host_helper_qos(QOS_CLASS_DEFAULT);   /* round20b：宿主辅助线程别继承客体高类（donor dm_host_helper_qos） */
+     for (;;) {
+         pthread_mutex_lock(&o->lock);
+         if (!o->running) { pthread_mutex_unlock(&o->lock); return NULL; }
+diff --git a/mario-odessy-harmony/entry/src/main/cpp/host/audio_mixer.c b/mario-odessy-harmony/entry/src/main/cpp/host/audio_mixer.c
+index f0afea1..a9f8729 100644
+--- a/mario-odessy-harmony/entry/src/main/cpp/host/audio_mixer.c
++++ b/mario-odessy-harmony/entry/src/main/cpp/host/audio_mixer.c
+@@ -62,6 +62,7 @@ static void report_once(Mixer *m, unsigned bit, const char *msg, int value) {
+    memory: filesystem writes and close/flush belong to this worker. */
+ static void *capture_write(void *ctx) {
+     Mixer *m=ctx;
++    dm_host_helper_qos(QOS_CLASS_DEFAULT);   /* round20b：宿主辅助线程别继承客体高类（donor dm_host_helper_qos） */
+     pthread_mutex_lock(&m->capture_lock);
+     while(!m->capture_done && !m->capture_closing)pthread_cond_wait(&m->capture_cond,&m->capture_lock);
+     uint64_t n=m->capture_frames;
+diff --git a/mario-odessy-harmony/entry/src/main/cpp/host/audio_renderer.c b/mario-odessy-harmony/entry/src/main/cpp/host/audio_renderer.c
+index af8eef6..757721d 100644
+--- a/mario-odessy-harmony/entry/src/main/cpp/host/audio_renderer.c
++++ b/mario-odessy-harmony/entry/src/main/cpp/host/audio_renderer.c
+@@ -253,7 +253,7 @@ static void advance_voice(AudioRenderer *r, ServerVoice *v, double out_seconds)
+ }
+ static void *render_thread(void *p) {
+     AudioRenderer *r = p;
+-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE,0);
++    dm_host_helper_qos(QOS_CLASS_DEFAULT);   /* round20b：原直接设 INTERACTIVE（空桩期无效）改宿主辅助线程自设 default——别继承客体高类（donor dm_host_helper_qos） */
+     const double frame = (double)r->param.sample_count / r->param.sample_rate;
+     struct timespec next; clock_gettime(CLOCK_MONOTONIC, &next);
+     while (__atomic_load_n(&r->running, __ATOMIC_ACQUIRE)) {
+diff --git a/mario-odessy-harmony/entry/src/main/cpp/host/services.c b/mario-odessy-harmony/entry/src/main/cpp/host/services.c
+index 4f49f0a..57dc2fa 100644
+--- a/mario-odessy-harmony/entry/src/main/cpp/host/services.c
++++ b/mario-odessy-harmony/entry/src/main/cpp/host/services.c
+@@ -298,7 +298,7 @@ static uint32_t host_vi_get_native_window(void **nw,void *layer){(void)layer;*nw
+    event_t 节点，宿主从不 signal vsync ⇒ 装库永等。真机 vsync 是 60Hz 硬件常驻信号——宿主起
+    60Hz 定时线程喂 hle_signal_system_event（该入口注释原话就是为"显示链接的垂直同步回调"设计的
+    宿主侧调用，含未绑定自动跳过护栏，游戏销毁事件后安全）。 */
+-static void *vsync_tick(void *p){for(;;){usleep(16667);hle_signal_system_event(p);}return NULL;}
++static void *vsync_tick(void *p){dm_host_helper_qos(QOS_CLASS_DEFAULT);for(;;){usleep(16667);hle_signal_system_event(p);}return NULL;}   /* round20b：vsync 宿主辅助线程自设 default（donor dm_host_helper_qos），别继承客体高类 */
+ static uint32_t host_vi_get_display_vsync_event(void *ev,void *display){
+  (void)display;hle_bind_system_event(ev,1);
+  static int armed;if(!armed){armed=1;pthread_t th;if(pthread_create(&th,NULL,vsync_tick,ev)!=0)runtime_fail("vsync tick thread");pthread_detach(th);fprintf(stderr,"[totk] vsync 60Hz signal armed\n");}

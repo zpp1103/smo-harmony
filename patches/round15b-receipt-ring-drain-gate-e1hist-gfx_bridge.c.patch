@@ -1,0 +1,186 @@
+--- /Users/zpp/ZCodeProject/switch2mac/switch2hos/mario-odessy-harmony/entry/src/main/cpp/host/gfx_bridge.c	2026-11-01 09:03:27
++++ /Users/zpp/VibeCoding/ns-mario-odessy-to-harmony/mario-odessy-harmony/entry/src/main/cpp/host/gfx_bridge.c	2026-11-01 09:44:04
+@@ -335,7 +335,11 @@
+ static void *nvn_buffer_get_memory_pool(const void *buf){return ((buf_h *)buf)->pool;}   /* donor :294 */
+ static int64_t nvn_buffer_get_memory_offset(const void *buf){return (int64_t)((const buf_h *)buf)->off;}   /* donor :295 */
+ typedef struct{uint32_t magic,recording;uint8_t *cur;uint64_t guest_flags;uint8_t *end;uint64_t inline_cur,inline_end;void *cb,*cb_data,*dev;uint8_t *seg;void *ctl;uint64_t ctl_size,game_size,cmd_base,cmd_used,ctl_used,rec_start,hw_used,last_rec,hw_start;} cmd_h;   /* =nvn_obj.h:70-87 cmd_t 字段序一致（guest_flags@0x10、inline_cur@0x20、inline_end@0x28 同 donor 断言） */
+-static uint64_t nvn_command_buffer_initialize(void *c,void *d){cmd_h *o=c;memset(o,0,sizeof(cmd_h));o->magic=0x434d4442;o->dev=d;o->inline_cur=~(uint64_t)0;o->inline_end=0;{static unsigned n;if(n++<8)fprintf(stderr,"[nvn] CommandBufferInitialize %p\n",c);}return 1;}   /* 'CMDB'，donor :773-775；round48 起打点：worker 提交前置判别（boot 期已 2 块，新指针=worker 建 CB） */
++/* round15b 回执环前置声明（实现块在下方 GPU 值写入族处；record/submit/复用生命周期都挂进去）。 */
++static void nvn_rcpt_drop(void *cmd);
++static void nvn_rcpt_map(uint64_t h,cmd_h *c);
++static void nvn_rcpt_submit(int n,const uint64_t *handles);
++static uint64_t nvn_command_buffer_initialize(void *c,void *d){cmd_h *o=c;nvn_rcpt_drop(o);memset(o,0,sizeof(cmd_h));o->magic=0x434d4442;o->dev=d;o->inline_cur=~(uint64_t)0;o->inline_end=0;{static unsigned n;if(n++<8)fprintf(stderr,"[nvn] CommandBufferInitialize %p\n",c);}return 1;}   /* 'CMDB'，donor :773-775；round48 起打点：worker 提交前置判别（boot 期已 2 块，新指针=worker 建 CB）；round15b 同址复用先弃旧回执 */
+ static void nvn_command_buffer_add_command_memory(void *c,const void *p,int64_t off,uint64_t n){cmd_h *o=c;const pool_h *pp=p;o->cmd_base=(uintptr_t)(pp?pp->mem:NULL)+(uintptr_t)off;o->game_size=n;o->cmd_used=0;o->hw_used=0;{static const void *seen[8];static unsigned ns;int hit=0;for(unsigned i=0;i<ns;i++)if(seen[i]==c)hit=1;if(!hit&&ns<8){seen[ns++]=c;fprintf(stderr,"[nvn] CB %p AddCommandMemory pool=%p off=%#llx n=%#llx base=%#llx\n",c,p,(unsigned long long)off,(unsigned long long)n,(unsigned long long)o->cmd_base);}}}   /* donor AddCommandMemory（accounting only）；round48 打点：命令内存授予是录制前置（缺它=worker CB 未配 */
+ static void nvn_command_buffer_add_control_memory(void *c,void *m,uint64_t n){cmd_h *o=c;o->ctl=m;o->ctl_size=n;o->ctl_used=0;{static const void *seen[8];static unsigned ns;int hit=0;for(unsigned i=0;i<ns;i++)if(seen[i]==c)hit=1;if(!hit&&ns<8){seen[ns++]=c;fprintf(stderr,"[nvn] CB %p AddControlMemory mem=%p n=%#llx\n",c,m,(unsigned long long)n);}}}   /* donor :840-844；round48 打点同上 */
+ static uint64_t nvn_command_buffer_get_command_memory_size(const void *c){return ((const cmd_h *)c)->game_size;}   /* donor :858 */
+@@ -498,8 +502,8 @@
+ static uint64_t nvn_queue_wait_sync(void *q,const void *s){(void)q;(void)s;{static unsigned n;if(n++<1)fprintf(stderr,"[nvn] QueueWaitSync -> 1 (waited work already done)\n");}return 1;}   /* donor :654：等待的活已在提交序前跑完 */
+ static void nvn_queue_flush(void *q){(void)q;{static unsigned n;if(n++<1)fprintf(stderr,"[nvn] QueueFlush %p -> immediate (nothing in flight)\n",q);}}   /* donor :728 空实现；提交即退休 */
+ static void nvn_queue_finish(void *q){(void)q;{static unsigned n;if(n++<1)fprintf(stderr,"[nvn] QueueFinish %p -> immediate (nothing in flight)\n",q);}}   /* donor :729 排空回放；本宿主无在飞工作 */
+-static void nvn_queue_submit_commands(void *q,int n,const void *h){(void)q;(void)h;{static unsigned nlogged;if(nlogged++<1)fprintf(stderr,"[nvn] QueueSubmitCommands %p n=%d -> retired immediately (no replay layer)\n",q,n);}}   /* donor :2245 入回放队列；本宿主命令只记账不回放，退休无副作用 */
+-static uint64_t nvn_command_buffer_end_recording(void *c){cmd_h *o=c;o->recording=0;o->ctl_used+=64;g_nvn_ctl_total+=64;uint64_t h=++g_nvn_handle_gen;{static unsigned n;if(n++<4)fprintf(stderr,"[nvn] CommandBufferEndRecording -> handle %#llx hw_used=%#llx game_size=%#llx ctl_used=%#llx\n",(unsigned long long)h,(unsigned long long)o->hw_used,(unsigned long long)o->game_size,(unsigned long long)o->ctl_used);}return h;}   /* donor :1061/:1086：返句柄 + 控制内存记账 64B；P0 补 recording 清零与用量日志（RSTB 尺寸取证） */
++static void nvn_queue_submit_commands(void *q,int n,const void *h){(void)q;{static unsigned nlogged;if(nlogged++<1)fprintf(stderr,"[nvn] QueueSubmitCommands %p n=%d -> retired immediately (no replay layer)\n",q,n);}nvn_rcpt_submit(n,(const uint64_t *)h);}   /* donor :2245 入回放队列；round15b：退休=回放完成，回执环此刻写真内存 */
++static uint64_t nvn_command_buffer_end_recording(void *c){cmd_h *o=c;o->recording=0;o->ctl_used+=64;g_nvn_ctl_total+=64;uint64_t h=++g_nvn_handle_gen;nvn_rcpt_map(h,o);{static unsigned n;if(n++<4)fprintf(stderr,"[nvn] CommandBufferEndRecording -> handle %#llx hw_used=%#llx game_size=%#llx ctl_used=%#llx\n",(unsigned long long)h,(unsigned long long)o->hw_used,(unsigned long long)o->game_size,(unsigned long long)o->ctl_used);}return h;}   /* donor :1061/:1086：返句柄 + 控制内存记账 64B；P0 补 recording 清零与用量日志（RSTB 尺寸取证）；round15b 句柄入回执环映射 */
+ static void nvn_memory_pool_flush_mapped_range(const void *p,int64_t off,uint64_t n){(void)p;(void)off;(void)n;{static unsigned l;if(l++<1)fprintf(stderr,"[nvn] MemoryPoolFlushMappedRange off=%lld n=%llu -> CPU-coherent, no-op\n",(long long)off,(unsigned long long)n);}}   /* donor :258 空实现：CPU 侧写入本就已就绪 */
+ static void nvn_buffer_flush_mapped_range(const void *b,int64_t off,uint64_t size){const buf_h *v=b;
+  if(off<0||(uint64_t)off>v->size||size>v->size-(uint64_t)off){fprintf(stderr,"[nvn][RED] BufferFlushMappedRange OOB off=%lld size=%llu buflen=%llu\n",(long long)off,(unsigned long long)size,(unsigned long long)v->size);return;}   /* donor :297 越界 die→本表风格红日志 */
+@@ -550,7 +554,7 @@
+    失败→重试自旋"）：pitch 存储按真实 stride、块线性按同一行式近似（自洽读写，本宿主无 GPU 消费方，
+    donor 走 mtl_read/write_texels 我们直拷池）。Timestamp→runtime_now_ns()（donor 无实现）。 */
+ static void cb_account(cmd_h *o,uint64_t bytes){o->hw_used+=bytes;g_nvn_cmd_total+=bytes;}
+-static void nvn_command_buffer_begin_recording(void *c){cmd_h *o=c;if(o->recording)fprintf(stderr,"[nvn][RED] BeginRecording 重入 (recording=1)\n");o->recording=1;{static unsigned n;if(n++<4)fprintf(stderr,"[nvn] BeginRecording %p hw_used=%#llx\n",c,(unsigned long long)o->hw_used);}}   /* donor :895 置 recording（重入红日志同 donor） */
++static void nvn_command_buffer_begin_recording(void *c){cmd_h *o=c;if(o->recording)fprintf(stderr,"[nvn][RED] BeginRecording 重入 (recording=1)\n");o->recording=1;nvn_rcpt_drop(o);{static unsigned n;if(n++<4)fprintf(stderr,"[nvn] BeginRecording %p hw_used=%#llx\n",c,(unsigned long long)o->hw_used);}}   /* donor :895 置 recording（重入红日志同 donor）；round15b：重录=命令内存重置，该 CB 回执弃（donor 同语义） */
+ static uint64_t nvn_command_buffer_is_recording(const void *c){return ((const cmd_h *)c)->recording;}   /* P0-2：此前空桩返 0=恒"未录制" */
+ static uint64_t nvn_command_buffer_get_command_memory_used(const void *c){const cmd_h *o=c;uint64_t r=o->hw_used<o->game_size?o->hw_used:o->game_size;{static unsigned n;if(n++<4)fprintf(stderr,"[nvn] GetCommandMemoryUsed -> %#llx (hw=%#llx given=%#llx; RSTB sizing input)\n",(unsigned long long)r,(unsigned long long)o->hw_used,(unsigned long long)o->game_size);}return r;}   /* donor :867；游戏累加它定 RSTB 堆尺寸 */
+ static uint64_t nvn_command_buffer_get_command_memory_free(const void *c){const cmd_h *o=c;return o->game_size-(o->hw_used<o->game_size?o->hw_used:o->game_size);}   /* donor :869 */
+@@ -603,47 +607,126 @@
+ static void nvn_command_buffer_clear_buffer(void *c,uint64_t buf,uint64_t n,uint32_t value){(void)buf;(void)n;(void)value;cb_account(c,24);}   /* donor :1253 hw_fix 24 */
+ static void nvn_command_buffer_barrier(void *c,int bits){(void)bits;cb_account(c,16);}   /* donor :2015 记录 8+4→16B */
+ static void nvn_command_buffer_set_viewports(void *c,int first,int n,const float *v){(void)first;(void)v;if(n<0)n=0;cb_account(c,24+4*(uint64_t)n);}   /* donor :1515 RECN 4n 浮点 */
+-/* —— round14b：GPU 值写入族——donor hle_nvn.c:873-889/:2450-2454 录 OP_SIGNAL_EVENT/OP_REPORT_COUNTER，
+-   提交回放完成时写真内存（nvn_mtl.m:10635 → post(:1274) → post_run(:1474)）。本宿主无回放层
+-   （QueueSubmitCommands 即退休、EndRecording 返生成句柄无可回放记录），录制即执行——语义等价：
+-   游戏读 counter/event 值前必经提交+等待（fence/flush/事件），这些等待在本宿主即时退休，录制时
+-   写入的值在游戏读取时已就位。此前全为 CB_REC +24B 纯记账 → counterData 恒读初值/0。
++/* —— round15b 回执环（receipt ring）：GPU 值写入族对齐 donor 时序——
++   donor（hle_nvn.c:873-889/:2450-2454）：录制只记 OP token（OP_SIGNAL_EVENT/OP_REPORT_COUNTER），
++   QueueSubmitCommands 入回放队列，回放完成时 post_run(:1474) 才写真内存。14b 的「录制即写」是
++   时序近似（值在提交前就可见——donor 不会）；emu14 验收遗留问题①「核实回执写入是否真落地」：
++   15b 起 record 存回执环、submit 退休（本宿主无 GPU，提交即回放完成）时写内存：
+    · ReportCounter：16B {counter@0, timestamp@8}（NVNcounterData=nvn.h:91-94）memcpy 到 bufferAddress；
+-     timestamp = guest_ns()×384/625（donor nvn_mtl.m:1280 gpu_ticks + nvn_timestamp.h:6，614.4MHz tick）；
+-     counter 字段 type∈{TIMESTAMP=0, TIMESTAMP_TOP=0x10} 时=timestamp 否则 0（post_run kind=2；donor
+-     render_cond profile 项本宿主无）。SAMPLES_PASSED(0x1) donor 走可见性槽求和（kind=3 {sum, ticks}），
+-     本宿主无光栅 sum 恒 0 → 落同式。
+-   · ReportValue/SignalEvent：event 写（post_run kind=1）WRITE(0x0)覆写 / ADD(0x1)累加（nvn.h:661-662）；
+-     ReportValue 写 (volatile uint32_t*)bufferAddress（donor :2450-2454）；SignalEvent 写 ev->val
+-     （donor :873-877，ev_t=nvn_obj.h:60 {magic,val}）。与 :536 nvn_event_signal 同式（CPU 侧原语）。
+-   · ResetCounter：donor :884-885 记 16B，回放只累计统计不写 guest 内存 → 记账对齐 16B。
+-   写前喂 dm_guest_write_prepare（写观察点，donor sbw 同款；:507 buffer_flush_mapped 同用法）。—— */
++     timestamp = guest_ns()×384/625（donor nvn_mtl.m:1280 gpu_ticks + nvn_timestamp.h:6，614.4MHz tick），
++     取**退休时刻**（donor=回放完成时刻）；counter 字段 type∈{TIMESTAMP=0, TIMESTAMP_TOP=0x10} 时
++     =timestamp 否则 0（post_run kind=2）。SAMPLES_PASSED(0x1) donor 走可见性槽求和（kind=3），本宿主
++     无光栅 sum 恒 0 → 落同式。
++   · ReportValue/SignalEvent：event 写（post_run kind=1）WRITE(0x0)覆写/ADD(0x1)累加（nvn.h:661-662）；
++     ReportValue 写 (volatile uint32_t*)bufferAddress（donor :2450-2454）；SignalEvent 退休时重读
++     ev->val（ev_t=nvn_obj.h:60 {magic,val}，donor 回放时才解引用）再写。
++   · ResetCounter：donor :884-885 记 16B 回放只累计统计不写 guest 内存 → 纯记账 16B，不入环。
++   生命周期（donor 命令内存语义）：BeginRecording 重录=命令内存重置 → 该 CB 回执全弃；同一地址
++   CommandBufferInitialize 复用同弃。同句柄重复提交=donor 重复回放 → 回执保留、每次提交重写。
++   环=宿主侧静态存储（cmd_h 是 guest 对象 overlay，nvn_obj.h:70-87 字段序锁死不可扩）；低频路径
++   （14c 全程 ReportCounter×4）一把 host mutex 足够。溢出丢最旧计数不红日志（重建 CB 段即恢复）。
++   计数器（回执写入门，dump 侧 threads.c 打印）：writes=退休真实落内存次数（验收位）、recorded 分
++   kind、pending=环内未退休、unknown_handle=提交的句柄无映射（Begin 重录后旧句柄再提交，donor 同
++   位置重放新内容的近似为不写——计数暴露即可）、dropped=环溢出。写前喂 dm_guest_write_prepare
++   （写观察点，donor sbw 同款；:507 buffer_flush_mapped 同用法）。—— */
+ static void nvn_cb_event_write(volatile uint32_t *val,uint32_t mode,uint32_t v){
+  if(!val){fprintf(stderr,"[nvn][RED] event 写 NULL dst（mode=%u v=%u）\n",mode,v);return;}
+  dm_guest_write_prepare((void *)val,4);
+  if(mode==1)*val+=v;else *val=v;
+ }
++#define NVN_RCPT_CAP 256
++#define NVN_RCPT_HMAP 64
++typedef struct{void *cmd;uint8_t kind,mode;uint32_t v;uint64_t a;} rcpt_t;   /* kind:1=counter(a=dst,v=type) 2=value(a=dst,v) 3=signal(a=ev*,mode) */
++static struct{
++ rcpt_t r[NVN_RCPT_CAP];unsigned n;
++ uint64_t hmap_h[NVN_RCPT_HMAP];void *hmap_c[NVN_RCPT_HMAP];unsigned hmap_n,hmap_next;
++ uint64_t writes,rec_cnt,rec_val,rec_sig,dropped,unknown_handle,submits;
++} g_rcpt;
++static pthread_mutex_t g_rcpt_mx=PTHREAD_MUTEX_INITIALIZER;
++static uint64_t nvn_gpu_ticks(void){return (uint64_t)((__uint128_t)guest_ns()*384/625);}
++static void nvn_rcpt_push(cmd_h *o,uint8_t kind,uint8_t mode,uint32_t v,uint64_t a){
++ pthread_mutex_lock(&g_rcpt_mx);
++ if(g_rcpt.n<NVN_RCPT_CAP)g_rcpt.r[g_rcpt.n++]=(rcpt_t){o,kind,mode,v,a};
++ else{memmove(g_rcpt.r,g_rcpt.r+1,sizeof(rcpt_t)*(NVN_RCPT_CAP-1));g_rcpt.r[NVN_RCPT_CAP-1]=(rcpt_t){o,kind,mode,v,a};g_rcpt.dropped++;}
++ if(kind==1)g_rcpt.rec_cnt++;else if(kind==2)g_rcpt.rec_val++;else g_rcpt.rec_sig++;
++ pthread_mutex_unlock(&g_rcpt_mx);
++}
++static void nvn_rcpt_drop(void *cmd){   /* BeginRecording 重录 / Initialize 复用：该 CB 回执与句柄映射全弃 */
++ pthread_mutex_lock(&g_rcpt_mx);
++ unsigned w=0;for(unsigned i=0;i<g_rcpt.n;i++)if(g_rcpt.r[i].cmd!=cmd)g_rcpt.r[w++]=g_rcpt.r[i];
++ g_rcpt.n=w;
++ for(unsigned i=0;i<g_rcpt.hmap_n;i++)if(g_rcpt.hmap_c[i]==cmd)g_rcpt.hmap_c[i]=NULL;
++ pthread_mutex_unlock(&g_rcpt_mx);
++}
++static void nvn_rcpt_map(uint64_t h,cmd_h *c){   /* EndRecording：句柄→CB 对象（submit 侧回执反查） */
++ pthread_mutex_lock(&g_rcpt_mx);
++ unsigned k=g_rcpt.hmap_next%NVN_RCPT_HMAP;g_rcpt.hmap_next++;
++ g_rcpt.hmap_h[k]=h;g_rcpt.hmap_c[k]=c;
++ if(g_rcpt.hmap_n<NVN_RCPT_HMAP)g_rcpt.hmap_n++;
++ pthread_mutex_unlock(&g_rcpt_mx);
++}
++static cmd_h *nvn_rcpt_lookup(uint64_t h){
++ for(unsigned i=0;i<g_rcpt.hmap_n;i++){unsigned k=(g_rcpt.hmap_next+i)%NVN_RCPT_HMAP;
++  if(g_rcpt.hmap_c[k]&&g_rcpt.hmap_h[k]==h)return (cmd_h *)g_rcpt.hmap_c[k];}
++ return NULL;
++}
++static void nvn_rcpt_retire_locked(cmd_h *c);   /* 定义在下方（保持块内顺序） */
++static void nvn_rcpt_submit(int n,const uint64_t *hs){
++ if(n<=0||!hs)return;
++ pthread_mutex_lock(&g_rcpt_mx);
++ g_rcpt.submits++;
++ for(int i=0;i<n;i++){
++  cmd_h *c=nvn_rcpt_lookup(hs[i]);
++  if(!c){g_rcpt.unknown_handle++;continue;}   /* Begin 重录后旧句柄再提交：无回执可写，计数暴露 */
++  nvn_rcpt_retire_locked(c);                   /* 退休=回放完成：写真内存+回执写入门计数 */
++ }
++ pthread_mutex_unlock(&g_rcpt_mx);
++}
++static void nvn_rcpt_retire_locked(cmd_h *c){   /* 提交退休=回放完成：按录制序写真内存，时戳取此刻 */
++ for(unsigned i=0;i<g_rcpt.n;i++){
++  if(g_rcpt.r[i].cmd!=(void *)c)continue;
++  rcpt_t *p=&g_rcpt.r[i];
++  if(p->kind==1){
++   uint64_t ts=nvn_gpu_ticks(),rec[2]={(p->v==0||p->v==0x10)?ts:0,ts};
++   dm_guest_write_prepare((void *)(uintptr_t)p->a,16);memcpy((void *)(uintptr_t)p->a,rec,16);
++   {static unsigned n;if(n++<4)fprintf(stderr,"[nvn] ReportCounter(retired) type=%#x -> %#llx {counter=%#llx, ts=%#llx}\n",p->v,(unsigned long long)p->a,(unsigned long long)rec[0],(unsigned long long)rec[1]);}
++  }else if(p->kind==2){
++   nvn_cb_event_write((volatile uint32_t *)(uintptr_t)p->a,0,p->v);
++   {static unsigned n;if(n++<4)fprintf(stderr,"[nvn] ReportValue(retired) v=%u -> %#llx\n",p->v,(unsigned long long)p->a);}
++  }else{
++   ev_h *ev=(ev_h *)(uintptr_t)p->a;nvn_cb_event_write(ev?ev->val:0,p->mode,p->v);
++   {static unsigned n;if(n++<4)fprintf(stderr,"[nvn] SignalEvent(retired) ev=%p mode=%s v=%u\n",ev,p->mode==1?"ADD":"WRITE",p->v);}
++  }
++  g_rcpt.writes++;
++ }
++}
+ static void nvn_command_buffer_signal_event(void *c,const void *e,int m,int loc,int flags,uint32_t v){
+- (void)loc;(void)flags;cb_account((cmd_h *)c,24);   /* donor :873-877 记 24B */
+- const ev_h *ev=(const ev_h *)e;nvn_cb_event_write(ev?ev->val:0,(uint32_t)m,v);
+- {static unsigned n;if(n++<4)fprintf(stderr,"[nvn] SignalEvent ev=%p mode=%s v=%u\n",e,m==1?"ADD":"WRITE",v);}
++ (void)loc;(void)flags;cb_account((cmd_h *)c,24);   /* donor :873-877 记 24B（OP_SIGNAL_EVENT token） */
++ nvn_rcpt_push((cmd_h *)c,3,(uint8_t)(m==1),v,(uint64_t)(uintptr_t)e);
++ {static unsigned n;if(n++<4)fprintf(stderr,"[nvn] SignalEvent recorded ev=%p mode=%s v=%u (writes at submit)\n",e,m==1?"ADD":"WRITE",v);}
+ }
+ static void nvn_command_buffer_report_value(void *c,uint32_t v,uint64_t a){
+  cb_account((cmd_h *)c,24);   /* donor :2450-2454 记 24B（经 OP_SIGNAL_EVENT WRITE） */
+- nvn_cb_event_write((volatile uint32_t *)(uintptr_t)a,0,v);
+- {static unsigned n;if(n++<4)fprintf(stderr,"[nvn] ReportValue v=%u -> %#llx\n",v,(unsigned long long)a);}
++ nvn_rcpt_push((cmd_h *)c,2,0,v,a);
++ {static unsigned n;if(n++<4)fprintf(stderr,"[nvn] ReportValue recorded v=%u -> %#llx (writes at submit)\n",v,(unsigned long long)a);}
+ }
+ static void nvn_command_buffer_report_counter(void *c,int t,uint64_t a){
+  cb_account((cmd_h *)c,24);   /* donor :887-889 记 24B（OP_REPORT_COUNTER） */
+- if(a){
+-  uint64_t ts=(uint64_t)((__uint128_t)guest_ns()*384/625),rec[2]={(t==0||t==0x10)?ts:0,ts};
+-  dm_guest_write_prepare((void *)(uintptr_t)a,16);memcpy((void *)(uintptr_t)a,rec,16);
+-  {static unsigned n;if(n++<4)fprintf(stderr,"[nvn] ReportCounter type=%#x -> %#llx {counter=%#llx, ts=%#llx}\n",t,(unsigned long long)a,(unsigned long long)rec[0],(unsigned long long)rec[1]);}
+- }
++ if(a)nvn_rcpt_push((cmd_h *)c,1,0,(uint32_t)t,a);
++ {static unsigned n;if(n++<4)fprintf(stderr,"[nvn] ReportCounter recorded type=%#x -> %#llx (writes at submit)\n",t,(unsigned long long)a);}
+ }
+ static void nvn_command_buffer_reset_counter(void *c,int t){
+  cb_account((cmd_h *)c,16);   /* donor :884-885 记 16B，回放只累计统计不写内存 */
+  {static unsigned n;if(n++<2)fprintf(stderr,"[nvn] ResetCounter type=%#x (stats only, donor :884-885)\n",t);}
++}
++/* 回执写入门计数（threads.c dump 侧）：0=writes 1=pending 2=rec_cnt 3=rec_val 4=rec_sig
++   5=dropped 6=unknown_handle 7=submits */
++uint64_t dm_nvn_receipt_stat(int idx){
++ uint64_t r=0;pthread_mutex_lock(&g_rcpt_mx);
++ switch(idx){case 0:r=g_rcpt.writes;break;case 1:r=g_rcpt.n;break;case 2:r=g_rcpt.rec_cnt;break;
++  case 3:r=g_rcpt.rec_val;break;case 4:r=g_rcpt.rec_sig;break;case 5:r=g_rcpt.dropped;break;
++  case 6:r=g_rcpt.unknown_handle;break;case 7:r=g_rcpt.submits;break;default:r=0;}
++ pthread_mutex_unlock(&g_rcpt_mx);return r;
+ }
+ /* —— 记账录制族：平价件（donor 无 hw_fix，按其记录尺寸 16-40B 的平价 24B 近似；首用一行日志）—— */
+ #define CB_REC(NAME) static void NAME(void *c){cb_account((cmd_h *)c,24);{static unsigned n;if(n++<1)fprintf(stderr,"[nvn] rec %s +24B (flat approx)\n",#NAME);}}

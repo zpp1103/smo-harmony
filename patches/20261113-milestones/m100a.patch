@@ -1,0 +1,236 @@
+--- mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c
++++ mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c
+@@ -4123,6 +4123,16 @@
+ static unsigned g_az_sh_fmt[H_RT_SLOTS];              /* 目标槽的游戏侧 NVN 格式 */
+ static unsigned long long g_wp_verts[H_RT_SLOTS];
+ static unsigned long long g_wp_verts_host, g_wp_draws_host;   /* colour draws that fell back to the host image */
++/* ===== M100A（2026-11-13）：HOSTFALLBACK 的分布 / 归因 / 就地救回 =====
++   判定点 = nvn_vk_rt_bind 末尾的 `!s`（s 来自 h_rt_ensure()）；返 NULL ⇒ h_rt_switch(NULL) ⇒
++   g_rt_cur==NULL ⇒ 之后每一笔颜色 draw 都记进上面那个 host 桶（见 m100a_hostkey 调用点）。
++   本块只记账 + 打印；真正改变「往哪写」的只有 smo_m100a 的两个模式（默认 0 = 关）。 */
++static void m100a_hostkey(const void *vsk, const void *fsk, const char *vss, const char *fss, unsigned nverts);
++static void m100a_hk_line(unsigned long long call, unsigned long long el, unsigned long long tick);
++static void m100a_hf_line(unsigned long long call, unsigned long long el, unsigned long long tick);
++static unsigned long long g_m100a_keep, g_m100a_rescue;
++static unsigned long long g_m100a_fb_total, g_m100a_fb_n0, g_m100a_fb_noid, g_m100a_fb_nosz;
++static unsigned long long g_m100a_fb_big, g_m100a_fb_deny;
+ static int g_wp_on = -1;
+ /* ====== M7g P1（2026-11-06，只读，log-only，0 行为改动）：世界 RT 的「提交后生命周期 / 图像身份」======
+    派活单矛盾：同一笔世界 draw 在隔离重放里能出 21933 片元，真实 pass 之后 `[wp] rt` 对世界槽回读
+@@ -4578,6 +4588,9 @@
+ static unsigned long long g_h_rt_fallback, g_h_rt_switch;
+ /* M4ar P1/P2：最近一次 RT 绑定的口径 + 名义槽计数（见 nvn_vk_rt_bind / nvn_vk_rt_last_bind）。 */
+ static unsigned long long g_h_rt_nominal;
++/* M100A：h_rt_ensure() 返 NULL 的**唯一原因**（1 无身份/无尺寸 2 超限 3 满表且无同尺寸可回收
++   4 图预算拒 5 建图/建视图失败），由兜底点分类计数 —— 「谁判的 host 兜底」必须逐条归因。 */
++static int g_rt_deny_why;
+ /* M7b P2：尺寸解不出、按屏幕尺寸补尺寸的绑定计数（以前这些是 1x1 幽灵槽）。 */
+ static unsigned long long g_h_rt_screen_scratch;
+ /* M7b P2：允许拿屏幕尺寸的「解不出」身份上限。栈地址集合是每帧稳定的（m7a_b1 的 dump 里
+@@ -5011,8 +5024,9 @@
+    满表同尺寸 LRU → 宿主回落；**任何一步都不覆盖已有 img 句柄**（那就是 m5r 的泄漏源）。 */
+ static h_rt_slot *h_rt_ensure(uint64_t key, uint32_t w, uint32_t h)
+ {
+-    if (!key || !w || !h) return NULL;
+-    if (w > H_RT_MAXDIM || h > H_RT_MAXDIM) return NULL;
++    g_rt_deny_why = 0;                                  /* M100A：每次进入清原因，只有 NULL 才置位 */
++    if (!key || !w || !h) { g_rt_deny_why = 1; return NULL; }
++    if (w > H_RT_MAXDIM || h > H_RT_MAXDIM) { g_rt_deny_why = 2; return NULL; }
+     const int nslot = (int)(sizeof g_rt_tab / sizeof *g_rt_tab);
+     /* ① 精确身份命中 */
+     for (int i = 0; i < nslot; i++)
+@@ -5045,6 +5059,7 @@
+             if (nreuse++ < 4)
+                 vk_boot_logf("[h-red] rt tab full (%d) no same-size slot for key=%#llx %ux%u -> host fallback",
+                              nslot, (unsigned long long)key, (unsigned)w, (unsigned)h);
++            g_rt_deny_why = 3;
+             return NULL;
+         }
+         if (nreuse++ < 4)
+@@ -5064,6 +5079,7 @@
+             vk_boot_logf("[h-red] rt img budget deny key=%#llx %ux%u alloc_mb=%llu cap_mb=%d -> host fallback",
+                          (unsigned long long)key, (unsigned)w, (unsigned)h,
+                          g_rt_alloc_bytes >> 20, RT_IMG_BUDGET_MB);
++        g_rt_deny_why = 4;
+         return NULL;
+     }
+     VkImageCreateInfo ii = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+@@ -5081,6 +5097,7 @@
+     m40p_hit(2, key, w, h, (int)VK_FORMAT_R8G8B8A8_UNORM);   /* M40P：h_rt 桶 */
+     if (vkCreateImage(g_dev, &ii, NULL, &s->img) != VK_SUCCESS) {
+         s->img = NULL; vk_boot_logf("[h-red] rt slot vkCreateImage key=%#llx %ux%u failed", (unsigned long long)key, (unsigned)w, (unsigned)h);
++        g_rt_deny_why = 5;
+         return NULL;
+     }
+     VkMemoryRequirements rq;
+@@ -5092,6 +5109,7 @@
+     if (vkAllocateMemory(g_dev, &ai, NULL, &s->mem) != VK_SUCCESS) {
+         g_m40p_dst++; vkDestroyImage(g_dev, s->img, NULL); s->img = NULL; s->mem = NULL;
+         vk_boot_logf("[h-red] rt slot vkAllocateMemory(%llu) failed", (unsigned long long)rq.size);
++        g_rt_deny_why = 5;
+         return NULL;
+     }
+     vkBindImageMemory(g_dev, s->img, s->mem, 0);
+@@ -5104,6 +5122,7 @@
+         g_m40p_dst++; vkDestroyImage(g_dev, s->img, NULL); vkFreeMemory(g_dev, s->mem, NULL);
+         s->img = NULL; s->mem = NULL; s->view = NULL;
+         vk_boot_logf("[h-red] rt slot vkCreateImageView key=%#llx failed", (unsigned long long)key);
++        g_rt_deny_why = 5;
+         return NULL;
+     }
+     if (g_h_rp) {   /* CLEAR 通道的 framebuffer（g_h_rp 已在 h_rt_objects_ensure 建好） */
+@@ -24043,6 +24062,8 @@
+            误读成「世界根本没画」。所以单独一个 host 桶，口径与槽桶一致（dvar<3 才算颜色）。 */
+         g_wp_verts_host += (unsigned long long)nverts;
+         g_wp_draws_host++;
++        /* M100A：同一桶再按 (vs,fs) 键指针身份精确分账（不是 1/50 抽样），每 60 s 打 top 8。 */
++        m100a_hostkey((const void *)kv, (const void *)kf, kv->key, kf->key, (unsigned)nverts);
+     }
+     /* M7g P1（只读）：世界 RT 的图像身份与「claim 之后的写/清」记账（不判、不改、不选源）。 */
+     m7g_draw(g_rt_cur ? g_rt_cur->key : 0ull, g_rt_cur ? (int)(g_rt_cur - g_rt_tab) : -1,
+@@ -28448,6 +28469,104 @@
+     }
+ }
+ 
++/* ===== M100A 定义区：host 桶的 (vs,fs) 精确分布 + 兜底原因计数 + 两个救回模式 =====
++   开关 smo_m100a（app 侧 seed 0；hdc 写文件即可活改，3 s 轮询 —— 0.2 fps 下也能在一个 60 s 窗口内切）：
++     0 = 关（默认，逐字等于今天：解不出身份/尺寸 ⇒ 落宿主 1280x720 那张死图）
++     1 = keep-cur：只对 n<=0（本次声明**没有任何颜色目标**）且深度也解不出的绑定生效 ——
++         M4r P1 的既有语义「n=0 的纯深度 pass 不动颜色目标」本来只有深度解出时才走到，这里补齐另一支。
++     2 = rescue-slot：同场景改投槽表里一张专用 800x450（= guest 1600x900 ÷2）槽，固定身份 'M100A'+尺寸；
++         槽一旦进表，[wp] tgt 的 writers_all 与 present 候选池都能看见它。
++   两者都只改「往哪写」，不动 shader / 管线 / 深度挂载 / 上屏选择判据。 */
++#define M100A_SW_A "/data/storage/el2/base/files/smo_m100a"
++#define M100A_SW_B "/data/app/el2/100/base/com.vibecc.smo/files/smo_m100a"
++#define M100A_NK   8
++typedef struct { const void *vs, *fs; char vss[17], fss[17]; unsigned long long verts, draws; } m100a_hk_t;
++static m100a_hk_t g_m100a_hk[M100A_NK];
++static unsigned g_m100a_hk_n;
++static int g_m100a_mode = -1;
++static void m100a_hostkey(const void *vsk, const void *fsk, const char *vss, const char *fss, unsigned nverts)
++{
++    unsigned i;
++    for (i = 0; i < g_m100a_hk_n; i++)
++        if (g_m100a_hk[i].vs == vsk && g_m100a_hk[i].fs == fsk) {
++            g_m100a_hk[i].verts += (unsigned long long)nverts;
++            g_m100a_hk[i].draws++;
++            return;
++        }
++    if (g_m100a_hk_n >= M100A_NK) return;    /* 实测 host 桶只有 6 个不同键；8 个够，超了只丢新键 */
++    g_m100a_hk[i].vs = vsk; g_m100a_hk[i].fs = fsk;
++    snprintf(g_m100a_hk[i].vss, sizeof g_m100a_hk[i].vss, "%s", vss ? vss : "?");
++    snprintf(g_m100a_hk[i].fss, sizeof g_m100a_hk[i].fss, "%s", fss ? fss : "?");
++    g_m100a_hk[i].verts = (unsigned long long)nverts;
++    g_m100a_hk[i].draws = 1;
++    g_m100a_hk_n++;
++}
++static int m100a_sw(void)
++{
++    static unsigned long long last;
++    if (g_m100a_mode < 0) {
++        p_file_seed(M100A_SW_A, M100A_SW_B);
++        g_m100a_mode = p_file_int(M100A_SW_A, M100A_SW_B, 0);
++        last = (unsigned long long)r_now_ms();
++        vk_boot_logf("[m100a] sw init mode=%d (0=off 1=keep-cur 2=rescue-slot; log+routing only)", g_m100a_mode);
++        return g_m100a_mode;
++    }
++    if ((unsigned long long)r_now_ms() - last >= 3000ull) {
++        const int v = p_file_int(M100A_SW_A, M100A_SW_B, 0);
++        last = (unsigned long long)r_now_ms();
++        if (v != g_m100a_mode) {
++            vk_boot_logf("[m100a] sw %d -> %d (host-fallback rescue mode switched at runtime)",
++                         g_m100a_mode, v);
++            g_m100a_mode = v;
++        }
++    }
++    return g_m100a_mode;
++}
++static const char *m100a_mode_name(int m)
++{
++    return m == 1 ? "keep-cur" : (m == 2 ? "rescue-slot" : "off");
++}
++static h_rt_slot *m100a_rescue_slot(void)
++{
++    const unsigned w = h_rs_dim(1600u), h = h_rs_dim(900u);
++    const unsigned long long nk = 0x4D31303041000000ull |
++                                  ((unsigned long long)(w & 0xFFFFu) << 16) |
++                                  (unsigned long long)(h & 0xFFFFu);
++    return h_rt_ensure(nk, w, h);
++}
++static void m100a_hk_line(unsigned long long call, unsigned long long el, unsigned long long tick)
++{
++    char ln[1024];
++    int lo = 0;
++    unsigned i, a, b;
++    unsigned ord[M100A_NK];
++    for (i = 0; i < g_m100a_hk_n; i++) ord[i] = i;
++    for (a = 0; a < g_m100a_hk_n; a++)                 /* verts 降序（与 wp_tick 同款选择排序） */
++        for (b = a + 1; b < g_m100a_hk_n; b++)
++            if (g_m100a_hk[ord[b]].verts > g_m100a_hk[ord[a]].verts) {
++                const unsigned t = ord[a]; ord[a] = ord[b]; ord[b] = t;
++            }
++    for (i = 0; i < g_m100a_hk_n && lo < (int)sizeof ln - 160; i++) {
++        const m100a_hk_t *e = &g_m100a_hk[ord[i]];
++        const unsigned long long pv = g_wp_verts_host ? e->verts * 1000ull / g_wp_verts_host : 0ull;
++        lo += snprintf(ln + lo, sizeof ln - (size_t)lo,
++                       "%s#%u vs=%s fs=%s verts=%llu(%llu.%llu%%) draws=%llu",
++                       i ? " | " : "", i + 1, e->vss, e->fss, e->verts,
++                       pv / 10ull, pv % 10ull, e->draws);
++    }
++    vk_boot_logf("[m100a] hostk pipe=%llu t=%llus tick=%llu keys=%u host_verts_cum=%llu host_draws_cum=%llu :: %s",
++                 call, el, tick, g_m100a_hk_n, g_wp_verts_host, g_wp_draws_host, ln);
++}
++static void m100a_hf_line(unsigned long long call, unsigned long long el, unsigned long long tick)
++{
++    (void)m100a_sw();   /* 懒初始化：本 boot 若一次兜底都没发生，也要把 knob 状态读一次并打出来 */
++    vk_boot_logf("[m100a] hf pipe=%llu t=%llus tick=%llu mode=%d(%s) fb_total=%llu n0_nodepth=%llu "
++                 "noid=%llu nosize=%llu overdim=%llu deny=%llu keep=%llu rescue=%llu cur_slot=%d",
++                 call, el, tick, g_m100a_mode, m100a_mode_name(g_m100a_mode), g_m100a_fb_total,
++                 g_m100a_fb_n0, g_m100a_fb_noid, g_m100a_fb_nosz, g_m100a_fb_big, g_m100a_fb_deny,
++                 g_m100a_keep, g_m100a_rescue, g_rt_cur ? (int)(g_rt_cur - g_rt_tab) : -1);
++}
++
+ static void wp_tick(unsigned long long call)
+ {
+     const int ns = (int)(sizeof g_rt_tab / sizeof *g_rt_tab);
+@@ -28502,6 +28621,9 @@
+                 vk_boot_logf("[wp] tgt pipe=%llu t=%llus tick=%llu slot=-1 texid=-1 ext=host "
+                              "draws_win=%llu verts_win=%llu verts_cum=%llu draws_cum=%llu HOSTFALLBACK",
+                              call, el, g_wp_ticks, hd, hv, g_wp_verts_host, g_wp_draws_host);
++            /* M100A：同一窗口的精确 (vs,fs) 分布 + 兜底原因/模式（各一行，60 s 一条） */
++            if (g_m100a_hk_n) m100a_hk_line(call, el, g_wp_ticks);
++            m100a_hf_line(call, el, g_wp_ticks);
+         }
+     }
+ 
+@@ -30652,7 +30774,30 @@
+                                  g_h_rt_nominal, (unsigned long long)key, rw, rh,
+                                  (int)(ns - g_rt_tab), (unsigned long long)ns->key,
+                                  (unsigned long long)(uintptr_t)ns->img, (int)H_OFF_W, (int)H_OFF_H);
++            }
++        }
++        if (!s) {
++            /* M100A：兜底原因分类（h_rt_ensure 的 5 个出口 + 调用方两条否决）+ 两种救回模式。
++               关态（mode 0）不执行任何改路由的语句 ⇒ 与今天逐字相同。 */
++            const int m100a_m = m100a_sw();
++            g_m100a_fb_total++;
++            if (n <= 0) g_m100a_fb_n0++;              /* 深度解出时上面已 return，故这里 = n=0 且深度也没解出 */
++            else if (!key) g_m100a_fb_noid++;
++            else if (!rw || !rh) g_m100a_fb_nosz++;
++            else if (rw > H_RT_MAXDIM || rh > H_RT_MAXDIM) g_m100a_fb_big++;
++            else g_m100a_fb_deny++;
++            if (m100a_m == 1 && n <= 0 && g_rt_cur) {
++                s = g_rt_cur;                         /* 保留当前颜色目标：不换图、不 flush，后续 draw 照原路写 */
++                g_m100a_keep++;
++            } else if (m100a_m == 2 && n <= 0) {
++                h_rt_slot *m100a_rs = m100a_rescue_slot();
++                if (m100a_rs) { s = m100a_rs; g_m100a_rescue++; }
+             }
++            if (g_m100a_fb_total <= 8 || (g_m100a_fb_total % 5000) == 0)
++                vk_boot_logf("[m100a] fb #%llu n=%d key=%#llx %ux%u deny=%d mode=%d(%s) -> %s slot=%d",
++                             g_m100a_fb_total, n, (unsigned long long)key, rw, rh, g_rt_deny_why,
++                             m100a_m, m100a_mode_name(m100a_m), s ? "rescued" : "host",
++                             s ? (int)(s - g_rt_tab) : -1);
+         }
+         if (!s) {
+             g_h_rt_fallback++;

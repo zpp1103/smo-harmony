@@ -1,0 +1,30 @@
+--- entry/src/main/cpp/host/gfx_bridge.c	2026-11-01 06:43:00 (pre-round12b)
++++ /Users/zpp/VibeCoding/ns-mario-odessy-to-harmony/mario-odessy-harmony/entry/src/main/cpp/host/gfx_bridge.c	2026-11-01 06:43:47
+@@ -255,13 +255,16 @@
+  nvn_pool_ledger[nvn_pool_ledger_head]=(NvnPoolRec){(uintptr_t)o->mem,o->size,o->flags};nvn_pool_ledger_head=(nvn_pool_ledger_head+1)%NVN_POOL_LEDGER;   /* 毒化源账本（crash handler 经 runtime_nvn_pool_hit 只读查询） */
+  return 1;
+ }
+-static void *nvn_pool_map(const void *p){const pool_h *o=p;   /* round14 插桩：magic≠0x504f4f4c 即 foreign 对象（从未过宿主 Initialize）；行为不变仍无条件返 mem——有意不学 donor hle_nvn.c:262-264 对 CPU_NO_ACCESS 返 NULL：round13 双证游戏拿 Map 结果当写基址（main+0x9a3f38/0x9a3f60），宿主无 vpool 层返 NULL 必崩 */
++static void *nvn_pool_map(const void *p){const pool_h *o=p;   /* round14 插桩：magic≠0x504f4f4c 即 foreign 对象（从未过宿主 Initialize）。round12b 起对齐 donor hle_nvn.c:1986——flags&CPU_NO_ACCESS 返 NULL（=0x1，donor include/nvn.h:605；nvnBufferMap :1977 同款）。
++   round13 教训（游戏拿 Map 当写基址 main+0x9a3f38/0x9a3f60，当时宿主无 vpool 层裸 NULL 必崩）不冲突：CPU_NO_ACCESS 池（0x21/0x61/0xa1/0x2a1）的写基址经 MapVirtual 取物理后备别名（map_virtual 把 v->mem 指到 pp->mem+poff，宿主匿名页可写），NULL 即真机语义。
++   round12a 实测洪流（3.88M 次/147s≈26k/s）194 条采样全落 flags=0x12/0x24（CPU 可见池，不吃 NULL 分支），返回值不变 */
+  /* round3 限流：该行是 map-pool 洪流本体（13k 行/s，56 万行/43s），打满 stderr 管道+hilog 进程级
+     socket——[spin] 采样/全景 dump 全被挤掉，且 hilog 流自身在 43s 处断流（emu_round1/2/3 同证）。
+     前 200 条全打，之后每 2 万条打 1 条带累计序号：洪流起点/终点/总速可见，日志通道留活。 */
+  static unsigned pn,ps;pn++;
+- if(ps<200||pn%20000==0){fprintf(stderr,"[nvn] map pool=%p magic=%#x mem=%p size=%#llx flags=%#x (#%u)\n",p,o->magic,o->mem,(unsigned long long)o->size,o->flags,pn);}   /* round12a 观测：洪流池 flags 分布（0x1=CPU_NO_ACCESS / 0x200=VIRTUAL） */
++ if(ps<200||pn%20000==0){fprintf(stderr,"[nvn] map pool=%p magic=%#x mem=%p size=%#llx flags=%#x (#%u)\n",p,o->magic,o->mem,(unsigned long long)o->size,o->flags,pn);}   /* round12a 观测：洪流池 flags 分布（0x1=CPU_NO_ACCESS / 0x200=VIRTUAL）；NULL 分支命中率可由此行判读 */
+  if(ps<200)ps++;
++ if(o->flags&0x1)return NULL;   /* donor :1986：CPU_NO_ACCESS(0x1) → NULL；GetBufferAddress（donor :268）仍返 mem，GPU 地址链不受影响 */
+  return o->mem;}
+ typedef struct{const void *physical_pool;int64_t physical_offset,virtual_offset;uint64_t size;int32_t storage_class;uint32_t padding;} nvn_map_req_h;   /* =totk_vpool.h:7-15 NVNmappingRequest，0x28 实测布局 */
+ static uint64_t nvn_pool_map_virtual(void *p,int n,const void *req){
+@@ -269,7 +272,7 @@
+  if(r)fprintf(stderr,"[nvn] map-virtual pool=%p n=%d phys=%p poff=%#llx voff=%#llx size=%#llx class=%d\n",p,n,r->physical_pool,(unsigned long long)r->physical_offset,(unsigned long long)r->virtual_offset,(unsigned long long)r->size,r->storage_class);   /* round14 插桩：dump 请求定位 mystery 池 */
+  if(!v||v->magic!=0x504f4f4c||!(v->flags&0x200)||!v->mem||n<0||(n&&!r))return 0;   /* donor totk_vpool.c:107-108 同款校验（0x200=VIRTUAL；count=0 合法空操作） */
+  if(!n)return 1;
+- {const pool_h *pp=r->physical_pool;   /* donor-lite：不做 mach_vm_remap 页别名（totk_vpool.c:85-97），直接把虚拟池 mem 指到物理后备 p->mem+physical_offset，游戏随后 Map 虚拟池即拿 CPU 地址；boot 版不重映射/不登记 mtl，差异注此 */
++ {const pool_h *pp=r->physical_pool;   /* donor-lite：不做 mach_vm_remap 页别名（totk_vpool.c:85-97），直接把虚拟池 mem 指到物理后备 p->mem+physical_offset；round12b NULL 语义后游戏写基址=本处 v->mem（物理池 mem=宿主匿名 RW 页或游戏自备存储，均可安全写），Map 虚拟池返 NULL 走 donor :1986，两链不交叉。donor :2025 vpool_reserve（mmap PROT_NONE 预留段，非固定地址）评估=不补：donor 对 Mario 整池单请求（voff=0、size=池大小）在首次 MapVirtual 即 vpool_drop 弃预留改指物理后备（hle_nvn.c:2114-2117），预留段只服务"映射前建对象"与真 sparse（MHR 64GB 分段重映射）；boot 期 Initialize 的宿主匿名 RW 页（上方 host-alloc 分支）已承担同一地址同一性且能力更强（可写），round12a 实测游戏 150s 内未调 MapVirtual，映射前无对象注册，故匿名页已够；boot 版不重映射/不登记 mtl，差异注此 */
+   if(n>1)fprintf(stderr,"[nvn] map-virtual n=%d 只处理首请求\n",n);
+   if(pp&&pp->magic==0x504f4f4c&&pp->mem){v->mem=(char *)pp->mem+r->physical_offset;fprintf(stderr,"[nvn] map-virtual -> mem=%p (phys %p + %#llx)\n",v->mem,pp->mem,(unsigned long long)r->physical_offset);}
+   else fprintf(stderr,"[nvn] map-virtual phys pool invalid/foreign: %p\n",r->physical_pool);   /* 物理池也 foreign 时不动 v->mem，日志留证 */

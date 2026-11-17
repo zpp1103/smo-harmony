@@ -1,0 +1,36 @@
+--- entry/src/main/cpp/host/gfx_bridge.c + loader.c	2026-11-01 07:08:28 (round12c/12d 排障：Map 洪流定位)
+--- gfx_bridge.c (nvn_pool_map 排障探针: LR/账本/周期采样)
+@@ -262,6 +262,23 @@
+     socket——[spin] 采样/全景 dump 全被挤掉，且 hilog 流自身在 43s 处断流（emu_round1/2/3 同证）。
+     前 200 条全打，之后每 2 万条打 1 条带累计序号：洪流起点/终点/总速可见，日志通道留活。 */
+  static unsigned pn,ps;pn++;
++ /* round12c 排障（donor 基准：SMO init 全程 Map=409 次/帧 2 次，本宿主 402 万次/150s=万倍病态）：
++    ①调用点一次性 LR 探针（stub_caller_lr 同款帧链走法，24 个去重首见）——洪流调用链检举；
++    ②池账本反查一次性打点——洪流主池两轮 ctor 行皆缺（12a 0x6e44573e90/12b 0x6e43476e90），按 mem+size
++      查 nvn_pool_ledger：命中=ctor 行只是被 hilog 丢弃，未命中=struct 拷贝/foreign 对象；
++    ③每 50 万次打当前 lr+pool（洪流期取样）。全部有界输出，不添新洪流。 */
++ {uintptr_t lr=stub_caller_lr();
++  static uintptr_t seen_lr[24];static unsigned nsl;
++  unsigned f=1;for(unsigned i=0;i<nsl;i++)if(seen_lr[i]==lr)f=0;
++  if(f&&nsl<24){seen_lr[nsl++]=lr;const char *nm;uint64_t off;char loc[96];
++   if(runtime_module_offset(lr,&nm,&off))snprintf(loc,sizeof loc,"%s+%#llx",nm,(unsigned long long)off);else snprintf(loc,sizeof loc,"%p",(void *)lr);
++   fprintf(stderr,"[nvn] map-caller lr=%p (%s) pool=%p flags=%#x (#%u first)\n",(void *)lr,loc,p,o->flags,pn);}
++  static uintptr_t seen_pool[16];static unsigned nsp;
++  f=1;for(unsigned i=0;i<nsp;i++)if(seen_pool[i]==(uintptr_t)p)f=0;
++  if(f&&nsp<16){seen_pool[nsp++]=(uintptr_t)p;int led=0;
++   for(unsigned i=0;i<NVN_POOL_LEDGER;i++)if(nvn_pool_ledger[i].mem==(uintptr_t)o->mem&&nvn_pool_ledger[i].size==o->size){led=1;break;}
++   fprintf(stderr,"[nvn] map-pool-seen pool=%p mem=%p size=%#llx flags=%#x ledger=%s (#%u)\n",p,o->mem,(unsigned long long)o->size,o->flags,led?"hit":"MISS",pn);}
++  if(pn%500000==0)fprintf(stderr,"[nvn] map-sample lr=%p pool=%p flags=%#x (#%u)\n",(void *)lr,p,o->flags,pn);}
+  if(ps<200||pn%20000==0){fprintf(stderr,"[nvn] map pool=%p magic=%#x mem=%p size=%#llx flags=%#x (#%u)\n",p,o->magic,o->mem,(unsigned long long)o->size,o->flags,pn);}   /* round12a 观测：洪流池 flags 分布（0x1=CPU_NO_ACCESS / 0x200=VIRTUAL）；NULL 分支命中率可由此行判读 */
+  if(ps<200)ps++;
+  if(o->flags&0x1)return NULL;   /* donor :1986：CPU_NO_ACCESS(0x1) → NULL；GetBufferAddress（donor :268）仍返 mem，GPU 地址链不受影响 */
+--- loader.c (relocate import-cell 定性探针, 12d 实测两 cell 均非直接 reloc 目标=未打印)
++  else {
++   need(r->kind==257||r->kind==1025||r->kind==1026,"relocation kind");
++   const Symbol *s=&m->symbols[r->symbol];void *p=r->kind==1026?runtime_observer(s->name):NULL;
++   /* round12c 排障：SMO 装载进度监视洪流（main+0x9b9ba8 经 cell 0x1363dc8 调 Map 3.7M 次/150s）
++      的同函数第二表调用走 cell 0x136deb8（其返回值=进度分子，main+0x9b97e0 差值计量）——boot 期
++      打出两 cell 的符号名，定性该调用是 NVN/宿主实现还是客体函数；有界 2 行。 */
++   if(r->where==0x1363dc8||r->where==0x136deb8)
++    fprintf(stderr,"[odyssey] import-cell %#llx <- %s (defined=%u binding=%u)\n",(unsigned long long)r->where,s->name,s->defined,s->binding);
++   if(!p)p=runtime_override(s->name);

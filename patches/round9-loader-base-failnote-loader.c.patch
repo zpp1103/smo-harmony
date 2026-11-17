@@ -1,0 +1,28 @@
+--- entry/src/main/cpp/host/loader.c	2026-10-31 18:10:08
++++ /Users/zpp/VibeCoding/ns-mario-odessy-to-harmony/mario-odessy-harmony/entry/src/main/cpp/host/loader.c	2026-11-01 02:31:24
+@@ -24,7 +24,7 @@
+ #define NM (sizeof(modules)/sizeof(modules[0]))
+ pthread_key_t runtime_keys[8];
+ static uint64_t timer_calls, svc_calls;
+-_Noreturn void runtime_fail(const char *message) { fprintf(stderr,"[totk] FAIL: %s\n",message); fflush(stderr); usleep(50000); exit(1); }   /* usleep：等 stderr→hilog 转发线程把 FAIL 行送出（OHOS）再退 */
++_Noreturn void runtime_fail(const char *message) { runtime_svc_context_line("[totk] FAIL svc ctx: "); fprintf(stderr,"[totk] FAIL: %s\n",message); fflush(stderr); usleep(50000); exit(1); }   /* round9：FAIL 前先 write(2) 落笔在飞 SVC（runtime_svc+5104 即 svc 0x26 Break→本函数）；usleep：等 stderr→hilog 转发线程把 FAIL 行送出（OHOS）再退 */
+ static void need(bool c,const char *m) { if(!c) runtime_fail(m); }
+ static size_t page_up(size_t x) { return (x+0x3fff)&~(size_t)0x3fff; }
+ static unsigned hash_name(const char *s) { unsigned h=2166136261u; for(;*s;s++)h=(h^(uint8_t)*s)*16777619u;return h; }
+@@ -238,6 +238,7 @@
+   memcpy(m->base+r->where,&v,8);
+  }
+  fprintf(stderr,"[odyssey] relocated %s %u entries\n",m->name,m->nreloc);
++ fprintf(stderr,"[loader-base] %s base=0x%llx size=0x%llx\n",m->name,(unsigned long long)(uintptr_t)m->base,(unsigned long long)m->size);   /* round9 观测：relocate 完成即留基址；dump 头行另有一份（含宿主 libgame.so），供 who= 裸地址换算 offset */
+ }
+ static void verify_identity(int negative) {
+  unsigned checked=0;void *original=required("nnMain");
+@@ -538,7 +539,7 @@
+ /* Host aborts (e.g. Metal validation assertions) print the host call stack before the process ends. */
+ #include <execinfo.h>
+ static void abort_report(int num) {
+- (void)num;void *frames[64];int n=backtrace(frames,64);write(2,"[totk] host abort, call stack:\n",31);backtrace_symbols_fd(frames,n,2);
++ (void)num;runtime_svc_context_line("[totk] abort svc ctx: ");void *frames[64];int n=backtrace(frames,64);write(2,"[totk] host abort, call stack:\n",31);backtrace_symbols_fd(frames,n,2);
+  signal(SIGABRT,SIG_DFL);raise(SIGABRT);
+ }
+ int main(int argc,char **argv) {

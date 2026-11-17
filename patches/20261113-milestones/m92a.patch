@@ -1,0 +1,499 @@
+--- mario-odessy-harmony/entry/src/main/cpp/platform/shader_dump.c
++++ mario-odessy-harmony/entry/src/main/cpp/platform/shader_dump.c
+@@ -11,6 +11,7 @@
+ #include <CommonCrypto/CommonDigest.h>
+ #include <pthread.h>
+ #include <stdio.h>
++#include <stdlib.h>   /* M92A：strtol / malloc（缺失 shader 暂存区） */
+ #include <string.h>
+ #include <stdint.h>
+ #include <sys/stat.h>
+@@ -285,8 +286,381 @@
+         }
+     }
+     return h->why == SD_OK;
++}
++
++/* ===================== M92A（2026-11-13）：缺失 shader dump =====================
++   背景（M91A 实测定论）：真机 3D 帧段 9,895 笔 draw 因为 r_key() 在 shader 语料里查不到 vs/fs 键
++   被整笔跳过（`noentry=0 / nokey=9895 / cache_keys=14422`），而语料本身完好（14,422 条、与本机逐字节一致）
++   ⇒ 真机跑了**语料里从没烘过的 shader 变体**。本块把这些"缺的"shader 的控制码原样抓出来，
++   供下一单装机跑 3D 段 → 离线烘 spv → 重建 index.json/spv.bin。
++
++   开关 `smo_m92a`（位掩码；缺省 0 = 本块整段不进，逐字节旧行为）：
++     bit0 = r_bin_spv 的键比较 15 → 16（真正的比较在 nvn_vk.c:6512，这里只提供读位掩码）；
++     bit1 = 缺失 shader dump：SetShaders 期把「语料里没有」的 (key, ctl, code) **拷进内存暂存区**
++            （见 sd_one 里的 m92a_maybe_stash），真机 draw 判 nokey 时再把该键写成自描述文件
++            （见 shader_dump_missing_note）。**draw 路径里零 guest 读、零 RT 绑定/布局切换** ——
++            M89A 曾在 draw 录制路径里切 RT 布局，把设备拖死 ~27 min，这次只在 SetShaders 期取字节；
++     bit2 = 只统计不落盘（不暂存、不写文件，只打 `[m92a] stats` 汇总，供先跑一轮看规模）。
++   `smo_m92a_dir`：输出目录（缺省 files/shader_dump92；相对路径按 /data/storage/el2/base 解析）。
++
++   落盘格式（每键一个文件 `<dir>/<key>.<stage>.m92a`，**自描述**；stage 0=VS 1=FS）：
++     +0   char magic[8] = "M92ADMP1"
++     +8   u32 version = 1        +12 u32 header_bytes = 128
++     +16  u16 stage              +18 u16 flags (bit0=1：ctl/code 两个段都在)
++     +20  u32 ctl_len            +24 u32 code_len
++     +28  u32 n_draws（首见时该笔的索引数）  +32 u64 rt_key（目标 RT 键 nw_tgt_key 口径）
++     +40  char key[17]（本 stage 键，16 hex + NUL）
++     +57  char vs[17]            +74 char fs[17]
++     +128 ctl 字节（ctl_len）    +128+ctl_len code 字节（code_len）
++   同目录另有 `m92a_index.txt`（每键一行：key/stage/ctl/code/bytes/rt/vs/fs/draws/文件名）与
++   `m92a_pairs.txt`（每对 (vs,fs,rt) 一行），离线烘焙按文本行对账即可。
++   上限：语料落盘侧 SD_MAX_KEYS(4096)/SD_MAX_BYTES(256MB) 在真机 3D 段覆盖完前就会打满
++   ⇒ bit1 时抬到 60,000 键 / 1 GiB（仍是硬顶，且"已满"时点名丢弃哪个 key）；暂存区另给
++   4,096 键 / 64 MiB（实测 68 对 ≈ 2.8 MB 量级，够用且不惊动 LMK）。
++   纪律：所有失败路径只计数 + 一行日志，绝不改渲染行为、绝不阻塞 draw。 */
++#define M92A_A     "/data/storage/el2/base/files/smo_m92a"
++#define M92A_B     "/data/app/el2/100/base/com.vibecc.smo/files/smo_m92a"
++#define M92A_DIR_A "/data/storage/el2/base/files/smo_m92a_dir"
++#define M92A_DIR_B "/data/app/el2/100/base/com.vibecc.smo/files/smo_m92a_dir"
++#define M92A_DIR_DEF "files/shader_dump92"
++#define M92A_STASH_KEYS   4096u                    /* 暂存键上限（去重后） */
++#define M92A_STASH_BYTES  (64ull << 20)            /* 暂存区字节上限 */
++#define M92A_PAIR_MAX     1024u                    /* (vs,fs,rt) 去重表容量 */
++#define M92A_HDR          128u                     /* 自描述头固定长度 */
++#define M92A_KEY_TAG      0x4d393241u              /* 'M92A'：只用于日志/自检辨识 */
++
++extern int nvn_vk_key_in_corpus(const char *key);   /* nvn_vk.c：r_key() 命中即"在语料里" */
++extern int nvn_vk_corpus_ready(void);               /* nvn_vk.c：语料是否已装好（g_rk_n>0） */
++
++typedef struct {
++    char     key[17];
++    uint32_t off;          /* 暂存区偏移（ctl 紧跟 code） */
++    uint32_t ctl_len, code_len;
++    uint16_t stage;
++    uint8_t  dumped;       /* 1 = 已落盘（每键只落一次） */
++} m92a_rec;
++typedef struct { char vs[17], fs[17]; uint64_t rt; unsigned long long n; } m92a_pair;
++
++static pthread_mutex_t g_mu92 = PTHREAD_MUTEX_INITIALIZER;
++static int      g_m92a_bits = -2;          /* -2 = 还没读过 */
++static unsigned long long g_m92a_stamp, g_m92a_stat_stamp;
++static unsigned long long g_m92a_notes, g_m92a_dumped, g_m92a_dropped, g_m92a_bytes;
++static unsigned      g_m92a_stash_n, g_m92a_full_logged, g_m92a_miss_logged, g_m92a_cap_logged;
++static unsigned long long g_m92a_notready;
++static uint8_t      *g_m92a_pool;          /* 惰性 malloc 的暂存区 */
++static size_t        g_m92a_pool_used;
++static m92a_rec      g_m92a_rec[M92A_STASH_KEYS];
++static char          g_m92a_dir[512];
++static int           g_m92a_dir_state;     /* 0=未建 1=可用 -1=不可用 */
++static m92a_pair     g_m92a_pair[M92A_PAIR_MAX];
++static unsigned      g_m92a_pair_n;
++static unsigned long long g_m92a_pair_ovf;
++
++/* 读一个整型开关文件（缺省 -1；与 d3_file_tri 不同，这里要的是位掩码整数）。 */
++static int m92a_int(const char *a, const char *b)
++{
++    char buf[32];
++    for (int i = 0; i < 2; i++) {
++        FILE *f = fopen(i ? b : a, "r");
++        if (!f) continue;
++        size_t n = fread(buf, 1, sizeof buf - 1, f);
++        fclose(f);
++        buf[n] = 0;
++        const char *p = buf;
++        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
++        return (int)strtol(p, NULL, 0);
++    }
++    return -1;
++}
++/* 缺的开关文件先由应用种成缺省值（hdc 只能改已存在的文件）。 */
++static void m92a_seed_file(const char *a, const char *b, const char *val)
++{
++    FILE *f;
++    for (int i = 0; i < 2; i++) if ((f = fopen(i ? b : a, "r"))) { fclose(f); return; }
++    for (int i = 0; i < 2; i++)
++        if ((f = fopen(i ? b : a, "w"))) { fputs(val, f); fclose(f); return; }
++}
++__attribute__((constructor)) static void m92a_seed(void)
++{
++    m92a_seed_file(M92A_A, M92A_B, "0\n");
++    m92a_seed_file(M92A_DIR_A, M92A_DIR_B, M92A_DIR_DEF "\n");
++}
++
++int shader_dump_m92a_bits(void)
++{
++    unsigned long long t = d3_now_ms();
++    if (g_m92a_bits == -2 || t >= g_m92a_stamp + 2000ull) {
++        g_m92a_stamp = t;
++        int v = m92a_int(M92A_A, M92A_B);
++        if (v < 0) v = 0;
++        v &= 7;                                   /* 只认 bit0/1/2 */
++        if (v != g_m92a_bits) {
++            int was = g_m92a_bits;
++            g_m92a_bits = v;
++            if (v || was > 0)   /* 缺省 0 不打日志（默认路径零输出），只有变化时才说一句 */
++                vk_boot_logf("[m92a] knob smo_m92a=%d (0x%x) strict16=%d dump=%d stats_only=%d dir=%s",
++                             v, v, v & 1, (v & 2) ? 1 : 0, (v & 4) ? 1 : 0, M92A_DIR_DEF);
++        }
++    }
++    return g_m92a_bits;
+ }
+ 
++/* 输出目录：smo_m92a_dir（缺省 files/shader_dump92）。绝对路径直接用；相对路径按
++   /data/storage/el2/base 解析（与 files/ 同一沙箱视角，hdc file recv 拉得回）。 */
++static const char *m92a_dir(void)
++{
++    if (g_m92a_dir_state) return g_m92a_dir_state > 0 ? g_m92a_dir : NULL;
++    char v[256];
++    int has = 0;
++    for (int i = 0; i < 2 && !has; i++) {
++        FILE *f = fopen(i ? M92A_DIR_B : M92A_DIR_A, "r");
++        if (!f) continue;
++        size_t n = fread(v, 1, sizeof v - 1, f);
++        fclose(f);
++        v[n] = 0;
++        char *s = v;
++        while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
++        size_t l = strlen(s);
++        while (l && (s[l - 1] == '\n' || s[l - 1] == '\r' || s[l - 1] == ' ' || s[l - 1] == '\t')) s[--l] = 0;
++        if (l) { memmove(v, s, l + 1); has = 1; }
++    }
++    if (!has) snprintf(v, sizeof v, "%s", M92A_DIR_DEF);
++    if (v[0] == '/') {
++        snprintf(g_m92a_dir, sizeof g_m92a_dir, "%s", v);
++    } else {
++        char base[512] = "/data/storage/el2/base";
++        const char *lp = vk_boot_log_path();
++        if (lp && lp[0]) {
++            snprintf(base, sizeof base, "%s", lp);
++            char *s = strrchr(base, '/');
++            if (s) { *s = 0; }                    /* 去掉文件名 → …/files */
++            s = strrchr(base, '/');
++            if (s) { *s = 0; }                    /* 去掉 files → …/base */
++            if (!base[0]) snprintf(base, sizeof base, "/data/storage/el2/base");
++        }
++        snprintf(g_m92a_dir, sizeof g_m92a_dir, "%s/%s", base, v);
++    }
++    if (mkdir(g_m92a_dir, 0777) != 0 && errno != EEXIST) {
++        vk_boot_logf("[m92a] dir mkdir FAILED path=%s errno=%d -> dump disabled", g_m92a_dir, errno);
++        g_m92a_dir_state = -1;
++        return NULL;
++    }
++    chmod(g_m92a_dir, 0777);   /* app 私有目录 0700 也能 recv，这里放宽便于取证 */
++    g_m92a_dir_state = 1;
++    vk_boot_logf("[m92a] dir=%s", g_m92a_dir);
++    return g_m92a_dir;
++}
++
++/* `[m92a] stats dumped=… pairs=… dropped=…`（周期 + 每次新 dump 之后 + 收尾各一行）。 */
++static void m92a_stats(const char *why)
++{
++    vk_boot_logf("[m92a] stats dumped=%llu pairs=%llu dropped=%llu notes=%llu stash=%u/%u "
++                 "stash_bytes=%llu/%llu pair_ovf=%llu notready=%llu bytes=%llu mode=%s dir=%s why=%s",
++                 g_m92a_dumped, (unsigned long long)g_m92a_pair_n, g_m92a_dropped, g_m92a_notes,
++                 g_m92a_stash_n, M92A_STASH_KEYS, (unsigned long long)g_m92a_pool_used,
++                 M92A_STASH_BYTES, g_m92a_pair_ovf, g_m92a_notready, g_m92a_bytes,
++                 (g_m92a_bits & 4) ? "stats_only" : "dump",
++                 g_m92a_dir_state > 0 ? g_m92a_dir : "-", why);
++}
++
++/* (vs,fs,rt) 去重表：判覆盖率用；落盘模式同步追加 m92a_pairs.txt（离线烘培要知道哪对一起用）。 */
++static void m92a_pair_note(const char *vs, const char *fs, uint64_t rt, int count)
++{
++    if (!vs || !*vs || !fs || !*fs) return;
++    unsigned long long n = (count > 0) ? (unsigned long long)count : 0ull;
++    for (unsigned i = 0; i < g_m92a_pair_n; i++)
++        if (g_m92a_pair[i].rt == rt && !strcmp(g_m92a_pair[i].vs, vs) && !strcmp(g_m92a_pair[i].fs, fs)) {
++            g_m92a_pair[i].n += n;
++            return;
++        }
++    if (g_m92a_pair_n >= M92A_PAIR_MAX) {
++        if (g_m92a_pair_ovf++ < 4)
++            vk_boot_logf("[m92a] pairs FULL cap=%u -> 丢弃 pair vs=%s fs=%s rt=%#llx",
++                         M92A_PAIR_MAX, vs, fs, (unsigned long long)rt);
++        return;
++    }
++    m92a_pair *p = &g_m92a_pair[g_m92a_pair_n++];
++    snprintf(p->vs, sizeof p->vs, "%s", vs);
++    snprintf(p->fs, sizeof p->fs, "%s", fs);
++    p->rt = rt;
++    p->n = n;
++    if (g_m92a_dir_state > 0 && (shader_dump_m92a_bits() & 2) && !(shader_dump_m92a_bits() & 4)) {
++        char path[704];
++        snprintf(path, sizeof path, "%s/m92a_pairs.txt", g_m92a_dir);
++        FILE *f = fopen(path, "a");
++        if (f) {
++            fprintf(f, "vs=%s fs=%s rt=%016llx draws=%llu\n", vs, fs, (unsigned long long)rt, p->n);
++            fclose(f);
++        }
++    }
++}
++
++/* SetShaders 期：只把"语料里没有的键"拷进暂存区（每键一次）。调用方已持 g_mu（shader_dump_program）。 */
++static void m92a_maybe_stash(const char *key, int stage, const void *ctl, uint64_t code_addr,
++                             uint32_t ctl_len, uint32_t code_len)
++{
++    if (!key || !*key) return;
++    if (!(shader_dump_m92a_bits() & 2)) return;          /* bit2/0：不暂存（省内存） */
++    if (stage != 0 && stage != 1) return;                /* 只要图形两阶段（compute 不在本题） */
++    if (!nvn_vk_corpus_ready()) { g_m92a_notready++; return; }   /* 语料还没装好时别把全量 shader 吞进内存 */
++    if (nvn_vk_key_in_corpus(key)) return;               /* 语料里有 ⇒ 不抓（本次只补缺的） */
++    pthread_mutex_lock(&g_mu92);
++    for (unsigned i = 0; i < g_m92a_stash_n; i++)
++        if (g_m92a_rec[i].stage == (uint16_t)stage && !strcmp(g_m92a_rec[i].key, key)) {
++            pthread_mutex_unlock(&g_mu92);
++            return;
++        }
++    if (g_m92a_stash_n >= M92A_STASH_KEYS ||
++        g_m92a_pool_used + (size_t)ctl_len + (size_t)code_len > M92A_STASH_BYTES) {
++        g_m92a_dropped++;
++        if (++g_m92a_full_logged <= 8)
++            vk_boot_logf("[m92a] stash FULL keys=%u/%u bytes=%llu/%llu -> 丢弃 key=%s stage=%d "
++                         "(该键不入暂存区，dump 时会计 MISS)", g_m92a_stash_n, M92A_STASH_KEYS,
++                         (unsigned long long)g_m92a_pool_used, M92A_STASH_BYTES, key, stage);
++        pthread_mutex_unlock(&g_mu92);
++        return;
++    }
++    if (!g_m92a_pool) {
++        g_m92a_pool = (uint8_t *)malloc((size_t)M92A_STASH_BYTES);
++        if (!g_m92a_pool) {
++            g_m92a_dropped++;
++            if (++g_m92a_full_logged <= 8)
++                vk_boot_logf("[m92a] stash malloc FAILED bytes=%llu -> dump disabled",
++                             (unsigned long long)M92A_STASH_BYTES);
++            pthread_mutex_unlock(&g_mu92);
++            return;
++        }
++    }
++    uint8_t *dst = g_m92a_pool + g_m92a_pool_used;
++    if (ctl_len && !sd_read(dst, (uint64_t)(uintptr_t)ctl, ctl_len)) {
++        g_m92a_dropped++;
++        if (++g_m92a_full_logged <= 8) vk_boot_logf("[m92a] stash read FAILED key=%s ctl=%u", key, ctl_len);
++        pthread_mutex_unlock(&g_mu92);
++        return;
++    }
++    if (code_len && !sd_read(dst + ctl_len, code_addr, code_len)) {
++        g_m92a_dropped++;
++        if (++g_m92a_full_logged <= 8) vk_boot_logf("[m92a] stash read FAILED key=%s code=%u", key, code_len);
++        pthread_mutex_unlock(&g_mu92);
++        return;
++    }
++    m92a_rec *r = &g_m92a_rec[g_m92a_stash_n++];
++    snprintf(r->key, sizeof r->key, "%s", key);
++    r->off = (uint32_t)g_m92a_pool_used;
++    r->ctl_len = ctl_len;
++    r->code_len = code_len;
++    r->stage = (uint16_t)stage;
++    r->dumped = 0;
++    g_m92a_pool_used += (size_t)ctl_len + code_len;
++    if (g_m92a_stash_n <= 32 || (g_m92a_stash_n & 255u) == 0u)
++        vk_boot_logf("[m92a] stash key=%s stage=%d ctl=%u code=%u n=%u/%u (tag=%08x)",
++                     key, stage, ctl_len, code_len, g_m92a_stash_n, M92A_STASH_KEYS, M92A_KEY_TAG);
++    pthread_mutex_unlock(&g_mu92);
++}
++
++/* 把一个暂存键写成自描述文件（每键一次）。调用方持 g_mu92。返回 1 = 已落盘/本来就已落盘。 */
++static int m92a_dump_key(const char *key, uint64_t rt, const char *vs, const char *fs, int n)
++{
++    m92a_rec *r = NULL;
++    for (unsigned i = 0; i < g_m92a_stash_n; i++)
++        if (!strcmp(g_m92a_rec[i].key, key)) { r = &g_m92a_rec[i]; break; }
++    if (!r) {
++        g_m92a_dropped++;
++        if (++g_m92a_miss_logged <= 8)
++            vk_boot_logf("[m92a] dump MISS key=%s (暂存区没有：语料里本来有 / 暂存已满 / SetShaders 没经过) rt=%#llx",
++                         key, (unsigned long long)rt);
++        return 0;
++    }
++    if (r->dumped) return 1;
++    const char *d = m92a_dir();
++    if (!d) { g_m92a_dropped++; return 0; }
++
++    uint8_t hdr[M92A_HDR];
++    memset(hdr, 0, sizeof hdr);
++    memcpy(hdr, "M92ADMP1", 8);
++    uint32_t u32;
++    uint16_t u16;
++    u32 = 1u;         memcpy(hdr + 8,  &u32, 4);          /* version */
++    u32 = M92A_HDR;   memcpy(hdr + 12, &u32, 4);          /* header_bytes */
++    u16 = (uint16_t)r->stage; memcpy(hdr + 16, &u16, 2);  /* 0=VS 1=FS */
++    u16 = 1u;         memcpy(hdr + 18, &u16, 2);          /* flags bit0 = ctl/code 都在 */
++    memcpy(hdr + 20, &r->ctl_len, 4);
++    memcpy(hdr + 24, &r->code_len, 4);
++    u32 = (uint32_t)(n > 0 ? n : 0);
++    memcpy(hdr + 28, &u32, 4);                            /* n_draws（首见时） */
++    memcpy(hdr + 32, &rt, 8);                             /* 目标 RT 键 */
++    memcpy(hdr + 40, r->key, strlen(r->key) + 1);
++    if (vs) memcpy(hdr + 57, vs, strlen(vs) + 1);
++    if (fs) memcpy(hdr + 74, fs, strlen(fs) + 1);
++
++    char path[704];
++    snprintf(path, sizeof path, "%s/%s.%u.m92a", d, r->key, (unsigned)r->stage);
++    FILE *f = fopen(path, "wb");
++    if (!f) {
++        g_m92a_dropped++;
++        vk_boot_logf("[m92a] dump write FAILED key=%s stage=%u path=%s errno=%d",
++                     r->key, (unsigned)r->stage, path, errno);
++        return 0;
++    }
++    size_t total = (size_t)r->ctl_len + (size_t)r->code_len;
++    size_t w1 = fwrite(hdr, 1, sizeof hdr, f);
++    size_t w2 = total ? fwrite(g_m92a_pool + r->off, 1, total, f) : 0;
++    int ce = fclose(f);
++    if (w1 != sizeof hdr || w2 != total || ce != 0) {
++        g_m92a_dropped++;
++        vk_boot_logf("[m92a] dump write SHORT key=%s stage=%u want=%zu got=%zu/%zu",
++                     r->key, (unsigned)r->stage, sizeof hdr + total, w1, w2);
++        return 0;
++    }
++    r->dumped = 1;
++    g_m92a_dumped++;
++    g_m92a_bytes += (unsigned long long)total;
++    vk_boot_logf("[m92a] dump key=%s stage=%u bytes=%zu ctl=%u code=%u n=%d rt=%#llx vs=%s fs=%s file=%s",
++                 r->key, (unsigned)r->stage, sizeof hdr + total, r->ctl_len, r->code_len,
++                 n, (unsigned long long)rt, vs ? vs : "-", fs ? fs : "-", path);
++    char ipath[704];
++    snprintf(ipath, sizeof ipath, "%s/m92a_index.txt", d);
++    FILE *ix = fopen(ipath, "a");
++    if (ix) {
++        fprintf(ix, "key=%s stage=%u ctl=%u code=%u bytes=%zu rt=%016llx vs=%s fs=%s draws=%d file=%s.%u.m92a\n",
++                r->key, (unsigned)r->stage, r->ctl_len, r->code_len, sizeof hdr + total,
++                (unsigned long long)rt, vs ? vs : "-", fs ? fs : "-", n, r->key, (unsigned)r->stage);
++        fclose(ix);
++    }
++    return 1;
++}
++
++/* nokey 的 draw 调这里（nvn_vk.c:22525 分支）。只读 g_rt_cur->key，不做任何绑定/布局改动。 */
++void shader_dump_missing_note(const char *vs, const char *fs, uint64_t rt_key, int count)
++{
++    int bits = shader_dump_m92a_bits();
++    if (!bits) return;                          /* 缺省 0：一次分支都不多（只有 2 s 缓存读） */
++    pthread_mutex_lock(&g_mu92);
++    g_m92a_notes++;
++    m92a_pair_note(vs, fs, rt_key, count);
++    if ((bits & 2) && !(bits & 4)) {            /* bit1 落盘；bit2 在时只统计 */
++        if (vs && *vs) m92a_dump_key(vs, rt_key, vs, fs, count);
++        if (fs && *fs) m92a_dump_key(fs, rt_key, vs, fs, count);
++    }
++    unsigned long long t = d3_now_ms();
++    if ((g_m92a_notes & 255ull) == 0ull || t >= g_m92a_stat_stamp + 5000ull) {
++        g_m92a_stat_stamp = t;
++        m92a_stats("periodic");
++    }
++    pthread_mutex_unlock(&g_mu92);
++}
++
++/* M92A：语料落盘侧（shader_dump_program）的上限。bit1 时抬到 60,000 键 / 1 GiB；
++   其它情况逐字沿用旧常量（默认路径行为不变）。 */
++static unsigned long long sd_max_keys(void)
++{
++    return (shader_dump_m92a_bits() & 2) ? 60000ull : SD_MAX_KEYS;
++}
++static unsigned long long sd_max_bytes(void)
++{
++    return (shader_dump_m92a_bits() & 2) ? (1024ull << 20) : SD_MAX_BYTES;
++}
++
+ static unsigned long long g_d3_zero_key, g_d3_real_key;   /* M7D3：占位零 key vs 真 SHA key 的计数 */
+ 
+ static void sd_zero_key(char out[17]) { memset(out, '0', 16); out[16] = 0; g_d3_zero_key++; }
+@@ -462,15 +836,24 @@
+     uint64_t k;
+     memcpy(&k, d, sizeof k);
+ 
++    /* M92A bit1：语料里没有的键在这里拷进内存暂存区（SetShaders 期读一次；draw 期零 guest 读）。 */
++    m92a_maybe_stash(key, (int)h.stage, ctl, code_addr, h.ctl_len, h.code_len);
++
+     g_uniq++;                                   /* 口径：通过校验的不同键数（含超出上限未落盘的） */
+     if (sd_seen(k)) return 0;
+-    if (g_dumped >= SD_MAX_KEYS) {
++    if (g_dumped >= sd_max_keys()) {
+         if (!g_full) { vk_boot_logf("[s] dump full (keys=%lu) -> counting only", g_dumped); g_full = 1; }
++        if ((shader_dump_m92a_bits() & 2) && ++g_m92a_cap_logged <= 8)
++            vk_boot_logf("[m92a] corpus dump FULL key=%s stage=%u dumped=%lu cap=%llu -> 丢弃该键",
++                         key, h.stage, g_dumped, sd_max_keys());
+         g_full++;
+         return 0;
+     }
+-    if (g_bytes + h.ctl_len + h.code_len > SD_MAX_BYTES) {
++    if (g_bytes + h.ctl_len + h.code_len > sd_max_bytes()) {
+         if (!g_full) { vk_boot_logf("[s] dump full (bytes=%lu) -> counting only", g_bytes); g_full = 1; }
++        if ((shader_dump_m92a_bits() & 2) && ++g_m92a_cap_logged <= 16)
++            vk_boot_logf("[m92a] corpus dump FULL key=%s stage=%u bytes=%lu cap=%llu -> 丢弃该键",
++                         key, h.stage, g_bytes, sd_max_bytes());
+         g_full++;
+         return 0;
+     }
+@@ -568,4 +951,10 @@
+     pthread_mutex_lock(&g_mu);
+     if (g_calls) sd_totals("final");
+     pthread_mutex_unlock(&g_mu);
++    /* M92A：收尾补一行缺失-shader 汇总（knob=0 时不打、不建目录、不碰任何东西）。 */
++    if (shader_dump_m92a_bits()) {
++        pthread_mutex_lock(&g_mu92);
++        m92a_stats("final");
++        pthread_mutex_unlock(&g_mu92);
++    }
+ }
+--- mario-odessy-harmony/entry/src/main/cpp/platform/shader_dump.h
++++ mario-odessy-harmony/entry/src/main/cpp/platform/shader_dump.h
+@@ -17,4 +17,18 @@
+ int shader_dump_key_at(const void *sd, int i, uint64_t prog, char out[17]);
+ /* M3v P2：key_bad（shader_key 失败次数）按「原始 stage 字段」与「首个不满足的判据」两维分解。 */
+ void shader_dump_keybad_report(void);
++
++/* ---- M92A（2026-11-13）：缺失 shader dump（真机 3D 段 nokey 的那 68 对） ----
++ * `smo_m92a` 位掩码，缺省 0 = 逐字节旧行为：
++ *   bit0 = r_bin_spv 的键比较 15 → 16（比较本体在 nvn_vk.c，用本函数选长度）；
++ *   bit1 = 缺失 shader dump：SetShaders 期把「语料里没有」的 (key, ctl, code) 暂存进内存，
++ *          draw 判 nokey 时写成 <smo_m92a_dir>/<key>.<stage>.m92a（128 B 自描述头 + ctl + code），
++ *          每键只写一次（去重）；同目录 m92a_index.txt / m92a_pairs.txt 为文本台账；
++ *   bit2 = 只统计不落盘（只打 `[m92a] stats dumped/pairs/dropped`）。
++ * `smo_m92a_dir`：输出目录，缺省 files/shader_dump92（相对路径按 /data/storage/el2/base 解析）。
++ * 文件格式见 shader_dump.c 的 M92A 注释块（魔数 "M92ADMP1"）。 */
++int  shader_dump_m92a_bits(void);
++/* nokey 的 draw：vs/fs = 该 program 的两把键，rt_key = 目标 RT 键（g_rt_cur->key）。
++ * 只读、只计数/落盘；**不做任何 RT 绑定或布局切换**；knob=0 时立即返回。 */
++void shader_dump_missing_note(const char *vs, const char *fs, uint64_t rt_key, int count);
+ #endif
+--- mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c
++++ mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c
+@@ -34,6 +34,7 @@
+ #define M7O_ON 1  /* M7o P2: 0 = revert scene FS key 0c70f5be9430cba7 to original baked bytes (one-key rollback) */
+ #include "m7o_uv_fs_spv.h"   /* M7o P2: replacement FS for 0c70f5be9430cba7 (loc1 varying as UV + tex.rgb passthrough, see r_module) */
+ #include "../../vk_boot.h"   /* M3c：file log 取证通道 + ICD 路径（vk_boot.c） */
++#include "../shader_dump.h"  /* M92A：smo_m92a 位掩码（bit0 严格 spv 键比较）+ 缺失 shader dump 入口 */
+ #include "../../third_party/d2r_gfx/gfx/tex/nvn_deswizzle.h"   /* round23批2 收编尾巴③：块线性解排布（nvn_deswizzle_geom/nvn_deswizzle；单体线 pkg_upload :6028/:6108 同位用法） */
+ #include "../../nvn_vk2/nvn_bc.h"   /* M42E：CPU BC 软解（树内既有 nvn_vk2/nvn_bc.c，bcdec，BCDEC_STATIC；本次只接线，未新写解码器） */
+ #include <pthread.h>
+@@ -6262,6 +6263,12 @@
+     }
+     return NULL;
+ }
++
++/* M92A：给 shader_dump.c 的缺失-shader 暂存器用的**只读**语料查询。
++   "这个键在不在语料里"用的就是 nokey 的同一把尺子（r_key 命中），避免两边判据漂移。
++   corpus_ready 用 g_rk_n（index 装载条数）：语料没装好时返回 0，暂存器就不会把全量 shader 吞进内存。 */
++int nvn_vk_key_in_corpus(const char *key) { return r_key(key) != NULL; }
++int nvn_vk_corpus_ready(void) { return g_rk_n > 0; }
+ 
+ /* ---- M5c：内存护栏 + 阶段打点（只读，唯一的行为改动见 runtime_rss_guard 的注释） ----
+    M5b 的实况：guest 全体在等、只有 h=0x1004 在 host 代码里跑，CPU 稳定 107%、RSS 从 2.6 GB 涨到 13.7 GB
+@@ -6507,8 +6514,12 @@
+ static const void *r_bin_spv(const char *key, int stage, size_t *n)
+ {
+     if (!r_bin_load() || !key || !*key) return NULL;
++    /* M92A bit0（`smo_m92a&1`）：严格按 16 个 hex 字符比。旧行为按 15 比，有 1/16 概率取到
++       "前 15 字符相同"的另一把 key 的 spv（管线可能建错 shader）——这是独立隐患，不改本轮的 9,895 笔。
++       缺省 0 = 逐字节旧行为（比较长度仍是 15）。 */
++    const size_t kcmp = (shader_dump_m92a_bits() & 1) ? 16u : 15u;
+     for (uint32_t i = 0; i < g_rbe_n; i++) {
+-        if (g_rbe[i].stage != (uint32_t)stage || strncmp(g_rbe[i].key, key, 15)) continue;
++        if (g_rbe[i].stage != (uint32_t)stage || strncmp(g_rbe[i].key, key, kcmp)) continue;
+         if ((size_t)g_rbe[i].off + g_rbe[i].bytes > g_rbin_n) return NULL;
+         *n = g_rbe[i].bytes;
+         return g_rbin + g_rbe[i].off;
+@@ -22529,6 +22540,10 @@
+         nw_note_noprog(pr, kv, kf, count, mode, type, (int)topo, 0);   /* M4bw P1：按目标归因 */
+         p3_note_dpass_skip("nokey", g_r_cur_prog, pr->vs, pr->fs);
+         r_nokey_hist(pr->vs, pr->fs, count, g_rt_w == H_OFF_W && g_rt_h == H_OFF_H);   /* M4h P1 / M4ae P3：加 count+ext */
++        /* M92A bit1/bit2：把「语料里没有的那对 shader」的字节抓下来（每键一次去重；缺省 0 = 立即返回）。
++           只读 g_rt_cur->key 拿目标 RT 身份；**绝不做任何 RT 绑定/布局切换**（M89A 曾因此在 draw
++           录制路径里切布局，把设备拖死 ~27 min）。 */
++        shader_dump_missing_note(pr->vs, pr->fs, g_rt_cur ? g_rt_cur->key : 0ull, count);
+         if (g_r_skip_nokey <= 4)
+             vk_boot_logf("[r] skip nokey prog=%#llx vs=%s(%d) fs=%s(%d) cache_keys=%d idx=%d type=%d mode=%d",
+                          (unsigned long long)g_r_cur_prog, pr->vs, kv ? 1 : 0, pr->fs, kf ? 1 : 0, g_rk_n,

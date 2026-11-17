@@ -1,0 +1,379 @@
+--- mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c
++++ mario-odessy-harmony/entry/src/main/cpp/platform/nvn_vk/nvn_vk.c
+@@ -29984,6 +29984,196 @@
+     if (lastfs[0] && sel_slot >= 0 && sel_slot < H_RT_SLOTS) memcpy(g_m105a_lastfs[sel_slot], lastfs, sizeof lastfs);
+     g_m105a_rd = w;
+     memset(g_m105a_texmask, 0, sizeof g_m105a_texmask);
++}
++
++/* ================= M106A（2026-11-13）：present 取源处一次 blit =================
++   目标（本单唯一目标）：把「带贴图的真实场景」所在槽（默认 slot 75 = 400×225，每帧 237 笔带贴图
++   draw）**放大**到 800×450，再走**既有 CH1**（vkCmdCopyImageToBuffer → g_p_map →
++   nvn_win_present_rgba）上屏。不改 pass 顺序、不造第二条上屏通道、不改游戏逻辑、不碰 nvn_vk2 目录（死代码层）。
++   knob `smo_m106a=<slot>`：app 自种缺省 0 = 关（关态逐字节等于 M105A 行为）；同一 boot 内改槽号即可
++   扫候选（75→31→40→45→76），这是省 install 的关键。
++   失败必须可见：建图/槽不可用/布局不可 barrier 时**不切换源**（原路径照跑）并打 `rc!=0 fallback=1`；
++   blit 提交/栅栏失败打 `rc!=0 fallback=1`，连续 2 次失败 ⇒ 本 boot 粘住关闭（屏幕上继续走 M105A 原
++   路径），不静默、不半途改架构。
++   判据口径（M105A 遗留盲区）：`dcol` = 每通道 >>4 量化后的**不同三元组数**（12-bit 精确计数，
++   ≥8 才算有内容），`nyb` = 不属于 黑(各通道<16) / 纯黄(r,g≥240 且 b<32) 的像素占比（>5% 才算有画面）。 */
++#define M106A_A P_SLOT_DIR_A "/smo_m106a"
++#define M106A_B P_SLOT_DIR_B "/smo_m106a"
++#define M106A_DW 800u
++#define M106A_DH 450u
++static VkImage g_m106a_img;
++static VkDeviceMemory g_m106a_mem;
++static VkImageLayout g_m106a_dlay = VK_IMAGE_LAYOUT_UNDEFINED;
++static int g_m106a_creat_rc;                    /* 0 = 建好；非 0 = 建图失败（含 VkResult） */
++static int g_m106a_v = -2;
++static double g_m106a_kt, g_m106a_klog;
++static unsigned long long g_m106a_blits, g_m106a_bfail, g_m106a_fb_pre, g_m106a_sticky_off;
++
++typedef struct {
++    unsigned mr, mg, mb;      /* 均值 */
++    unsigned mx;              /* 各通道最大值里的最大 */
++    unsigned spread;          /* 各通道极差的最大（<16 = 近单色） */
++    unsigned nz10;            /* 非零像素千分比 */
++    unsigned col10;           /* colored（任一 RGB 非零）千分比 —— 与 c_img_rb 的 colored 同口径 */
++    unsigned nyb10;           /* 非黑非纯黄像素千分比 */
++    unsigned dcol;            /* 12-bit 量化不同三元组数（0..4096） */
++    unsigned npx;
++} m106a_sig_t;
++
++/* 内容签名（整幅，逐像素）。dcol 用 4096 位图精确计数，不靠哈希近似。 */
++static void m106a_sig(const uint8_t *p, unsigned w, unsigned h, m106a_sig_t *o)
++{
++    unsigned char seen[512];
++    unsigned long long sr = 0, sg = 0, sb = 0, nz = 0, col = 0, nyb = 0, n = 0;
++    unsigned mn[3] = { 255, 255, 255 }, mx[3] = { 0, 0, 0 };
++    unsigned d = 0;
++    memset(o, 0, sizeof *o);
++    if (!p || !w || !h) return;
++    memset(seen, 0, sizeof seen);
++    const unsigned long long npx = (unsigned long long)w * (unsigned long long)h;
++    for (unsigned long long i = 0; i < npx; i++) {
++        const uint8_t *q = p + i * 4;
++        const unsigned r = q[0], g = q[1], b = q[2];
++        sr += r; sg += g; sb += b; n++;
++        if (r || g || b) { nz++; col++; }
++        /* 判据口径：黑 = 各通道 <16；纯黄 = r,g ≥240 且 b <32。两者都不是 ⇒ nyb */
++        if (!(r < 16 && g < 16 && b < 16) && !(r >= 240 && g >= 240 && b < 32)) nyb++;
++        if (r < mn[0]) mn[0] = r;
++        if (g < mn[1]) mn[1] = g;
++        if (b < mn[2]) mn[2] = b;
++        if (r > mx[0]) mx[0] = r;
++        if (g > mx[1]) mx[1] = g;
++        if (b > mx[2]) mx[2] = b;
++        const unsigned k = ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4);
++        if (!(seen[k >> 3] & (1u << (k & 7u)))) { seen[k >> 3] |= (unsigned char)(1u << (k & 7u)); d++; }
++    }
++    if (!n) return;
++    o->mr = (unsigned)(sr / n); o->mg = (unsigned)(sg / n); o->mb = (unsigned)(sb / n);
++    o->mx = mx[0] > mx[1] ? (mx[0] > mx[2] ? mx[0] : mx[2]) : (mx[1] > mx[2] ? mx[1] : mx[2]);
++    for (int c = 0; c < 3; c++) { const unsigned dd = mx[c] - mn[c]; if (dd > o->spread) o->spread = dd; }
++    o->nz10 = (unsigned)(nz * 1000ull / n);
++    o->col10 = (unsigned)(col * 1000ull / n);
++    o->nyb10 = (unsigned)(nyb * 1000ull / n);
++    o->dcol = d;
++    o->npx = (unsigned)n;
++}
++
++/* 布局 → (srcAccess, srcStage)。barrier 的 oldLayout 必须与真实布局一致，故按槽自己的记账走。 */
++static void m106a_lay_acc(VkImageLayout lay, VkAccessFlags *acc, VkPipelineStageFlags *st)
++{
++    switch (lay) {
++    case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
++        *acc = VK_ACCESS_SHADER_READ_BIT; *st = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT; break;
++    case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
++        *acc = VK_ACCESS_TRANSFER_READ_BIT; *st = VK_PIPELINE_STAGE_TRANSFER_BIT; break;
++    case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
++        *acc = VK_ACCESS_TRANSFER_WRITE_BIT; *st = VK_PIPELINE_STAGE_TRANSFER_BIT; break;
++    case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
++        *acc = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
++        *st = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT; break;
++    default:
++        *acc = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
++        *st = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT; break;
++    }
++}
++
++/* knob：文件必须 app 自己先建（hdc 在沙箱里建不出新文件）；每 2 s 重读，值变化立刻打
++   `[m106a] sw knob -> val=`，未变化也每 10 s 打一行同格式心跳（M104A 教训：knob 未生效不许当结果）。 */
++static int m106a_knob(void)
++{
++    const double t = (double)pf_now_us() / 1e6;
++    if (g_m106a_v == -2) {
++        const char *p[2] = { M106A_A, M106A_B };
++        int have = 0, i;
++        for (i = 0; i < 2 && !have; i++) { FILE *f = fopen(p[i], "r"); if (f) { fclose(f); have = 1; } }
++        for (i = 0; i < 2 && !have; i++) { FILE *f = fopen(p[i], "w"); if (f) { fputs("0\n", f); fclose(f); have = 1; } }
++        g_m106a_v = p_file_int(M106A_A, M106A_B, 0);
++        g_m106a_kt = t; g_m106a_klog = t;
++        vk_boot_logf("[m106a] sw knob -> val=%d (seed)", g_m106a_v);
++        return g_m106a_v;
++    }
++    if (t - g_m106a_kt >= 2.0) {
++        const int v = p_file_int(M106A_A, M106A_B, 0);
++        g_m106a_kt = t;
++        if (v != g_m106a_v) {
++            g_m106a_v = v; g_m106a_klog = t;
++            vk_boot_logf("[m106a] sw knob -> val=%d", g_m106a_v);
++        } else if (t - g_m106a_klog >= 10.0) {
++            g_m106a_klog = t;
++            vk_boot_logf("[m106a] sw knob -> val=%d", g_m106a_v);
++        }
++    }
++    return g_m106a_v;
++}
++
++/* 目标图：800×450 / RGBA8 UNORM（与 present 源同格式 ⇒ blit 免转换）/ TRANSFER_DST|TRANSFER_SRC /
++   device-local，懒创建一次。失败返回非 0 并留日志（调用方据此 fallback=1，不静默）。 */
++static int m106a_dst_img(void)
++{
++    if (g_m106a_img) return 0;
++    if (g_m106a_creat_rc) return g_m106a_creat_rc;
++    if (!g_dev) { g_m106a_creat_rc = -1; return -1; }
++    VkImageCreateInfo ii = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
++    ii.imageType = VK_IMAGE_TYPE_2D;
++    ii.format = VK_FORMAT_R8G8B8A8_UNORM;
++    ii.extent = (VkExtent3D){ M106A_DW, M106A_DH, 1 };
++    ii.mipLevels = 1; ii.arrayLayers = 1;
++    ii.samples = VK_SAMPLE_COUNT_1_BIT;
++    ii.tiling = VK_IMAGE_TILING_OPTIMAL;
++    ii.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++    ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++    ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++    VkResult rv = vkCreateImage(g_dev, &ii, NULL, &g_m106a_img);
++    if (rv != VK_SUCCESS) {
++        g_m106a_img = VK_NULL_HANDLE; g_m106a_creat_rc = (int)rv;
++        vk_boot_logf("[m106a] dst img vkCreateImage rv=%d (%s) rc=%d -> fallback=1", (int)rv, vr(rv), (int)rv);
++        return g_m106a_creat_rc;
++    }
++    VkMemoryRequirements rq;
++    vkGetImageMemoryRequirements(g_dev, g_m106a_img, &rq);
++    const int ti = find_type(rq, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++    VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
++    ai.allocationSize = rq.size; ai.memoryTypeIndex = ti >= 0 ? (uint32_t)ti : 0;
++    rv = vkAllocateMemory(g_dev, &ai, NULL, &g_m106a_mem);
++    if (rv != VK_SUCCESS) {
++        g_m106a_creat_rc = (int)rv;
++        vkDestroyImage(g_dev, g_m106a_img, NULL);
++        g_m106a_img = VK_NULL_HANDLE; g_m106a_mem = VK_NULL_HANDLE;
++        vk_boot_logf("[m106a] dst img vkAllocateMemory(%llu) rv=%d (%s) rc=%d -> fallback=1",
++                     (unsigned long long)rq.size, (int)rv, vr(rv), (int)rv);
++        return g_m106a_creat_rc;
++    }
++    vkBindImageMemory(g_dev, g_m106a_img, g_m106a_mem, 0);
++    g_m106a_dlay = VK_IMAGE_LAYOUT_UNDEFINED;
++    vk_boot_logf("[m106a] dst img %ux%u fmt=RGBA8 usage=TFR_DST|TFR_SRC img=%#llx mem=%#llx bytes=%llu rc=0",
++                 (unsigned)M106A_DW, (unsigned)M106A_DH,
++                 (unsigned long long)(uintptr_t)g_m106a_img,
++                 (unsigned long long)(uintptr_t)g_m106a_mem, (unsigned long long)rq.size);
++    return 0;
++}
++
++/* 源槽整幅回读 + 签名（设备侧数字，不猜）。≤1/2 s 一次，只读；回读走 g_vkq_lock（与 M99A 同锁序）。 */
++static void m106a_sig_probe(int slot, h_rt_slot *s)
++{
++    if (!s || !s->img || !s->w || !s->h) return;
++    const VkImageLayout lay = p_slot_layout(s);
++    const VkDeviceSize sz = (VkDeviceSize)s->w * (VkDeviceSize)s->h * 4ull;
++    pthread_mutex_lock(&g_vkq_lock);
++    void *px = c_raw_copy(s->img, lay, s->w, s->h, sz);
++    pthread_mutex_unlock(&g_vkq_lock);
++    if (!px) {
++        vk_boot_logf("[m106a] sig src slot=%d wh=%ux%u lay=%d readback=FAIL", slot,
++                     (unsigned)s->w, (unsigned)s->h, (int)lay);
++        return;
++    }
++    m106a_sig_t sg;
++    m106a_sig((const uint8_t *)px, s->w, s->h, &sg);
++    free(px);
++    vk_boot_logf("[m106a] sig src slot=%d wh=%ux%u lay=%d mean=%u/%u/%u spread=%u colored=%u.%u%% "
++                 "dcol=%u nyb=%u.%u%% nz=%u.%u%% npx=%u",
++                 slot, (unsigned)s->w, (unsigned)s->h, (int)lay, sg.mr, sg.mg, sg.mb, sg.spread,
++                 sg.col10 / 10u, sg.col10 % 10u, sg.dcol, sg.nyb10 / 10u, sg.nyb10 % 10u,
++                 sg.nz10 / 10u, sg.nz10 % 10u, sg.npx);
+ }
+ 
+ /* 返 1 = 本帧屏幕内容归我们管（已上屏，或按降采样主动跳过——两种情况都不要再走纯色兜底）；
+@@ -30867,8 +31057,70 @@
+             } else if (call <= 3 || (call % 300) == 0) {
+                 vk_boot_logf("[m104a] knob=%d unusable (img=%d ext=%ux%u) — 保持链上选源 src=%s",
+                              (int)kv, fh->img ? 1 : 0, (unsigned)fh->w, (unsigned)fh->h, srcname);
++            }
++        }
++    }
++    /* ===== M106A（2026-11-13）：present 取源处一次 blit —— 源槽(默认 75, 400×225) → 800×450 =====
++       只在这里决定「本帧用哪张图当源」并把 simg/sw/sh/slay 指向目标图；真正的 vkCmdBlitImage 录在
++       同一条 present 命令缓冲里（拷贝之前，见下方 M106A blit 段）。
++       knob=0（缺省）⇒ 本块整段不生效，关态逐字节等于 M105A。 */
++    int m106a_blit = 0, m106a_slot = -1;
++    unsigned m106a_sw = 0, m106a_sh = 0;
++    h_rt_slot *m106a_src = NULL;
++    {
++        const int kv = m106a_knob();
++        static int last_kv = -3;
++        if (kv != last_kv) {
++            last_kv = kv;
++            vk_boot_logf("[m106a] knob=%d (%s) call=%llu sticky_off=%llu", kv,
++                         kv > 0 ? "blit 源槽 -> 800x450 上屏" : "关", call, g_m106a_sticky_off);
++        }
++        if (kv > 0 && !g_m106a_sticky_off) {
++            if (kv >= H_RT_SLOTS) {
++                g_m106a_fb_pre++;
++                if (g_m106a_fb_pre <= 4 || (call % 300) == 0)
++                    vk_boot_logf("[m106a] blit fallback=1 rc=-2 why=slot_range slot=%d (max %d) src=%s",
++                                 kv, H_RT_SLOTS - 1, srcname);
++            } else {
++                h_rt_slot *s = &g_rt_tab[kv];
++                const VkImageLayout sl0 = (s->img && s->w && s->h) ? p_slot_layout(s) : VK_IMAGE_LAYOUT_UNDEFINED;
++                const int lay_ok = (sl0 == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL ||
++                                    sl0 == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL ||
++                                    sl0 == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL ||
++                                    sl0 == VK_IMAGE_LAYOUT_GENERAL);
++                const int rc = m106a_dst_img();
++                if (rc) {
++                    g_m106a_fb_pre++;
++                    if (g_m106a_fb_pre <= 4 || (call % 300) == 0)
++                        vk_boot_logf("[m106a] blit fallback=1 rc=%d why=dst_img slot=%d -> M105A 原路径 src=%s",
++                                     rc, kv, srcname);
++                } else if (!s->img || !s->w || !s->h) {
++                    g_m106a_fb_pre++;
++                    if (g_m106a_fb_pre <= 4 || (call % 300) == 0)
++                        vk_boot_logf("[m106a] blit fallback=1 rc=-3 why=slot_empty slot=%d img=%d ext=%ux%u "
++                                     "-> M105A 原路径 src=%s", kv, s->img ? 1 : 0,
++                                     (unsigned)s->w, (unsigned)s->h, srcname);
++                } else if (!lay_ok) {
++                    g_m106a_fb_pre++;
++                    if (g_m106a_fb_pre <= 4 || (call % 300) == 0)
++                        vk_boot_logf("[m106a] blit fallback=1 rc=-4 why=layout slot=%d lay=%d "
++                                     "-> M105A 原路径 src=%s", kv, (int)sl0, srcname);
++                } else {
++                    m106a_src = s; m106a_slot = kv;
++                    m106a_sw = s->w; m106a_sh = s->h;
++                    m106a_blit = 1;
++                    simg = g_m106a_img; sw = M106A_DW; sh = M106A_DH;
++                    slay = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++                    srcname = "m106a-blit"; snap_used = 0;
++                }
+             }
+         }
++        /* 源槽内容签名（设备侧整幅回读，判据②；≤1/2 s 一次，只在 blit 生效时） */
++        if (m106a_blit && m106a_src) {
++            static double last_sg;
++            const double nows = (double)pf_now_us() / 1e6;
++            if (!last_sg || nows - last_sg >= 2.0) { last_sg = nows; m106a_sig_probe(m106a_slot, m106a_src); }
++        }
+     }
+     uint32_t cp_w = sw, cp_h = sh;
+     int cp_clamped = 0;
+@@ -31017,6 +31269,56 @@
+     cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+     vkBeginCommandBuffer(cb, &cbi);
+     VkImageSubresourceRange rng = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
++    /* ===== M106A：blit 录制（同一条 present 命令缓冲，既有拷贝**之前**）=====
++       源槽 → TRANSFER_SRC_OPTIMAL → vkCmdBlitImage(LINEAR, 全图 src wh → 800×450) →
++       目标图 TRANSFER_DST → TRANSFER_SRC → 源槽布局**回程**到原值（别把 RT 记账改坏）。
++       随后下面既有 barrier + vkCmdCopyImageToBuffer 把目标图搬进 g_p_map ⇒ 走的就是 CH1。
++       m106a_blit=0 时本段整段不执行（关态零行为变化）。 */
++    if (m106a_blit && m106a_src && m106a_src->img && g_m106a_img) {
++        const VkImageLayout sl0 = p_slot_layout(m106a_src);
++        VkAccessFlags sa; VkPipelineStageFlags ss;
++        m106a_lay_acc(sl0, &sa, &ss);
++        VkImageMemoryBarrier mb = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
++        mb.srcAccessMask = sa; mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
++        mb.oldLayout = sl0; mb.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++        mb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; mb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++        mb.image = m106a_src->img; mb.subresourceRange = rng;
++        beat_cmd();
++        vkCmdPipelineBarrier(cb, ss, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &mb);
++        VkAccessFlags da; VkPipelineStageFlags dstage;
++        m106a_lay_acc(g_m106a_dlay, &da, &dstage);
++        mb = (VkImageMemoryBarrier){ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
++        mb.srcAccessMask = da; mb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++        mb.oldLayout = g_m106a_dlay; mb.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++        mb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; mb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++        mb.image = g_m106a_img; mb.subresourceRange = rng;
++        vkCmdPipelineBarrier(cb, dstage, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &mb);
++        VkImageBlit bl;
++        memset(&bl, 0, sizeof bl);
++        bl.srcSubresource = (VkImageSubresourceLayers){ VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
++        bl.srcOffsets[0] = (VkOffset3D){ 0, 0, 0 };
++        bl.srcOffsets[1] = (VkOffset3D){ (int)m106a_sw, (int)m106a_sh, 1 };
++        bl.dstSubresource = (VkImageSubresourceLayers){ VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
++        bl.dstOffsets[0] = (VkOffset3D){ 0, 0, 0 };
++        bl.dstOffsets[1] = (VkOffset3D){ (int)M106A_DW, (int)M106A_DH, 1 };
++        beat_cmd();
++        vkCmdBlitImage(cb, m106a_src->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                       g_m106a_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_LINEAR);
++        mb = (VkImageMemoryBarrier){ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
++        mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
++        mb.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; mb.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++        mb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; mb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++        mb.image = g_m106a_img; mb.subresourceRange = rng;
++        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                             0, 0, NULL, 0, NULL, 1, &mb);
++        g_m106a_dlay = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++        mb = (VkImageMemoryBarrier){ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
++        mb.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT; mb.dstAccessMask = sa;
++        mb.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; mb.newLayout = sl0;
++        mb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; mb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++        mb.image = m106a_src->img; mb.subresourceRange = rng;
++        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, ss, 0, 0, NULL, 0, NULL, 1, &mb);
++    }
+     /* M4x：源的布局不一定是附件态（内容源可能正好被当纹理采样着）——barrier 的 oldLayout / srcAccess
+        跟着 slay 走，回程也回到 slay，别把别的目标的状态记账改坏。 */
+     const int slay_sro = (slay == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+@@ -31074,6 +31376,26 @@
+     cb_free_if_done(g_h_cp, &cb, (sr == VK_SUCCESS) ? wr : VK_SUCCESS, "present copy");
+     pthread_mutex_unlock(&g_vkq_lock);
+     if (simg == g_h_img) g_h_layout = slay;   /* 拷自己的当前目标：布局回程值同步记账；别的图不动 g_h_layout */
++    /* ===== M106A：blit 结果一行（成功/失败都记）=====
++       rc=0 = 本帧 blit + 拷贝提交与栅栏都过；rc!=0 ⇒ 打 fallback=1 并计数，
++       连续 2 次失败 ⇒ 本 boot 粘住关闭（后续帧回到 M105A 原路径），绝不静默。 */
++    if (m106a_blit) {
++        const int m106a_rc = (sr == VK_SUCCESS && wr == VK_SUCCESS) ? 0
++                           : (int)(sr != VK_SUCCESS ? sr : wr);
++        if (m106a_rc == 0) g_m106a_blits++;
++        else {
++            g_m106a_bfail++;
++            if (g_m106a_bfail >= 2 && !g_m106a_sticky_off) {
++                g_m106a_sticky_off = 1;
++                vk_boot_logf("[m106a] fallback=1 sticky off bfail=%llu rc=%d -> 本 boot 回 M105A 原路径",
++                             g_m106a_bfail, m106a_rc);
++            }
++        }
++        vk_boot_logf("[m106a] blit src=%d wh=%ux%u dst=%ux%u rc=%d img=%#llx fallback=%d n=%llu t=%llu call=%llu",
++                     m106a_slot, m106a_sw, m106a_sh, (unsigned)M106A_DW, (unsigned)M106A_DH, m106a_rc,
++                     (unsigned long long)(uintptr_t)g_m106a_img, m106a_rc ? 1 : 0, g_m106a_blits,
++                     (unsigned long long)(pf_now_us() / 1000000ull), call);
++    }
+ 
+     clock_gettime(CLOCK_MONOTONIC, &ts);
+     const long long t1 = (long long)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+@@ -31132,6 +31454,24 @@
+                          "stag[mean=%u/%u/%u max=%u nz=%u.%u%% yel=%u.%u%%]",
+                          call, srcname, g_p_sel_slot, cp_w, cp_h, (int)slay, m104a_pat,
+                          mr, mg, mb, mx, nz10 / 10u, nz10 % 10u, yel10 / 10u, yel10 % 10u);
++        }
++    }
++    /* ===== M106A：目标图内容签名（= staging 里真正要送屏的像素，判据③④ 的「设备侧 target 数字」）=====
++       这一行读的就是 g_p_map（blit 目标图刚被拷进来的那块），所以它就是「屏幕上应该出现的东西」。
++       dcol = 12-bit 量化不同三元组数（≥8 才算有内容）；nyb = 非黑非纯黄像素占比（>5% 才算有画面）。
++       ≤1 Hz，只在 blit 生效时打。 */
++    if (m106a_blit) {
++        static double m106a_last_d;
++        const double m106a_nowd = (double)pf_now_us() / 1e6;
++        if (!m106a_last_d || m106a_nowd - m106a_last_d >= 1.0) {
++            m106a_last_d = m106a_nowd;
++            m106a_sig_t sg;
++            m106a_sig((const uint8_t *)g_p_map, cp_w, cp_h, &sg);
++            vk_boot_logf("[m106a] sig dst slot=%d src_wh=%ux%u wh=%ux%u mean=%u/%u/%u spread=%u "
++                         "colored=%u.%u%% dcol=%u nyb=%u.%u%% nz=%u.%u%% npx=%u",
++                         m106a_slot, m106a_sw, m106a_sh, cp_w, cp_h, sg.mr, sg.mg, sg.mb, sg.spread,
++                         sg.col10 / 10u, sg.col10 % 10u, sg.dcol, sg.nyb10 / 10u, sg.nyb10 % 10u,
++                         sg.nz10 / 10u, sg.nz10 % 10u, sg.npx);
+         }
+     }
+     m68b_publish(cp_w, cp_h);
